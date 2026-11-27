@@ -3,7 +3,7 @@
 CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
-COVERAGE_MIN_LINES ?= 78.65
+COVERAGE_MIN_LINES ?= 87.60
 # Crash-recovery tests SIGKILL instrumented Bun, owner and workload processes
 # on purpose; one killed while it writes its profile at exit leaves a
 # truncated .profraw. Skip unreadable profiles with a warning instead of
@@ -230,12 +230,13 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, and the website's agent recordings
+test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, the website's agent recordings and the appliance image's scripts
 	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 	python3 -m unittest discover -s scripts/gym -p 'test_*.py'
 	python3 -m unittest discover -s scripts/record -p 'test_*.py'
+	python3 -m unittest discover -s image/tests -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons

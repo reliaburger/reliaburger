@@ -24,6 +24,9 @@ Some prose with a table-looking line: | not | a | row |
 | `c::closed_tracker` | 3 Oct | Unknown | Open ([#11]({ISSUE.format(11)})): still flaky |
 | `d::fixed` | 4 Oct | Harness | Fixed ([#11]({ISSUE.format(11)})): the fixture waits |
 | `e::pull_request_only` | 5 Oct | Unknown | Open: see [#12](https://github.com/reliaburger/reliaburger/pull/12) |
+| `f::not_reproduced` | 6 Oct | Unknown | Not reproduced; recheck if it recurs |
+| `g::not_a_defect` | 7 Oct | Runner | Not a defect: the runner's disk stalled |
+| `h::tracked_elsewhere` | 8 Oct | Unknown | Not reproduced ([#11]({ISSUE.format(11)}), closed) |
 """
 
 STATES = {10: "OPEN", 11: "CLOSED"}
@@ -40,7 +43,8 @@ class FlakesRegisterTests(unittest.TestCase):
     def test_only_the_table_rows_are_parsed(self):
         self.assertEqual([row.test for row in self.rows],
                          ["`a::tracked`", "`b::untracked`", "`c::closed_tracker`",
-                          "`d::fixed`", "`e::pull_request_only`"])
+                          "`d::fixed`", "`e::pull_request_only`", "`f::not_reproduced`",
+                          "`g::not_a_defect`", "`h::tracked_elsewhere`"])
         self.assertEqual(self.rows[0].line, 7)
 
     def test_open_rows_are_the_ones_whose_status_says_open(self):
@@ -50,10 +54,30 @@ class FlakesRegisterTests(unittest.TestCase):
 
     def test_every_open_row_links_an_issue(self):
         problems = flakes_register.missing_issues(self.rows)
-        self.assertEqual(len(problems), 2, problems)
         self.assertIn("`b::untracked`", problems[0])
         # A pull request is not an issue: it can't stay open as the tracker.
         self.assertIn("`e::pull_request_only`", problems[1])
+
+    def test_a_row_that_is_neither_fixed_nor_closed_out_needs_an_issue(self):
+        # Avoiding the word "Open" mustn't leave a flake with no owner (#2491).
+        problems = flakes_register.missing_issues(self.rows)
+        self.assertEqual(len(problems), 3, problems)
+        self.assertIn("`f::not_reproduced`", problems[2])
+        self.assertIn("unresolved", problems[2])
+
+    def test_a_closed_out_status_needs_no_issue(self):
+        for status in ("Fixed: x", "Not a defect: x", "Infrastructure; x", "Superseded by y"):
+            row = flakes_register.Row(1, "`t`", "1 Oct", "c", status)
+            self.assertTrue(row.is_resolved(), status)
+        for status in ("Open: x", "Not reproduced", "Passed 3 of 3 after #1", "Fixedish"):
+            row = flakes_register.Row(1, "`t`", "1 Oct", "c", status)
+            self.assertFalse(row.is_resolved(), status)
+
+    def test_an_unresolved_row_may_link_a_closed_issue(self):
+        # Only an Open row's tracker has to stay open; a "Not reproduced" row
+        # can point at the investigation that closed.
+        problems = flakes_register.closed_issues(self.rows, stub_state)
+        self.assertFalse(any("`h::tracked_elsewhere`" in problem for problem in problems))
 
     def test_a_row_linking_a_closed_issue_is_reported(self):
         problems = flakes_register.closed_issues(self.rows, stub_state)
@@ -85,7 +109,7 @@ class FlakesRegisterTests(unittest.TestCase):
 
 
 class RealRegisterTests(unittest.TestCase):
-    def test_every_open_row_in_the_real_register_links_an_issue(self):
+    def test_every_unresolved_row_in_the_real_register_links_an_issue(self):
         rows = flakes_register.parse((REPO / "docs" / "flakes.md").read_text())
         self.assertTrue(rows)
         self.assertEqual(flakes_register.missing_issues(rows), [])

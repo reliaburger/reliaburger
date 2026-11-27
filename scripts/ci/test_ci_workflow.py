@@ -1,4 +1,5 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
+import datetime
 import os
 from pathlib import Path
 import re
@@ -75,6 +76,20 @@ class LocalGateTests(unittest.TestCase):
         _, ci = dry_run("ci")
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
+
+    def test_the_ci_scripts_target_runs_the_image_script_tests(self):
+        # The appliance's Python tests ran only in appliance.yml, which the
+        # merge queue never waits for; they skip cleanly off Linux (#2484).
+        recipe = re.search(r"^test-ci-scripts:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text(), re.M)
+        self.assertIsNotNone(recipe)
+        self.assertIn("discover -s image/tests", recipe.group(1))
+
+    def test_the_audit_expiry_in_the_design_doc_is_the_makefiles(self):
+        # The doc said 18 August 2026 long after the Makefile moved on (#2494).
+        expiry = re.search(r"expiry=(\d{8})", (REPO / "Makefile").read_text()).group(1)
+        when = datetime.date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:]))
+        doc = " ".join((REPO / "docs" / "design" / "test-harness.md").read_text().split())
+        self.assertIn(f"{when.day} {when:%B} {when.year}", doc)
 
     def test_make_ci_runs_the_quick_checks_before_any_build(self):
         # A format slip or an unowned #[ignore] fails in seconds, not after
@@ -501,6 +516,28 @@ class TrainAndQueueTests(unittest.TestCase):
         # ci.yml's macOS job still follows select jobs, which never picks it
         # for a merge group.
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
+
+    def test_the_harness_design_doc_agrees_about_fuzz_and_macos(self):
+        # The design doc kept saying decoder PRs were fuzzed and the queue ran
+        # portable macOS after 24 November moved both to nightlies (#2494).
+        doc = (REPO / "docs" / "design" / "test-harness.md").read_text()
+        fuzz_triggers = (WORKFLOWS / "fuzz.yml").read_text().split("\njobs:")[0]
+        self.assertNotIn("pull_request", fuzz_triggers)
+        self.assertNotIn("on PRs touching a decoder", doc)
+        self.assertIn("never on pull requests", doc)
+        # select-jobs.sh never picks macOS for a merge group (the test above).
+        self.assertNotIn("portable macOS included", doc)
+        self.assertIn("macos-nightly.yml", doc)
+        # macOS runs its own lint and test targets, not make lint and make test.
+        rows = {row.split("|")[1].strip(): row for row in doc.splitlines() if row.startswith("| `make ")}
+        for command in ("`make lint`", "`make test`", "`make test-doc`"):
+            with self.subTest(command=command):
+                self.assertNotIn("Linux and hosted macOS", rows[command])
+        self.assertIn("`make lint-macos`", doc)
+        self.assertIn("`make test-macos`", doc)
+        # The S3 job starts scripts/test-s3.sh's pinned binary, not a service.
+        self.assertNotIn("services:", (WORKFLOWS / "ci.yml").read_text())
+        self.assertNotIn("service container", doc)
 
     def test_every_nightly_that_replaced_a_pull_request_job_tests_the_newest_train(self):
         # macOS left the queue, and fuzzing and mutants left pull requests,
@@ -1835,6 +1872,33 @@ class ApplianceTests(unittest.TestCase):
         boot = self.step("Boot test")
         self.assertIn(". image/tests/disk.sh", boot)
         self.assertIn("disk_from_image", boot)
+
+
+class ReleaseSmokeTests(unittest.TestCase):
+    """The Linux release `bun` runs a workload before it can be promoted.
+
+    Until #2486 the build ran only `bun --version`, and no gate ran the x86-64
+    release pair: Apple silicon runs the aarch64 bun in its VMs, and CI tests
+    debug builds made on another Ubuntu."""
+
+    def setUp(self):
+        self.build = jobs((WORKFLOWS / "build.yml").read_text())["build-binaries"]
+
+    def test_the_release_build_starts_the_linux_bun_it_built(self):
+        step = self.build.split("- name: Start the release bun and run one app")[1].split("\n      - ")[0]
+        self.assertIn("if: runner.os == 'Linux'", step)
+        self.assertIn("scripts/release/smoke-release-bun.sh", step)
+        self.assertIn("target/${{ matrix.target }}/release/bun", step)
+        self.assertIn("target/${{ matrix.target }}/release/relish", step)
+        # Before the artefacts upload, so a bun that can't run never becomes one.
+        self.assertLess(self.build.index("smoke-release-bun.sh"), self.build.index("Upload binary artifacts"))
+
+    def test_the_smoke_script_applies_an_app_and_waits_for_it_to_run(self):
+        script = (REPO / "scripts" / "release" / "smoke-release-bun.sh").read_text()
+        self.assertIn('. "${DEMO_DIR}/lib.sh"', script)
+        self.assertIn("demo_start", script)
+        self.assertIn('"${RELISH}" apply', script)
+        self.assertIn("running", script)
 
 
 class ReleaseKeyEnvironmentTests(unittest.TestCase):
