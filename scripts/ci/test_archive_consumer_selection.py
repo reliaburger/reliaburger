@@ -6,7 +6,11 @@ import unittest
 from test_ci_workflow import jobs, steps
 
 REPO = Path(__file__).resolve().parents[2]
-PINNED_TOOLCHAIN = "dtolnay/rust-toolchain@1.98.0"
+PINNED_TOOLCHAIN = "toolchain: 1.98.0"
+# The action is pinned to a commit (#2405), so the compiler is its input.
+PIN_STEP = ("      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master\n"
+            "        with:\n"
+            "          " + PINNED_TOOLCHAIN)
 
 
 class ArchiveConsumerSelectionTests(unittest.TestCase):
@@ -17,14 +21,14 @@ class ArchiveConsumerSelectionTests(unittest.TestCase):
         builder_steps = steps(self.workflow["build-tests"])
         builder = [step for step in builder_steps if "uses: dtolnay/rust-toolchain@" in step]
         self.assertEqual(len(builder), 1)
-        self.assertRegex(builder[0], r"(?m)^\s*- uses: " + re.escape(PINNED_TOOLCHAIN) + r"\s*$")
+        self.assertRegex(builder[0], r"(?m)^\s*" + re.escape(PINNED_TOOLCHAIN) + r"\s*$")
         consumer_steps = steps(consumer)
         selected = [index for index, step in enumerate(consumer_steps)
                     if "uses: dtolnay/rust-toolchain@" in step]
         self.assertEqual(len(selected), 1,
                          "archive consumers must select the pinned compiler before tool observation")
         self.assertRegex(consumer_steps[selected[0]],
-                         r"(?m)^\s*- uses: " + re.escape(PINNED_TOOLCHAIN) + r"\s*$")
+                         r"(?m)^\s*" + re.escape(PINNED_TOOLCHAIN) + r"\s*$")
         producers = [index for index, step in enumerate(consumer_steps)
                      if "workflow_adapter.py produce" in step]
         self.assertTrue(producers, "an actual archive-consumer producer is required")
@@ -38,7 +42,7 @@ class ArchiveConsumerSelectionTests(unittest.TestCase):
         self.assert_selected_before_producer(self.workflow["acceptance"])
 
     def test_missing_different_and_late_selection_are_refused(self):
-        pin = "      - uses: " + PINNED_TOOLCHAIN
+        pin = PIN_STEP
         for name in ("cluster", "acceptance"):
             original = self.workflow[name]
             # Synthetic controls test this policy helper; they do not run an archive.
@@ -47,7 +51,7 @@ class ArchiveConsumerSelectionTests(unittest.TestCase):
                                   if "workflow_adapter.py produce" in step)
             valid = without.replace(first_producer, pin + "\n" + first_producer, 1)
             self.assert_selected_before_producer(valid)
-            for changed in (without, valid.replace(PINNED_TOOLCHAIN, "dtolnay/rust-toolchain@1.98.1"),
+            for changed in (without, valid.replace(PINNED_TOOLCHAIN, "toolchain: 1.98.1"),
                             without + "\n" + pin):
                 with self.subTest(job=name, changed=changed), self.assertRaises(AssertionError):
                     self.assert_selected_before_producer(changed)

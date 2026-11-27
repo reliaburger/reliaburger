@@ -639,6 +639,32 @@ mod tests {
         assert_eq!(config_keys(&loaded), ["a", "b", "c"]);
     }
 
+    /// #2437: the committed pointer now rides on the next append instead of
+    /// an fsync of its own, so after the last batch of a run it's only in
+    /// memory. A clean stop must still write it: recovery replays up to the
+    /// pointer and no further, and would drop the last acknowledged write.
+    #[tokio::test]
+    async fn recovery_after_a_clean_stop_keeps_the_last_committed_write() {
+        use openraft::storage::RaftLogStorage;
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        let raft = dir.path().join("raft");
+        std::fs::create_dir_all(&raft).unwrap();
+        {
+            let mut log =
+                crate::council::durable_log::DurableLogStore::open(raft.join("log.redb")).unwrap();
+            // openraft's order: append a batch, then save the pointer to it.
+            for (index, key) in ["a", "b", "last"].into_iter().enumerate() {
+                let entry = config_entry(1, index as u64, key);
+                let log_id = entry.log_id;
+                log.write_entries(vec![entry]).unwrap();
+                log.save_committed(Some(log_id)).await.unwrap();
+            }
+        }
+        let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
+        assert_eq!(config_keys(&loaded), ["a", "b", "last"]);
+    }
+
     /// Entries past the node's commit point were never agreed by the dead
     /// council; replaying them could resurrect a write its client saw fail.
     #[tokio::test]

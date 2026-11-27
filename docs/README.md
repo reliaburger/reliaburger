@@ -195,7 +195,8 @@ place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
 0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
 moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2;
-0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place
+0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place,
+and 0.3.4 moves both to 62/77, so a 0.3.3 cluster starts afresh on 0.3.4
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
@@ -285,8 +286,8 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **Three nodes are what's qualified.** Every release is soaked on three
   nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
-  found the leader refusing report connections from 500 nodes up
-  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  found the leader refusing report connections from 500 nodes up, fixed in
+  0.3.4 ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
   slowing sharply between 500 and 1,000
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes

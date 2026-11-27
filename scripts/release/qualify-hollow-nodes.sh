@@ -80,6 +80,13 @@ for size in "${fleet_sizes[@]}"; do
             --ignored --exact hollow_fleet_measurement --nocapture \
         > "$out/fleet-$size.log" 2>&1 \
         || fail "the $size-node run failed; see $out/fleet-$size.log"
+    # Every report the leader didn't admit leaves this line in the fleet's
+    # log (#1411). A node the churn step cut off says "reporting is
+    # quiesced": the harness did that, not the leader.
+    refused=$(grep 'report worker: admission at' "$out/fleet-$size.log" \
+        | grep -vc 'reporting is quiesced' || true)
+    printf 'qualify-hollow-nodes: %s hollow nodes: %s report admissions refused\n' \
+        "$size" "$refused" >&2
     if grep -q '"stopped": "' "$out/hollow-$size.json"; then
         printf 'qualify-hollow-nodes: the %s-node run stopped early; not trying bigger fleets\n' \
             "$size" >&2

@@ -60,25 +60,24 @@ fn steps(job: &Value) -> &[Value] {
     job["steps"].as_array().expect("a job with steps")
 }
 
-/// The version after `@` of every step that uses `action`.
-fn action_versions(job: &Value, action: &str) -> Vec<String> {
-    steps(job)
-        .iter()
-        .filter_map(|step| step["uses"].as_str())
-        .filter_map(|uses| uses.strip_prefix(&format!("{action}@")))
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The single Rust a job installs with dtolnay/rust-toolchain.
+/// The single Rust a job installs with dtolnay/rust-toolchain. The action is
+/// pinned to a commit (#2405), so the compiler is its `toolchain` input.
 fn rust_version(job: &Value) -> String {
-    let versions = action_versions(job, "dtolnay/rust-toolchain");
+    let versions: Vec<&str> = steps(job)
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("dtolnay/rust-toolchain@"))
+        })
+        .filter_map(|step| step["with"]["toolchain"].as_str())
+        .collect();
     assert_eq!(
         versions.len(),
         1,
         "one Rust toolchain per job: {versions:?}"
     );
-    versions[0].clone()
+    versions[0].to_owned()
 }
 
 /// Tool name to version, from every taiki-e/install-action `tool:` list.

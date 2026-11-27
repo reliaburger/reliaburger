@@ -435,6 +435,7 @@ pub async fn start(
     // The council membership check dials the voters this node knows with
     // the node's own identity, to ask about a leader it has never heard of.
     let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone());
+    let committed_flusher = log_store.committed_flusher();
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
@@ -454,6 +455,11 @@ pub async fn start(
         council_shutdown.cancelled().await;
         if let Err(error) = shutdown_council.shutdown().await {
             eprintln!("cluster: council shutdown failed: {error}");
+        }
+        // The committed pointer rides on the next append (#2437); a clean
+        // stop writes the last one, so recovery replays every committed write.
+        if let Err(error) = committed_flusher.flush().await {
+            eprintln!("cluster: could not write the committed pointer: {error}");
         }
     });
 
