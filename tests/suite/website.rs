@@ -935,7 +935,10 @@ fn comparison_pages_only_claim_the_installed_release_when_they_describe_it() {
     let mut pages: Vec<PathBuf> = std::fs::read_dir(&directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "html"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "html")
+        })
         .collect();
     pages.sort();
     assert!(!pages.is_empty(), "no comparison pages found");
