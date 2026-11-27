@@ -549,8 +549,11 @@ credential therefore needs `[security] master_key_path` on the council
 members, and `relish gitops status` never shows one.
 
 The sync always reads every `.toml` file under `path`, subdirectories
-included. Credentials go in the URL; Bun strips them out of the process arguments and
-Git's config. With `require_signed_commits`, a commit that doesn't verify
+included. Credentials go in the URL, either as `https://user:TOKEN@host/...`
+or as a bare token, `https://TOKEN@host/...`. Bun strips them out of git's
+process arguments and the clone's config in both forms, and hands them to git
+through a credential helper; a clone an older Bun left with a token in its
+config is cleaned the next time it's opened. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
 everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
 signing key or its primary key (case and spaces don't matter), or an SSH
@@ -560,6 +563,14 @@ the signature against the node's own GnuPG keyring or
 `require_signed_commits`, a commit that adds, edits or removes an app's or
 job's `script` needs a signature from one of `trusted_signing_keys`, and so
 does any script on the first sync.
+
+A commit that leaves no `.toml` file under `path` at all (the files renamed,
+moved elsewhere, or lost in a bad merge) is refused while GitOps owns
+anything, since applying it would remove everything GitOps wrote. The sync
+shows the error and waits for a commit that brings the files back. To remove
+every GitOps-managed resource on purpose, commit an empty `.toml` file under
+`path` instead; a comment line is enough. To stop GitOps without removing
+anything, use `relish gitops disable`.
 
 Every poll reconciles, not just polls that find a new commit: change or delete
 a GitOps-managed app by hand and the next poll puts it back. Autoscaler
@@ -588,7 +599,12 @@ To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The
 endpoint needs no token, only the HMAC signature (`X-Hub-Signature-256`) or
 GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
-(`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
+(`webhook_rate_limit`, 10 a minute by default). For a signed delivery a replay
+is the same body again, whatever its delivery ID, since the signature covers
+only the body; the provider's "Redeliver" button on an old delivery is
+refused as a replay too. A GitLab token isn't a signature but the secret
+itself, so anyone who captures one GitLab delivery holds your secret: there
+only the delivery ID is checked, and the endpoint should sit behind TLS. A delivery refused for the
 rate limit isn't counted as seen, so the provider's retry gets through.
 
 A follower forwards an authenticated webhook to the leader. A clustered
@@ -600,9 +616,9 @@ original delivery ID is safe. Admission has one five-second budget, including
 waiting for the validator, resolving the leader and forwarding or replicating
 the trigger. Timing out releases the local rate and replay reservation.
 The cluster retains the most recent 1,000
-committed delivery IDs across restarts and leader changes. A delivery still
+committed deliveries across restarts and leader changes. A delivery still
 in that inventory is refused as a replay; one that was not admitted can be
-tried again. Older delivery IDs can be admitted again after eviction.
+tried again. Older deliveries can be admitted again after eviction.
 
 Durable webhook admission changes both protocol and state formats. Check
 `bun --compatibility` before upgrading. Before 1.0, recreate the cluster
