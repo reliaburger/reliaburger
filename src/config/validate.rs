@@ -1973,6 +1973,34 @@ mod tests {
     }
 
     #[test]
+    fn an_over_long_deploy_timeout_is_refused() {
+        // The deploy worker adds these to `Instant::now()`, which panics
+        // on overflow (#2378). A day and an hour are the caps.
+        for (field, value) in [
+            ("health_timeout", "9223372036854775807s"),
+            ("health_timeout", "86401s"),
+            ("drain_timeout", "86401s"),
+            ("drain_timeout", "3601s"),
+        ] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\n{field} = \"{value}\"\n"
+            ))
+            .unwrap();
+            let err = config_with_app("web", app).validate().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Validation { field: f, reason, .. }
+                    if f == "deploy" && reason.contains(field) && reason.contains("at most")),
+                "{field} = {value}: {err:?}"
+            );
+        }
+        let app: AppSpec = toml::from_str(
+            "image = \"web:v1\"\n[deploy]\nhealth_timeout = \"24h\"\ndrain_timeout = \"1h\"\n",
+        )
+        .unwrap();
+        config_with_app("web", app).validate().unwrap();
+    }
+
+    #[test]
     fn unparseable_drain_timeout_is_rejected() {
         for (field, value) in [
             ("drain_timeout", "1m30s"),

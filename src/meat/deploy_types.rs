@@ -61,23 +61,39 @@ impl Default for DeployConfig {
 }
 
 impl DeployConfig {
-    /// Parse a `DeploySpec`, refusing a duration that doesn't parse and a
-    /// surge/unavailable pair that can't make progress.
+    /// Parse a `DeploySpec`, refusing a duration that doesn't parse or is
+    /// over its cap, and a surge/unavailable pair that can't make progress.
     ///
     /// `"1m30s"` or `"500ms"` used to fall back to the default without a
     /// word, so an operator who asked for a 90-second drain got 30 seconds.
     /// Like `[autoscale]`, a `[deploy]` table is refused rather than clamped.
     pub fn parse(spec: &crate::config::app::DeploySpec) -> Result<Self, String> {
-        for (field, value) in [
-            ("drain_timeout", &spec.drain_timeout),
-            ("health_timeout", &spec.health_timeout),
+        // The deploy worker adds each to `Instant::now()`, which panics on
+        // overflow, so each has a cap (#2378): a day for health, as for
+        // `[health] initial_delay`, and an hour for a drain, as for a stop.
+        for (field, value, cap) in [
+            (
+                "drain_timeout",
+                &spec.drain_timeout,
+                crate::grill::stop::MAX_STOP_DURATION,
+            ),
+            (
+                "health_timeout",
+                &spec.health_timeout,
+                Duration::from_secs(crate::bun::health::MAX_HEALTH_DELAY_SECS),
+            ),
         ] {
-            if let Some(value) = value
-                && parse_duration(value).is_none()
-            {
+            let Some(value) = value else { continue };
+            let Some(duration) = parse_duration(value) else {
                 return Err(format!(
                     "{field} {value:?} is not a duration: use a whole number of seconds, \
                      minutes or hours, such as \"90s\", \"5m\" or \"1h\""
+                ));
+            };
+            if duration > cap {
+                return Err(format!(
+                    "{field} {value:?} is too long: it must be at most {}s",
+                    cap.as_secs()
                 ));
             }
         }

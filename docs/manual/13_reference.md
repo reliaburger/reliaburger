@@ -299,7 +299,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
 | `[[volumes]]` | `path`, and `source` (a node directory, allowlisted) or a managed volume with optional `size`; not on `exec` or `script` apps. A `size` needs root, and can't change once the volume exists |
 | `placement` | `required` and `preferred` node labels, `key=value` |
-| `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout`, `health_timeout`, `auto_rollback` |
+| `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout` (at most `"1h"`), `health_timeout` (at most `"24h"`), `auto_rollback` |
 | `stop_signal` | The signal a stop sends: `SIGTERM` (default), `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH` |
 | `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop. When Bun shuts down, every stop on the node shares 20 s |
 | `runtime` | A `[app.NAME.runtime]` table: `capabilities` to add, namespaced `sysctls` and `devices` (`path`, `permissions`). Each needs the node's `[runtime]` allowlist and, from a token with a `[permission]` block, `host-exec`; not on `exec` or `script` apps (see `security`) |

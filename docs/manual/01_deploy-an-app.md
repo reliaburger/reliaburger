@@ -926,7 +926,8 @@ containers and `strategy = "blue-green"`, for a cluster with runc.
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
-(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
+(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`). `health_timeout` is
+at most a day (`"24h"`) and `drain_timeout` at most an hour (`"1h"`).
 
 ## Stopping gracefully
 
