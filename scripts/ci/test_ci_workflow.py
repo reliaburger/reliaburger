@@ -502,6 +502,21 @@ class TrainAndQueueTests(unittest.TestCase):
         # for a merge group.
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
 
+    def test_every_nightly_that_replaced_a_pull_request_job_tests_the_newest_train(self):
+        # macOS left the queue, and fuzzing and mutants left pull requests,
+        # on 24 November 2026 for nightlies. A scheduled run checks out main,
+        # so each must switch to the train itself, or train work goes
+        # untested until the gate PR merges (#2482).
+        for name in ("macos-nightly.yml", "fuzz.yml", "mutants.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text()
+                triggers = text.split("\njobs:")[0]
+                self.assertRegex(triggers, r"\n  schedule:\n(    #.*\n)*    - cron: \"[^\"]* \* \* \*\"")
+                self.assertNotIn("pull_request", triggers)
+                self.assertIn("fetch-depth: 0", text)
+                self.assertIn("git branch -r --list 'origin/release-*'", text)
+                self.assertIn("sort -V | tail -n 1", text)
+
     def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
         self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
                       self.jobs["changes"])
@@ -596,6 +611,12 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       blocks[aggregate])
         self.assertIn('--release-gate "$RELEASE_GATE"', blocks[aggregate])
+        # A ready gate PR without the label is refused there (#2483).
+        for line in ("HEAD_REF: ${{ github.event.pull_request.head.ref }}",
+                     "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+                     "DRAFT: ${{ github.event.pull_request.draft == true }}",
+                     '--head-ref "$HEAD_REF" --base-ref "$BASE_REF" --draft "$DRAFT"'):
+            self.assertIn(line, blocks[aggregate])
         # The owner check still reports when another job failed, so one red
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
@@ -1695,6 +1716,20 @@ class ApplianceTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, paths)
 
+    def test_the_image_tests_run_when_the_code_they_boot_changes(self):
+        # The image carries the PR's own bun and relish, and the boot, OS
+        # update and fallback tests run bun's start-up and its OS API, so a
+        # change there must build the image too (#2484). os_release.py is
+        # what the plan job calls.
+        triggers = self.text.split("\njobs:", 1)[0]
+        pull_request = triggers.split("\n  pull_request:", 1)[1]
+        paths = re.findall(r'(?m)^      - "([^"]+)"$', pull_request)
+        for path in ("src/bun/**", "src/relish/os.rs", "src/relish/image.rs",
+                     "scripts/release/os_release.py"):
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+                self.assertTrue(list(REPO.glob(path)), f"{path} matches no file")
+
     def test_every_build_checks_its_manifest_for_an_ssh_server_before_uploading(self):
         # #401: a published image has no SSH server. The check reads the
         # built image's manifest, so it must run after the build and before
@@ -1839,6 +1874,82 @@ class DeadTriggerTests(unittest.TestCase):
         for path in sorted(WORKFLOWS.glob("*.yml")):
             with self.subTest(workflow=path.name):
                 self.assertNotIn("feat/appliance-", path.read_text())
+
+
+class ManualGateTests(unittest.TestCase):
+    """Every make target that runs ignored tests has someone who runs it (#2489).
+
+    The ignored-test owner check accepts any existing make target, so a
+    target no workflow runs and no document assigns looks owned while
+    nothing executes it.
+    """
+
+    # The union of test-upgrade-node and test-upgrade-cluster, which CI runs.
+    UNION_TARGETS = {"test-upgrade"}
+
+    def manual_table(self):
+        text = (REPO / "docs" / "testing.md").read_text()
+        start = text.index("Gates CI can't run are manual")
+        table = text[start:text.index("\n\n###", start)]
+        return {match.group(1): match.group(2) for match in
+                re.finditer(r"(?m)^\| `make ([a-z0-9-]+)`[^|]*\|[^|]*\| ([^|]+) \|$", table)}
+
+    def test_the_hollow_node_checks_have_an_owner_and_a_cadence(self):
+        row = self.manual_table().get("test-hollow")
+        self.assertIsNotNone(row, "docs/testing.md's manual gates list make test-hollow")
+        self.assertIn("maintainer", row)
+        self.assertIn("before any release", row)
+
+    def test_every_ignored_test_gate_is_run_by_a_workflow_or_a_named_person(self):
+        import ignored_owners
+        workflows = "\n".join(path.read_text() for path in sorted(WORKFLOWS.glob("*.yml")))
+        manual = self.manual_table()
+        # The evidence owners ci.yml runs through workflow_adapter.py.
+        owned, _ = ignored_owners.ci_owners(REPO)
+        for gate in sorted(ignored_owners.make_gates(REPO) - self.UNION_TARGETS):
+            with self.subTest(gate=gate):
+                in_a_workflow = gate in owned or re.search(rf"\bmake {re.escape(gate)}(?![\w-])", workflows)
+                self.assertTrue(in_a_workflow or gate in manual,
+                                f"make {gate} runs ignored tests, but no workflow runs it and "
+                                "docs/testing.md's manual gates don't say who does")
+
+class ActionPinTests(unittest.TestCase):
+    """A third-party action runs the commit we reviewed, not whatever its tag points at now (#2405).
+
+    The release build runs actions before it compiles what the candidate job
+    signs, so a moved tag would be signed and attested truthfully.
+    """
+
+    THIRD_PARTY = re.compile(r"uses:\s*([^\s#]+)")
+
+    def uses(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for line in path.read_text().splitlines():
+                match = self.THIRD_PARTY.search(line)
+                if match and not match.group(1).startswith(("actions/", "./")):
+                    yield path, line, match.group(1)
+
+    def test_every_third_party_action_is_pinned_to_a_commit(self):
+        for path, _, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_every_pin_names_its_version_for_dependabot(self):
+        # Dependabot rewrites a SHA pin and its trailing comment together.
+        for path, line, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(line, r"@[0-9a-f]{40} # \S+$")
+
+    def test_the_toolchain_action_states_its_compiler(self):
+        # Pinned to a commit, the action no longer carries the compiler in
+        # its ref, so each step names the toolchain it installs.
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for name, job in jobs(path.read_text()).items():
+                for step in steps(job):
+                    if "uses: dtolnay/rust-toolchain@" not in step:
+                        continue
+                    with self.subTest(workflow=path.name, job=name):
+                        self.assertRegex(step, r"(?m)^\s+toolchain: .+$")
 
 
 if __name__ == "__main__":

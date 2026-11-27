@@ -39,6 +39,8 @@
 # whose train isn't open yet), runs only the cheap set: CI policy, select jobs
 # and lint, whatever its labels say (maintainer decision of 24 November
 # 2026). Marking a draft ready for review starts a run with the full set.
+# So does one from a `0-3-4/` batch branch: 0.3.4's batches reach the train
+# through integration PRs and never get a PR of their own.
 #
 # Other pull requests are judged by the files they change against their base:
 #
@@ -117,27 +119,28 @@ fi
 # only the destination, so moving src/x.rs to docs/x.md looked docs-only.
 changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 
-# Documentation that neither the build nor any test reads. The manual is
-# compiled into relish, and documentation_first_run checks snippets in the
-# READMEs, the whitepaper, the relish design doc, the Linux servers guide and
-# book chapters 2 and 4.
-# tests/suite/website.rs parses the homepage tour's commands with relish and
-# checks the site's installer, recordings and release cards against the
-# roadmap, the quickstart and the release runbook. tests/suite/issue_forms.rs
-# checks the contributing guide, SECURITY.md and AGENTS.md, and
-# tests/suite/agent_docs.rs checks the skill under plugins/ against the
-# manual's agent chapter. scripts/ci/test_features_page.py checks
-# docs/features.toml against the website's feature status page.
+# Documentation that neither the build nor any test reads (#2485). Under
+# docs/ that's only the plans, the talks, the research notes and the PDF
+# build's configuration; everything else there is read by something:
+# relish compiles the manual in and packs the book, the design docs, the
+# release log, testing.md and flakes.md into its source bundle (whose size
+# CI checks); tests/suite/website.rs reads the website, the roadmap, the
+# quickstart, the runbook, the release log, the book and the qualification
+# records; relish's concept-budget test reads docs/testing/; and
+# documentation_first_run checks the READMEs' and the Linux servers guide's
+# snippets. Outside docs/, the README, CLAUDE.md (in the source bundle), the
+# policy files (tests/suite/issue_forms.rs), the skill under plugins/
+# (tests/suite/agent_docs.rs) and any Markdown under src/ or tests/ count as
+# code. CHANGELOG.md stays documentation: its test, test_changelog.py, runs
+# in CI policy on every run. In a `case` pattern `*` matches `/` too, so
+# docs/* is every file at any depth.
 is_docs_only() {
     case "$1" in
-        docs/manual/* | README.md | docs/README.md | docs/whitepaper.md | \
-            docs/design/cli-relish.md | docs/linux-servers.md | \
-            CONTRIBUTING.md | SECURITY.md | AGENTS.md | plugins/* | \
-            docs/book/02-* | docs/book/04-* | \
-            docs/website/* | docs/roadmap.md | docs/quickstart.md | docs/releasing.md | \
-            docs/features.toml)
-            return 1 ;;
-        docs/* | website/* | *.md) return 0 ;;
+        docs/plans/* | docs/talks/* | docs/research/* | docs/_quarto/*) return 0 ;;
+        docs/*) return 1 ;;
+        README.md | CLAUDE.md | CONTRIBUTING.md | SECURITY.md | AGENTS.md) return 1 ;;
+        src/* | tests/* | plugins/* | .claude/*) return 1 ;;
+        website/* | *.md) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -170,8 +173,15 @@ while IFS= read -r file; do
     [ -z "$file" ] && continue
     is_docs_only "$file" || code=true
     if [ "$macos_code" = false ] && macos_code_file "$file"; then macos_code=true; fi
+    # `gossip` selects the `benchmarks` job, which runs `make bench`: the
+    # gossip benchmarks and the scheduler's planning pass and policy
+    # evaluation beside them, so their benches and what they measure count
+    # (#2493).
     case "$file" in
         src/mustard/* | benches/gossip* | benches/support/* | tests/gossip_*) gossip=true ;;
+        benches/scheduler.rs | benches/policy.rs | src/cluster/orchestrate* | \
+            src/meat/scheduler* | src/meat/filter* | src/meat/score* | src/meat/quota* | \
+            src/meat/cluster_state* | src/policy/*) gossip=true ;;
     esac
     # What benches/task_arrays.rs measures: range sets, the leader's state
     # machine, the node pool and the process runner; and the script that
@@ -231,11 +241,11 @@ fi
 
 # A draft, or a 0.4.0 branch: lint alone, when there's code to lint.
 case "${HEAD_REF:-}" in
-    0-4-0/*) parked=true ;;
+    0-4-0/* | 0-3-4/*) parked=true ;;
     *) parked=false ;;
 esac
 if [ "${DRAFT:-false}" = true ] || [ "$parked" = true ]; then
-    echo "a draft or 0-4-0/ pull request runs only the cheap set" >&2
+    echo "a draft, 0-4-0/ or 0-3-4/ pull request runs only the cheap set" >&2
     emit false false false false false false false "" "$code"
     exit 0
 fi

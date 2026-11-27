@@ -341,6 +341,7 @@ record goes in [`qualification/`](qualification):
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
 | `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after a promote, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
 | `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host, the night before a planned freeze, armed with `nightly-qualify.sh --once` ([arming a nightly](releasing.md#arming-a-nightly), [#1721](https://github.com/reliaburger/reliaburger/issues/1721)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record, freeze rule, the one-night launchd job and the evening's build and staging, with fakes for `gh` and `launchctl` ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
+| `make test-hollow` (twenty hollow nodes, then a hundred running 1,000 apps, [below](#hollow-nodes)) | A multi-core host, macOS or Linux, without root; the two tests took 2 minutes 19 seconds on the Mac Studio on 27 November 2026 at a load average around 12, after a build of the test binaries | The maintainer, before any release that changes the cluster summary (`src/bun/api/summary.rs`), the reporting path (`src/reporting/`) or the hollow-node harness (`tests/hollow_nodes.rs`, `tests/support/hollow.rs`). No workflow runs it yet: the hundred-node check's 1 s budget has never been timed on a hosted runner, and running it in CI needs an evidence owner of its own ([#2489](https://github.com/reliaburger/reliaburger/issues/2489)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
 | `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
@@ -354,15 +355,21 @@ a leader pass placing 150 replicas, and a converged pass, on 1,000 and 10,000
 nodes, then [`benches/policy.rs`](../benches/policy.rs): compiling 10, 100 and
 1,000 policies, and judging one app under them) and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
-request runs the first when it touches the gossip protocol or its benchmarks,
-and the second when it touches what `benches/task_arrays.rs` measures: the
+request runs the first when it touches what `make bench` measures: the gossip
+protocol, the scheduler's planning pass (`src/cluster/orchestrate.rs` and the
+scheduler, filter, score, quota and cluster-state modules under `src/meat/`),
+the policy engine (`src/policy/`), or any of their benchmarks
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)); and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
 itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
 `criterion`'s version, in `Cargo.toml` or only in `Cargo.lock`, runs both,
 because both parse its output and use its filter syntax
 ([#1151](https://github.com/reliaburger/reliaburger/issues/1151)). A pull request into a
-merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip numbers
-gate nothing. The task-array job compares each benchmark's mean with the
+merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip, scheduler and policy numbers
+gate nothing: they're uploaded and no job compares them. Gossip's are a
+simulated network and vary with the runner; the scheduler and policy
+benchmarks are pure CPU work on in-memory data, the kind `bench_baseline.py`
+could compare, but whether to is a maintainer decision. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
 differ by tens of per cent from run to run, and on 12 October 2026 one was
@@ -495,10 +502,11 @@ jobs. What else runs depends on where the change is going:
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Draft pull request, or one from a `0-4-0/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
+| Draft pull request, or one from a `0-4-0/` or `0-3-4/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
 | Merge-queue group | Everything but portable macOS; only CI policy and the gate when the group changes nothing but documentation | set by acceptance and the privileged Linux jobs instead of portable macOS, plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| [`appliance.yml`](../.github/workflows/appliance.yml), a ready pull request into `main` or a train that changes `image/`, `src/os/`, `src/appliance/`, `src/bun/`, `src/relish/netboot/`, `src/relish/os.rs`, `src/relish/image.rs`, `scripts/release/os_release.py` or the workflow ([#2484](https://github.com/reliaburger/reliaburger/issues/2484)) | Builds both appliance images with the PR's bun and relish, runs `image/tests`' unit tests, then the QEMU tests: boot, netboot install, `relish netboot` install, seeded and claimed pairs, OS update and fallback. Not in the merge queue, and no ruleset requires it | 60 to 90 minutes |
 | [`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), nightly and by hand | Portable macOS alone (`make lint-macos`, `make test-macos`, relish's doctests) on the newest `release-*` train with work `main` doesn't have, else `main` | about an hour, plus any wait for a macOS runner |
 
 **macOS only where it adds something**
@@ -538,12 +546,24 @@ the push to `main` runs it, and a candidate build only reuses a push or
 nightly run in which `portable macOS` passed; otherwise `validate-release`
 runs all of `ci.yml`, macOS included.
 
+A nightly like this runs only once it's on `main`. GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of a
+workflow, so `macos-nightly.yml` did nothing while it sat on the 0.3.3 train
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). A new or
+changed schedule-only workflow goes to `main` in its own PR, and
+`open_train.py` refuses to open a train while one is missing from `main`
+([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
+
 **Drafts and 0.4.0 work run the cheap set** (same decision). A draft pull
 request, and one whose head branch starts with `0-4-0/`, runs select jobs, CI
 policy and lint (when it changes code) and nothing else, whatever its labels;
 `appliance.yml` builds no image for it and `build.yml` builds nothing.
 `ready_for_review` starts a run with the full set for its base, and
 `converted_to_draft` starts a cheap run that cancels the one still going.
+`select-jobs.sh` treats a `0-3-4/` branch the same way: 0.3.4's batch
+branches reach the train through integration PRs, so a PR of their own is a
+mistake and pays for nothing heavy (`appliance.yml` and `build.yml` still
+build for one).
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
@@ -705,6 +725,21 @@ to 110 to report (#1723). Three things wasted runners, and each now has a fix:
 A queue group that changes only documentation runs no code job either (two of
 the window's 32 groups): its code is its base's, which the run before it is
 testing. Scripts are code here, since the jobs run them.
+
+"Documentation" is narrower than everything under `docs/`
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)): it's
+`docs/plans/`, `docs/talks/`, `docs/research/`, `docs/_quarto/`, and Markdown
+outside `docs/`, `src/` and `tests/` other than the README, `CLAUDE.md`,
+`CONTRIBUTING.md`, `SECURITY.md` and `AGENTS.md` (so `CHANGELOG.md`, whose
+test runs in CI policy anyway). Everything else under `docs/` is read by a
+test or packed into relish: the manual, the book, the design docs, the
+release log, this file, the flakes register, the qualification records and
+`docs/testing/concept-budget.json`. A change to one ran no Rust test before,
+landed, and turned the train red on the push after it. `is_docs_only` in
+`scripts/ci/select-jobs.sh` holds the list, and
+`test_no_docs_path_named_by_a_test_is_docs_only` fails when a `"docs/..."`
+literal in `src/` or `tests/` names a file the list calls documentation. The
+price is portable Linux on every book or design-doc PR.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
@@ -1084,6 +1119,13 @@ and hit its timeout.
 also ran for 30 seconds a target on every pull request that touched a
 decoder's file, but the job takes 14 to 33 minutes and runners were short, so
 the maintainer took it off pull requests; the release gate never used it.
+The nightly fuzzes the newest `release-*` train that has work `main` doesn't,
+else `main`, picked the way [mutation testing](#mutation-testing) picks it, and
+says which in the job summary (`fuzzing origin/release-... at <commit>`); a
+run by hand takes a `ref`
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). GitHub runs
+the copy of `fuzz.yml` on `main`, so a change to it takes effect only once
+it's there ([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
 The stable half, every target over its checked-in corpus, still runs in the
 portable suite on every pull request. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
@@ -1160,7 +1202,10 @@ runner for up to 75 minutes per train PR while the train's own CI queued
 behind it, so it moved to a nightly run.
 
 The nightly run mutates the newest release train (`release-*`), where work
-lands before `main`, or `main` when no train has work `main` doesn't.
+lands before `main`, or `main` when no train has work `main` doesn't. That
+needs the train's copy of `mutants.yml` on `main`, since GitHub schedules
+from `main`'s; until it is, `main`'s older copy runs weekly and mutates
+`main` ([#2482](https://github.com/reliaburger/reliaburger/issues/2482)).
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
