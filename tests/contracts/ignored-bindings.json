@@ -1693,6 +1693,12 @@
   },
   {
     "source": "tests/self_upgrade.rs",
+    "function": "an_upgrade_that_fails_before_config_load_reverts_by_itself",
+    "binary": "reliaburger::self_upgrade",
+    "test": "an_upgrade_that_fails_before_config_load_reverts_by_itself"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
     "function": "version_retention_gc_keeps_last_three",
     "binary": "reliaburger::self_upgrade",
     "test": "version_retention_gc_keeps_last_three"
