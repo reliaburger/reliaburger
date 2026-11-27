@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ring::hmac;
 
-use super::types::{LettuceError, WebhookEvent};
+use super::types::{LettuceError, StoredGitOpsConfig, WebhookEvent};
 
 /// A source of the current time, injectable so tests can move the
 /// rate-limit window without sleeping.
@@ -32,6 +32,9 @@ pub struct WebhookValidator {
     recent_triggers: VecDeque<Instant>,
     /// Where "now" comes from for the rate window.
     clock: Clock,
+    /// The cluster config the secret was last taken from, so an unchanged
+    /// config isn't unsealed again on every request (#2388).
+    keyed_from: Option<StoredGitOpsConfig>,
 }
 
 /// An authenticated reservation is committed only after durable admission.
@@ -74,6 +77,7 @@ impl WebhookValidator {
             max_replay_entries: 1000,
             recent_triggers: VecDeque::with_capacity(rate_limit as usize),
             clock,
+            keyed_from: None,
         }
     }
 
@@ -92,6 +96,27 @@ impl WebhookValidator {
     pub fn rekey(&mut self, secret: Option<&str>, rate_limit: u32) {
         self.secret = secret.map(|secret| secret.as_bytes().to_vec());
         self.rate_limit = rate_limit;
+        self.keyed_from = None;
+    }
+
+    /// Take the secret and rate limit from the cluster's stored config.
+    ///
+    /// Unsealing costs a key derivation and a decryption, and the webhook
+    /// route is public, so it runs only when `stored` differs from the
+    /// config the validator was last keyed from (#2388). A config that
+    /// fails to unseal leaves the validator as it was.
+    pub fn rekey_from(
+        &mut self,
+        stored: &StoredGitOpsConfig,
+        master_key: Option<&[u8]>,
+    ) -> Result<(), LettuceError> {
+        if self.keyed_from.as_ref() == Some(stored) {
+            return Ok(());
+        }
+        let config = stored.unseal(master_key)?;
+        self.rekey(config.webhook_secret.as_deref(), config.webhook_rate_limit);
+        self.keyed_from = Some(stored.clone());
+        Ok(())
     }
 
     /// Whether the validator has a secret to check webhooks against.

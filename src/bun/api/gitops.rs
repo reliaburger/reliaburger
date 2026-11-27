@@ -70,18 +70,25 @@ async fn admit_gitops_webhook(
         .and_then(|value| value.to_str().ok());
     let delivery = header_delivery_id(&headers);
     let branch = header_branch(&headers).unwrap_or_else(|| "main".to_owned());
-    let mut validator = validator.lock().await;
     // The cluster's secret in Raft wins over this node's `[gitops]` (#693),
-    // so every node checks a webhook against the same secret.
-    if let Some(council) = &state.council
-        && let Some(stored) = council.desired_state().await.gitops_config
-    {
-        match stored.unseal(council.wrapping_ikm().map(|key| key.as_slice())) {
-            Ok(config) => {
-                validator.rekey(config.webhook_secret.as_deref(), config.webhook_rate_limit)
-            }
-            Err(error) => return webhook_unavailable(error),
+    // so every node checks a webhook against the same secret. The route is
+    // public, so a request that will fail its signature check must stay
+    // cheap (#2388): read only the GitOps config, not the whole desired
+    // state, and do it before taking the validator lock.
+    let stored = match &state.council {
+        Some(council) => {
+            council
+                .read_desired(|desired| desired.gitops_config.clone())
+                .await
         }
+        None => None,
+    };
+    let mut validator = validator.lock().await;
+    if let (Some(council), Some(stored)) = (&state.council, stored.as_ref())
+        && let Err(error) =
+            validator.rekey_from(stored, council.wrapping_ikm().map(|key| key.as_slice()))
+    {
+        return webhook_unavailable(error);
     }
     if !validator.is_keyed() {
         return webhook_unavailable("webhook secret not configured");
@@ -246,15 +253,23 @@ pub(super) async fn gitops_status_handler(
     let Some(council) = &state.council else {
         return Json(crate::lettuce::types::GitOpsStatus::default()).into_response();
     };
-    let desired = council.desired_state().await;
+    // Only the GitOps fields: the rest of the desired state isn't cloned.
+    let (gitops_config, sync, owned) = council
+        .read_desired(|desired| {
+            (
+                desired.gitops_config.clone(),
+                desired.gitops_sync_state.clone(),
+                desired.gitops_owned.clone(),
+            )
+        })
+        .await;
     let status = crate::lettuce::types::GitOpsStatus {
-        has_credentials: desired
-            .gitops_config
+        has_credentials: gitops_config
             .as_ref()
             .is_some_and(|stored| stored.sealed_credentials.is_some()),
-        config: desired.gitops_config.map(|stored| stored.config),
-        sync: desired.gitops_sync_state,
-        owned: desired.gitops_owned,
+        config: gitops_config.map(|stored| stored.config),
+        sync,
+        owned,
         local: local
             .map(|axum::Extension(GitOpsLocalCheck(check))| check.borrow().clone())
             .unwrap_or_default(),

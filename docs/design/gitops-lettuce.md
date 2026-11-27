@@ -876,7 +876,7 @@ The primary security boundary. Signed commits ensure that only authorised develo
 
 ### 8.2 Webhook HMAC Validation
 
-Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. Use a long random `webhook_secret`; a minimum length is planned (Section 6.3) but not enforced.
+Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. Before the check, a council node reads only the stored `gitops_config` (`read_desired`), never a clone of the whole desired state, and does it before taking the validator lock; the validator unseals the secret only when the stored config has changed since it was last keyed (#2388). An unauthenticated request therefore costs one small clone and one HMAC. Use a long random `webhook_secret`; a minimum length is planned (Section 6.3) but not enforced.
 
 **Provider compatibility:**
 

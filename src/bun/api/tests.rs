@@ -11675,6 +11675,86 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
     }
 }
 
+/// A single-node council that leads, with a GitOps config whose webhook
+/// secret is `secret`, sealed under the cluster master key.
+async fn council_with_gitops_secret(tag: &str, secret: &str) -> Arc<crate::council::CouncilNode> {
+    let council = seeded_council_with_ikm(tag).await;
+    let config: crate::lettuce::types::GitOpsConfig = toml::from_str(&format!(
+        "repo = \"https://example.invalid/config\"\nwebhook_secret = \"{secret}\"\n"
+    ))
+    .unwrap();
+    let stored = crate::lettuce::types::StoredGitOpsConfig::seal(
+        &config,
+        council.wrapping_ikm().map(|key| key.as_slice()),
+    )
+    .unwrap();
+    council
+        .write(crate::council::types::RaftRequest::GitOpsConfigSet {
+            config: Some(Box::new(stored)),
+            seed: false,
+        })
+        .await
+        .unwrap();
+    council
+}
+
+/// #2388: the webhook route is public, so a request that fails the
+/// signature check must cost the node as little as possible. It used to
+/// clone the whole desired state to read one field before checking.
+#[tokio::test]
+async fn a_webhook_with_a_bad_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-bad-sig-clone", "secret").await;
+    let (app, mut receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        br#"{"after":"abc"}"#,
+        &[
+            ("x-hub-signature-256", "sha256=00".to_string()),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "a junk webhook cloned the whole desired state"
+    );
+    assert!(receiver.try_recv().is_err());
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// #2388: a genuine delivery reads only the GitOps config too, and is
+/// checked against the cluster's secret, not this node's.
+#[tokio::test]
+async fn a_webhook_with_a_good_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-good-sig-clone", "secret").await;
+    let (app, _receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc"}"#;
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        body,
+        &[
+            ("x-hub-signature-256", github_signature("secret", body)),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "an admitted webhook cloned the whole desired state"
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
 fn webhook_boundary_setup(
     secret: &str,
     rate_limit: u32,
