@@ -553,7 +553,37 @@ That property test later timed out at nextest's 60-second limit on a busy Mac (#
 
 The syncs are what make a flush durable, so they stay. The test changed instead. A file layout is the expensive part of a case and a query is the cheap part, so each case now builds its files once and runs all ten query shapes against them, each with its own bounds and names. Thirty-two cases cover every shape against every layout with about an eighth of the flushes. Eight copies at once now take 13 to 15 seconds. Both planted bugs (the `a + 2` one above, and pruning a file whose last sample equals the lower bound) still fail on every run. If a test's time goes to waiting for the disk, ask whether each case needs its own files before reaching for a seam that skips the syncs.
 
-What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, still needs room for that answer. Everything else is flat.
+What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, needed room for that answer, until the next section gave every answer a ceiling. Everything else is flat.
+
+### Every read gets a ceiling
+
+Streaming bounded the memory a query *works* in. It didn't bound what a query *returns*, or how long it runs, and the November 2026 audit found seven read routes where the caller chose both ([#2382](https://github.com/reliaburger/reliaburger/issues/2382)). The commonest was the most innocent: `relish logs web` with no `--tail`. Every node built `SELECT ... FROM logs WHERE app = 'web' ... ORDER BY sequence`, sorted the app's whole history, collected it into a `Vec<LogEntry>` and serialised it. A chatty app with a 2 GiB log store could get Bun killed for memory by anyone allowed to read its logs, and Bun supervises every workload on the node.
+
+The fix is one rule, applied to logs and metrics alike. Every query has a row cap, a maximum, and a deadline, and an answer that hits a cap the caller didn't choose says so.
+
+- A log query with no tail now returns the newest `DEFAULT_LOG_QUERY_ROWS` (10,000) lines; a tail above `MAX_LOG_QUERY_ROWS` (100,000) is clamped. The SQL always carries the `ORDER BY sequence DESC LIMIT n` that `--tail` used to add, which DataFusion runs as a top-k: it keeps n rows and drops the rest as they stream past. The query also runs under the 256 MiB memory pool that `/v1/logs/sql` already had.
+- `/v1/metrics?name=X` and `/v1/metrics/rollup?name=X` keep the newest 10,000 rows, the same newest-first-then-flip trick the per-app query uses.
+- `/v1/metrics/summary` and `/v1/metrics/keys` list the names seen in the last hour (`METRIC_NAMES_WINDOW_SECS`) instead of every name in seven days of files.
+- Every user-driven query runs inside `tokio::time::timeout` with an 8-second deadline, under the fan-out's 10-second wait, so a node says "narrow the query" before the caller gives up on it.
+
+The deadline is a small function, and it's the first place this chapter drops a future on purpose:
+
+```rust
+async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    query: impl std::future::Future<Output = Result<T, KetchupError>>,
+) -> Result<T, KetchupError> {
+    tokio::time::timeout(deadline, query)
+        .await
+        .unwrap_or_else(|_| Err(KetchupError::QueryRejected { /* ... */ }))
+}
+```
+
+`timeout` returns `Err(Elapsed)` if the inner future hasn't finished in time, and then drops it. In Rust, dropping a future *is* cancelling it: a future only makes progress while someone polls it, so once nobody holds it, the DataFusion stream inside stops pulling files. No cancellation token, no flag to check. (A file already being decoded on the blocking pool finishes that one file, and its batches are thrown away.) `impl Future<Output = ...>` in argument position means "any type that is a future yielding this", the same shorthand as `impl Trait` anywhere else, so the function takes an `async` block directly.
+
+A refused query is `KetchupError::QueryRejected` or the new `MayoError::QueryRejected`, which the handlers turn into a 400 with the reason. The caller asked for too much; retrying won't help, narrowing will.
+
+And the cut is visible. When a cross-node log answer reaches the default cap, or a tail was clamped, the result carries `LogQueryWarning::Truncated { limit }`. `relish logs` already prints every warning, so the operator sees "showing the newest 10000 lines; use --since or --tail to choose others" without the CLI changing at all. An explicit `--tail 50` that the answer fills is not a cut: you asked for fifty. The tests pin each piece: `a_query_without_a_tail_returns_at_most_the_default_row_cap`, `a_named_query_returns_at_most_the_row_limit`, `a_named_rollup_query_returns_at_most_the_row_limit`, `a_tail_above_the_maximum_is_refused_or_clamped`, `a_log_query_cut_at_the_default_cap_says_so`, and two deadline tests that hand `within_deadline` a future that never finishes (`std::future::pending()`) and check the refusal arrives in time.
 
 ## Hardening the log path
 

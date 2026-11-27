@@ -19,7 +19,9 @@ use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
 use super::scan::{
     ParquetSource, ParquetTable, list_local, list_local_off_runtime, streaming_session,
 };
-use super::store::{dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet};
+use super::store::{
+    ALL_QUERY_ROW_LIMIT, dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet,
+};
 use super::types::MayoError;
 
 /// Cap on un-flushed buffered rollup rows. A council member receives rollups
@@ -145,13 +147,13 @@ impl RollupStore {
             .flatten()
             .map_or(0, |newest| newest.saturating_sub(IDEMPOTENCY_HORIZON_SECS));
         let ctx = self.session().await?;
-        let df = ctx
+        // Startup work, not a caller's query: no deadline.
+        let batches = ctx
             .sql(&format!(
                 "SELECT DISTINCT node_id, timestamp FROM rollups WHERE timestamp >= {cutoff}"
             ))
             .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-        let batches = df
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?
             .collect()
             .await
             .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
@@ -324,15 +326,7 @@ impl RollupStore {
     /// value is the sum across nodes for each (timestamp, metric_name, labels).
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
         let ctx = self.session().await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = super::store::collect_sql(&ctx, sql).await?;
 
         let mut results = Vec::new();
         for batch in &batches {
@@ -393,15 +387,7 @@ impl RollupStore {
         let sql = format!(
             "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT 10001"
         );
-        let batches = self
-            .session()
-            .await?
-            .sql(&sql)
-            .await
-            .map_err(|error| MayoError::QueryFailed(error.to_string()))?
-            .collect()
-            .await
-            .map_err(|error| MayoError::QueryFailed(error.to_string()))?;
+        let batches = super::store::collect_sql(&self.session().await?, &sql).await?;
         let mut rows = Vec::new();
         for batch in batches {
             let timestamps = batch
@@ -453,7 +439,8 @@ impl RollupStore {
     /// Query cluster-wide aggregated metrics by name and time range.
     ///
     /// Returns (timestamp, metric_name, labels, sum) tuples aggregated
-    /// across all nodes. For averages, callers can also retrieve count
+    /// across all nodes, oldest first, at most [`ALL_QUERY_ROW_LIMIT`] of
+    /// them, the newest. For averages, callers can also retrieve count
     /// via `query_sql`.
     pub async fn query_cluster_metric(
         &self,
@@ -471,9 +458,13 @@ impl RollupStore {
              WHERE metric_name = '{metric_name}' \
              AND timestamp >= {start} AND timestamp <= {end} \
              GROUP BY timestamp, metric_name, labels \
-             ORDER BY timestamp"
+             ORDER BY timestamp DESC LIMIT {ALL_QUERY_ROW_LIMIT}"
         );
-        self.query_sql(&sql).await
+        // Newest first under the limit, then back to oldest first: without
+        // a limit one request returned the whole rollup retention (#2382).
+        let mut rows = self.query_sql(&sql).await?;
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Every series' cluster sums in `[start, end]`, oldest first, at most
@@ -517,15 +508,7 @@ impl RollupStore {
         );
 
         let ctx = self.session().await?;
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = super::store::collect_sql(&ctx, &sql).await?;
 
         let mut results = Vec::new();
         for batch in &batches {
@@ -585,15 +568,11 @@ impl RollupStore {
     /// List all distinct metric names in the rollup store.
     pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
         let ctx = self.session().await?;
-        let df = ctx
-            .sql("SELECT DISTINCT metric_name FROM rollups ORDER BY metric_name")
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = super::store::collect_sql(
+            &ctx,
+            "SELECT DISTINCT metric_name FROM rollups ORDER BY metric_name",
+        )
+        .await?;
 
         let mut names = Vec::new();
         for batch in &batches {
@@ -1318,6 +1297,24 @@ mod tests {
             "buffer grew past the cap: {}",
             store.buffer_len()
         );
+    }
+
+    /// #2382: `/v1/metrics/rollup?name=X` over all time had no row bound.
+    /// It keeps the newest `ALL_QUERY_ROW_LIMIT` sums, oldest first.
+    #[tokio::test]
+    async fn a_named_rollup_query_returns_at_most_the_row_limit() {
+        let (mut store, _dir) = test_store();
+        let total = crate::mayo::store::ALL_QUERY_ROW_LIMIT as u64 + 50;
+        for minute in 1..=total {
+            store.ingest(&make_rollup("n1", minute * 60, "cpu", 1.0));
+        }
+        let rows = store
+            .query_cluster_metric("cpu", 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
+        assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
+        assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
 
     #[tokio::test]

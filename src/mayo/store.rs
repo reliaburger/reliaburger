@@ -78,6 +78,47 @@ pub const ALL_QUERY_ROW_LIMIT: usize = 10_000;
 
 const MAX_PENDING_METRIC_ROWS: usize = 1_000_000;
 
+/// How long one metrics or rollup query may run before it is refused
+/// (#2382). Under the cross-node fan-out's ten-second wait, so a node
+/// answers "narrow the query" before the caller gives up on it.
+pub const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How far back the metric-name list looks (#2382): the names reported in
+/// the last hour, not every name in the retention period.
+pub const METRIC_NAMES_WINDOW_SECS: u64 = 3600;
+
+/// Run `query`, refusing it if it takes longer than `deadline` (#2382).
+/// Dropping the query's future cancels it.
+pub(crate) async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    query: impl std::future::Future<Output = Result<T, MayoError>>,
+) -> Result<T, MayoError> {
+    tokio::time::timeout(deadline, query)
+        .await
+        .unwrap_or_else(|_| {
+            Err(MayoError::QueryRejected(format!(
+                "the query ran past its {} s limit; narrow the time range or the metric name",
+                deadline.as_secs()
+            )))
+        })
+}
+
+/// Plan and run `sql` on `ctx` within [`QUERY_DEADLINE`].
+pub(crate) async fn collect_sql(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, MayoError> {
+    within_deadline(QUERY_DEADLINE, async {
+        ctx.sql(sql)
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))
+    })
+    .await
+}
+
 /// Escape a value for safe interpolation into a single-quoted SQL string
 /// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
 /// doubled. Without this, a query param like `x' OR '1'='1` breaks out of
@@ -1104,14 +1145,9 @@ impl MayoStore {
         Ok(Some(pending))
     }
 
-    /// Build a DataFusion session exposing a `metrics` table over all data:
-    /// the Parquet files unioned with the unflushed buffer.
-    async fn session(&self) -> Result<SessionContext, MayoError> {
-        self.session_since(None).await
-    }
-
-    /// [`session`](Self::session) for a query whose SQL only wants samples at
-    /// or after `since`.
+    /// A DataFusion session exposing a `metrics` table over all data, the
+    /// Parquet files unioned with the unflushed buffer, for a query whose SQL
+    /// only wants samples at or after `since` (`None`: any time).
     ///
     /// The `metrics` table is streamed (#377): this method lists file names
     /// and verifies only the exact retained publication, if present, so that
@@ -1246,7 +1282,8 @@ impl MayoStore {
         Ok(rows)
     }
 
-    /// Query by metric name and time range (convenience).
+    /// One metric's samples in `[start, end]`, oldest first, at most
+    /// [`ALL_QUERY_ROW_LIMIT`] of them, the newest.
     pub async fn query(
         &self,
         metric_name: &str,
@@ -1254,13 +1291,18 @@ impl MayoStore {
         end: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
         let metric_name = escape_sql_literal(metric_name);
+        // Newest first under the limit, then back to oldest first, as
+        // `query_app` does: without a limit one request returned every
+        // sample of the metric in the retention period (#2382).
         let sql = format!(
             "SELECT timestamp, metric_name, labels, value FROM metrics \
              WHERE metric_name = '{metric_name}' \
              AND timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp"
+             ORDER BY timestamp DESC LIMIT {ALL_QUERY_ROW_LIMIT}"
         );
-        self.query_sql_since(&sql, start).await
+        let mut rows = self.query_sql_since(&sql, start).await?;
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Every series' samples in `[start, end]`, oldest first, at most
@@ -1325,15 +1367,7 @@ impl MayoStore {
         );
 
         let ctx = self.session_since(Some(start)).await?;
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = collect_sql(&ctx, &sql).await?;
 
         for batch in &batches {
             if batch.num_rows() == 0 || batch.num_columns() == 0 {
@@ -1349,18 +1383,24 @@ impl MayoStore {
         Ok(None)
     }
 
-    /// List all distinct metric names.
+    /// Every distinct metric name in the store, whatever its age.
     pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql("SELECT DISTINCT metric_name FROM metrics ORDER BY metric_name")
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        self.metric_names_since(0).await
+    }
 
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+    /// The distinct metric names with a sample at or after `since`. The API
+    /// asks for the last [`METRIC_NAMES_WINDOW_SECS`]: listing every name
+    /// in the retention period read every file on each call (#2382).
+    pub async fn metric_names_since(&self, since: u64) -> Result<Vec<String>, MayoError> {
+        let ctx = self.session_since(Some(since)).await?;
+        let batches = collect_sql(
+            &ctx,
+            &format!(
+                "SELECT DISTINCT metric_name FROM metrics \
+                 WHERE timestamp >= {since} ORDER BY metric_name"
+            ),
+        )
+        .await?;
 
         let mut names = Vec::new();
         for batch in &batches {
@@ -1398,15 +1438,7 @@ impl MayoStore {
         );
 
         let ctx = self.session_since(Some(start)).await?;
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = collect_sql(&ctx, &sql).await?;
 
         let mut results = Vec::new();
         for batch in &batches {
@@ -1598,15 +1630,7 @@ async fn rows_from(
     ctx: &SessionContext,
     sql: &str,
 ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-    let df = ctx
-        .sql(sql)
-        .await
-        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-    let batches = df
-        .collect()
-        .await
-        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+    let batches = collect_sql(ctx, sql).await?;
 
     let mut results = Vec::new();
     for batch in &batches {
@@ -1843,6 +1867,51 @@ mod tests {
             rows.windows(2).all(|pair| pair[0].0 <= pair[1].0),
             "rows must come back oldest first"
         );
+    }
+
+    /// #2382: a named query over all time used to return every sample of
+    /// the metric. It keeps the newest `ALL_QUERY_ROW_LIMIT`, oldest first.
+    #[tokio::test]
+    async fn a_named_query_returns_at_most_the_row_limit() {
+        let (mut store, _dir) = test_store();
+        let total = ALL_QUERY_ROW_LIMIT as u64 + 500;
+        for timestamp in 1..=total {
+            store.insert(&MetricKey::simple("cpu"), Sample::at(timestamp, 1.0));
+        }
+        let rows = store.query("cpu", 0, i64::MAX as u64).await.unwrap();
+        assert_eq!(rows.len(), ALL_QUERY_ROW_LIMIT);
+        assert_eq!(rows.last().unwrap().0, total, "the newest sample was lost");
+        assert!(rows.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    }
+
+    /// #2382: the metric-name list the API serves reads a recent window,
+    /// not the whole retention, so its cost doesn't grow with history.
+    #[tokio::test]
+    async fn metric_names_since_skip_older_names() {
+        let (mut store, _dir) = test_store();
+        let now = Sample::now(0.0).timestamp;
+        store.insert(&MetricKey::simple("old"), Sample::at(1, 1.0));
+        store.flush().await.unwrap();
+        store.insert(&MetricKey::simple("fresh"), Sample::at(now, 1.0));
+        let since = now - METRIC_NAMES_WINDOW_SECS;
+        assert_eq!(store.metric_names_since(since).await.unwrap(), ["fresh"]);
+        assert_eq!(store.metric_names().await.unwrap(), ["fresh", "old"]);
+    }
+
+    /// #2382: a metrics query past its deadline is refused within it.
+    #[tokio::test]
+    async fn a_metrics_query_past_its_deadline_is_refused_within_the_deadline() {
+        let started = std::time::Instant::now();
+        let result: Result<(), MayoError> = within_deadline(
+            std::time::Duration::from_millis(50),
+            std::future::pending::<Result<(), MayoError>>(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MayoError::QueryRejected(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

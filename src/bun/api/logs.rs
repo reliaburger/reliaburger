@@ -1057,7 +1057,9 @@ pub(super) async fn logs_cross_node_handler(
         json_field: None,
         // The newest N cluster-wide are among each node's newest N, so every
         // node sends only its own tail; the merge below trims to N again.
-        tail: query.tail,
+        // Without a tail every node still sends at most its newest
+        // DEFAULT_LOG_QUERY_ROWS (#2382), so ask for exactly that.
+        tail: Some(crate::ketchup::log_store::query_row_limit(query.tail)),
     };
 
     // If we have council + membership, do cross-node fan-out
@@ -1111,11 +1113,7 @@ pub(super) async fn logs_cross_node_handler(
                 // 10s", not a silent empty or a bare "did not respond" (#282).
                 warnings.extend(result.failures.into_iter().map(LogQueryWarning::from));
                 // Apply tail after merge (fan_out already merge-sorted)
-                if let Some(tail) = query.tail
-                    && entries.len() > tail
-                {
-                    entries = entries.split_off(entries.len() - tail);
-                }
+                warnings.extend(cap_entries(&mut entries, query.tail));
                 Json(LogQueryResult {
                     entries,
                     node_count,
@@ -1146,15 +1144,32 @@ pub(super) async fn logs_cross_node_handler(
         };
         let store = log_store.read().await;
         match store.query_with(&app, &namespace, &filter).await {
-            Ok(entries) => Json(LogQueryResult {
-                entries,
-                node_count: 1,
-                warnings: vec![],
-            })
-            .into_response(),
+            Ok(mut entries) => {
+                let warnings = cap_entries(&mut entries, query.tail).into_iter().collect();
+                Json(LogQueryResult {
+                    entries,
+                    node_count: 1,
+                    warnings,
+                })
+                .into_response()
+            }
             Err(e) => log_query_error(e),
         }
     }
+}
+
+/// Keep the newest lines the query's limit allows (`tail`, or the default
+/// cap without one) from merged, oldest-first `entries`, and warn when the
+/// answer met a limit the caller didn't choose (#2382): no tail, or one
+/// above the maximum.
+fn cap_entries(entries: &mut Vec<LogEntry>, tail: Option<usize>) -> Option<LogQueryWarning> {
+    let limit = crate::ketchup::log_store::query_row_limit(tail);
+    let reached = entries.len() >= limit;
+    if entries.len() > limit {
+        entries.drain(..entries.len() - limit);
+    }
+    let chosen = tail.is_some_and(|tail| tail <= limit);
+    (reached && !chosen).then_some(LogQueryWarning::Truncated { limit })
 }
 
 /// `GET /v1/logs/sql?q=SELECT...` — query logs via DataFusion SQL.

@@ -94,7 +94,22 @@ Every read path streams (#377): `/v1/metrics` by name or `*`, `/v1/metrics/app/�
 - **Projection.** Only the columns a query uses are decoded (`SELECT DISTINCT metric_name` reads one column).
 - **Object store.** A bucket object's footer is fetched with two range reads (the 8-byte tail, then the metadata), so an object the bounds rule out is never downloaded.
 - **Incremental aggregation.** DataFusion's filter, hash aggregate and top-k sort consume the stream as it arrives: an aggregate holds one accumulator per group, `ORDER BY … LIMIT n` holds `n` rows. Sessions use one target partition, because a repartition step after the scan reads ahead of its consumers and queued batches grew with the files read.
-- **What still scales with history.** The list of file names a query starts from (a couple of hundred bytes per file). A query whose *answer* scales with history (`/v1/metrics?name=X` with no start, which has no row cap, or `/v1/metrics/rollup` grouped by minute) still needs memory for that answer.
+- **What still scales with history.** The list of file names a query starts from (a couple of hundred bytes per file). Answers no longer do (§3.1.2).
+
+#### 3.1.2 Query bounds
+
+Every read a caller drives has a row cap, a deadline and, where it lists names, a window (#2382):
+
+| Read | Bound |
+|---|---|
+| `/v1/metrics?name=X` (`MayoStore::query`) | newest `ALL_QUERY_ROW_LIMIT` (10,000) rows, oldest first |
+| `/v1/metrics?name=*`, `/v1/metrics?app=…`, `/v1/metrics/app/…` | 10,000 rows (`ALL_QUERY_ROW_LIMIT`, `APP_QUERY_ROW_LIMIT`); the per-app one defaults to the last 15 minutes |
+| `/v1/metrics/summary`, `/v1/metrics/keys` | names with a sample in the last `METRIC_NAMES_WINDOW_SECS` (one hour) |
+| `/v1/metrics/rollup?name=X` (`RollupStore::query_cluster_metric`) | newest 10,000 sums, oldest first |
+| `/v1/metrics/rollup` (no name) | 10,000 rows |
+| every query above, plus `query_sql`, the rollup and autoscaler aggregates | `QUERY_DEADLINE` (8 s), under the fan-out's 10 s wait |
+
+A query past its deadline is `MayoError::QueryRejected`, which the handlers answer with a 400 and the reason: the caller's range is the problem, and narrowing it helps where retrying doesn't. `hydrate_seen_windows` at startup has no deadline; it isn't a caller's query.
 
 `tests/mayo_memory.rs` measures each path's peak heap with a counting allocator as history grows from one to four hours and fails if any grows by half. Golden snapshots recorded from the eager implementation (`src/mayo/snapshots/`) and a property test against an eager reference (`streamed_reads_match_the_eager_reader`) hold the answers identical.
 

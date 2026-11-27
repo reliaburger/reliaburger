@@ -75,11 +75,7 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         };
     }
 
@@ -94,11 +90,7 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         }
     } else {
         match store.query(name, start, end).await {
@@ -111,16 +103,13 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         }
     }
 }
 
-/// `GET /v1/metrics/summary` — latest value for each metric.
+/// `GET /v1/metrics/summary` — the metric names reported in the last hour
+/// (`METRIC_NAMES_WINDOW_SECS`).
 pub(super) async fn metrics_summary_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -142,16 +131,19 @@ pub(super) async fn metrics_summary_handler(
     };
 
     let store = mayo.read().await;
-    match store.metric_names().await {
+    match store
+        .metric_names_since(
+            crate::mayo::types::Sample::now(0.0)
+                .timestamp
+                .saturating_sub(crate::mayo::store::METRIC_NAMES_WINDOW_SECS),
+        )
+        .await
+    {
         Ok(names) => {
             // Return the list of known metrics (full summary requires more complex SQL)
             Json(serde_json::json!({"metrics": names})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -185,7 +177,8 @@ pub(super) async fn alerts_handler(
     Json(crate::mayo::alert::AlertsResponse { alerts: statuses }).into_response()
 }
 
-/// `GET /v1/metrics/keys` — list all distinct metric names.
+/// `GET /v1/metrics/keys` — the distinct metric names reported in the last
+/// hour (`METRIC_NAMES_WINDOW_SECS`).
 pub(super) async fn metrics_keys_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -207,13 +200,16 @@ pub(super) async fn metrics_keys_handler(
     };
 
     let store = mayo.read().await;
-    match store.metric_names().await {
-        Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+    match store
+        .metric_names_since(
+            crate::mayo::types::Sample::now(0.0)
+                .timestamp
+                .saturating_sub(crate::mayo::store::METRIC_NAMES_WINDOW_SECS),
         )
-            .into_response(),
+        .await
+    {
+        Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -267,11 +263,7 @@ pub(super) async fn metrics_rollup_handler(
                 .collect();
             Json(data).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -311,11 +303,7 @@ pub(super) async fn metrics_owned_rollup_handler(
         .await
     {
         Ok(rows) => Json(rows).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error":error.to_string()})),
-        )
-            .into_response(),
+        Err(error) => metrics_store_error(error),
     }
 }
 
@@ -421,11 +409,7 @@ pub(super) async fn metrics_cluster_handler(
         Ok(rows) => {
             Json(crate::mayo::query_fanout::merge_owned_rollups(vec![rows])).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -533,6 +517,21 @@ pub(super) fn app_query_window(start: Option<u64>, end: Option<u64>) -> (u64, u6
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
     (start, end)
+}
+
+/// A store error as an API answer: a refused query (past its deadline, or
+/// too many rows for its range) is the caller's to narrow, so a 400 with
+/// the reason; anything else is ours (#2382).
+pub(super) fn metrics_store_error(error: crate::mayo::types::MayoError) -> Response {
+    let status = match error {
+        crate::mayo::types::MayoError::QueryRejected(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 pub(super) fn metrics_error_response(error: String) -> Response {
