@@ -306,6 +306,14 @@ pub struct Compatibility {
 /// `NodeRollup` carries a `part` number, so a minute too large for one
 /// report frame goes out in parts and the council's rollup dedup key is
 /// `(node, window, part)` (#2426).
+/// `ArrayAssignment` carries `template_known` and `ArrayProgress`
+/// `template_unknown`, so the leader sends a run's template to a node once;
+/// empty `template`, `program`, `args`, `env` and `held` are no longer
+/// serialised, and an older node would read a template-less assignment as a
+/// host job with an empty binary (#2444).
+/// `AppSpec` and `SidecarSpec` carry `pids`, a process and thread limit, and
+/// refuse unknown fields, so the app spec on the wire and in the replicated
+/// desired state changes (#2386).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

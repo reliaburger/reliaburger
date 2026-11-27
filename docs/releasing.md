@@ -926,7 +926,7 @@ it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-Three things to check before you start the fresh cluster:
+Five things to check before you start the fresh cluster:
 
 - **Node names.** `[node] name` must be one DNS label: 1 to 63 lowercase
   letters, digits and `-`. Bun refuses to start otherwise, and
@@ -944,6 +944,16 @@ Three things to check before you start the fresh cluster:
   too, which a 0.3.3 Bun can't read, so a 0.3.3 node can't stage a 0.3.4
   binary with `relish upgrade` even apart from the format bump
   ([#2403](https://github.com/reliaburger/reliaburger/issues/2403)).
+- **Process limits.** An image app's container and each sidecar now get a
+  limit of 4,096 processes and threads unless they set `pids` (up to
+  32,768). Set `pids` on any app or sidecar that runs more before you apply
+  it to the new cluster
+  ([#2386](https://github.com/reliaburger/reliaburger/issues/2386)).
+- **Set-uid binaries.** Rootful runc containers run with no-new-privileges
+  under Docker's default seccomp filter, so an image that starts as a
+  non-root user and relies on `sudo` or another set-uid binary must start as
+  root instead
+  ([#2402](https://github.com/reliaburger/reliaburger/issues/2402)).
 
 ## Signing identity
 
