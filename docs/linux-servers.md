@@ -928,7 +928,7 @@ names any node that's missing it.
 | List one app's instances | `relish apps hello` |
 | View cluster membership | `relish nodes` |
 | View Raft council status | `relish council` |
-| Inspect app or node details | `relish inspect <app-or-node>` |
+| List an app's instances on every node | `relish inspect <app>` |
 | Stream application logs | `relish logs <app>` |
 | Apply application configuration | `relish apply <file.toml>` |
 | Stop an application | `relish stop <app>` |

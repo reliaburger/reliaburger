@@ -33,7 +33,7 @@
 
 release = "0.3.3"
 released = "27 November 2026"
-reviewed = "10 November 2026"
+reviewed = "27 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
 [milestones]
@@ -294,7 +294,7 @@ status = "planned"
 milestone = "0.4.0"
 summary = "Cordon, drain and uncordon, and cold moves that carry volumes."
 restrictions = "Today a managed-volume app stays with its node. Keeping memory across a move is planned for VM apps only (0.4.5); container checkpoints by CRIU are in Later (#658)."
-issues = [2106, 656, 657, 659]
+issues = [2106, 656, 657, 658, 659]
 docs = ["docs/roadmap.md#releases-after-010"]
 evidence = "Roadmap 0.4.0; issues in milestone 0.4.0."
 
@@ -538,7 +538,7 @@ evidence = "Every staged install enrols two nodes this way (2026-11-07 record, '
 name = "API tokens with roles and scopes"
 status = "ready"
 since = "0.1.0"
-summary = "Tokens carry a role and namespace scopes, expire after 90 days by default, and rotate with a grace period."
+summary = "Tokens carry a role and namespace scopes and rotate with a grace period. Deployer and read-only tokens expire after 90 days by default; admin tokens don't expire."
 restrictions = "On a plaintext cluster, the first API token needs a master key; `relish token create` refuses it without one."
 issues = []
 docs = ["docs/manual/10_security.md#api-tokens"]
@@ -548,8 +548,8 @@ evidence = "Rotation and lifetimes since 0.1.6. The gate's harness runs with its
 name = "Workload identity"
 status = "ready"
 since = "0.1.0"
-summary = "Every workload gets a SPIFFE certificate that rotates on its own."
-restrictions = ""
+summary = "Every app instance on a cluster gets a SPIFFE certificate that rotates on its own."
+restrictions = "Job tasks don't get an identity yet, and a standalone node issues none."
 issues = []
 docs = ["docs/manual/10_security.md#workload-identity"]
 evidence = "Gate: 9 workload identity rotations per node in the 0.2.7 V02 fast tier (soak-identity app)."
@@ -744,7 +744,7 @@ title = "Observability: metrics, logs and alerts"
 name = "Metrics"
 status = "ready"
 since = "0.1.0"
-summary = "Each node scrapes its own workloads, including anything with `prometheus.io` annotations, and `relish metrics`, `relish top`, the TUI and the dashboard read them."
+summary = "Each node scrapes the apps that ask for it with `metrics = {}`, and `relish metrics`, `relish top`, the TUI and the dashboard read them. An imported Kubernetes manifest gets `metrics` from its `prometheus.io` annotations."
 restrictions = "No PromQL: read metrics through `relish metrics`, the dashboards and the API."
 issues = []
 docs = ["docs/manual/04_observability.md#metrics"]
@@ -1067,7 +1067,7 @@ status = "beta"
 since = "0.2.8"
 summary = "Ask the cluster why it did something, with one merged timeline of an incident."
 restrictions = "The `/v1/timeline` endpoint, GitOps and log events are #1084 in 0.4.2."
-issues = []
+issues = [1084]
 docs = ["docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that"]
 evidence = "Shipped in 0.2.8 (#1685); unit and cluster tests on the train, and the five-minute tour's kill step. #1084 (machine-readable timeline) in 0.4.2."
 
@@ -1149,7 +1149,7 @@ name = "Web dashboard"
 status = "beta"
 since = "0.1.0"
 summary = "`relish dashboard` opens a read-only web dashboard through your authenticated CLI session."
-restrictions = "Read-only."
+restrictions = "Read-only through `relish dashboard`. Signed in on the leader's own port, its Proposals page can approve, reject and undo a proposal with your API token."
 issues = []
 docs = ["docs/manual/04_observability.md#events-and-dashboards", "docs/design/ui-brioche.md"]
 evidence = "Documented and tested; not exercised by the release gate."

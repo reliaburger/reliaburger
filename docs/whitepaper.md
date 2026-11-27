@@ -928,7 +928,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish events` | Recent cluster-wide events (the TUI streams them) | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
-| `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
+| `relish inspect <app>` | Every instance of an app across the cluster, with its node | `kubectl describe` |
 | `relish top` | Workloads with their latest CPU and memory, running array tasks included | `kubectl top` (requires metrics-server) |
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
@@ -1265,7 +1265,7 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 | Operators | Operators exist to manage complex stateful workloads on Kubernetes. Without CRDs, there's no operator framework or SDK, by design. Since 0.2.4 a controller is an ordinary app holding a scoped API token, which claims the apps it manages with `owner` so `relish apply` and GitOps leave them alone ([Writing a controller](manual/15_writing-a-controller.md)). |
 | Service mesh (full sidecar proxy) | Namespace isolation, per-app eBPF firewall rules, and SPIFFE-based workload identity provide network segmentation and cryptographic authentication without the overhead of a sidecar proxy on every connection. Applications that need mTLS can configure it directly using the workload identity certificates — Reliaburger provides the certs, the app owns its TLS policy. |
 | Helm / package manager | When the configuration is already 15 lines of TOML, a package manager for configuration templates is unnecessary. For the repetition that's left, 0.2.4 added plain TOML [templates](manual/01_deploy-an-app.md#templates) with parameters, and no chart registry. |
-| External secret manager integration | The encrypted-in-git model covers the majority of use cases. Vault/AWS Secrets Manager integration is planned for v2. |
+| External secret manager integration | The encrypted-in-git model covers the majority of use cases. 0.2.4 added exec secret providers: a node runs a command you configure and passes what it prints to the workload as an environment variable, written `PROVIDER[name:reference]` ([Secrets from a provider](manual/10_security.md#secrets-from-a-provider)). Native Vault and AWS Secrets Manager integrations are still planned for v2. |
 | Windows node support | Linux only in v1. |
 | IPv6 | The current networking model (virtual IPs, eBPF hooks) is IPv4-only. IPv6 support is planned for v2. |
 | Pod affinity / anti-affinity | Replaced by simple placement hints via node labels. |

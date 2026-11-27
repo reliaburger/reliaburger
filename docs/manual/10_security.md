@@ -1411,11 +1411,12 @@ Rotating the root itself isn't supported yet.
 
 ## Workload identity
 
-Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
-(or `/job/NAME`), and its credentials appear read-only in
+Every app instance on a cluster gets a SPIFFE identity,
+`spiffe://CLUSTER/ns/NAMESPACE/app/NAME`, and its credentials appear read-only in
 `/run/reliaburger/identity/`: `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`,
 `token`, an OIDC JWT, and `api-token`, a second JWT for the Reliaburger API
-alone. Use the certificate for mTLS between your services.
+alone. Use the certificate for mTLS between your services. Job tasks don't
+get an identity yet, and a standalone node issues none.
 `ca.pem` is a bundle: every Workload CA the cluster trusts, then the root.
 Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not
