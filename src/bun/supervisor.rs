@@ -427,7 +427,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
             app_name,
-            spec.memory.is_some() || spec.cpu.is_some(),
+            spec.memory.is_some() || spec.cpu.is_some() || spec.pids.is_some(),
             spec.exec.is_some() || spec.script.is_some(),
         )?;
         self.admit_egress(
@@ -1216,6 +1216,7 @@ mod tests {
             health: None,
             memory: None,
             cpu: None,
+            pids: None,
             gpu: None,
             env: Default::default(),
             config_file: Vec::new(),

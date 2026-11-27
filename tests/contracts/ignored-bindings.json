@@ -85,6 +85,12 @@
   },
   {
     "source": "src/grill/runc.rs",
+    "function": "runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes"
+  },
+  {
+    "source": "src/grill/runc.rs",
     "function": "runc_image_root_binds_port_80_without_being_host_root",
     "binary": "reliaburger",
     "test": "grill::runc::tests::runc_image_root_binds_port_80_without_being_host_root"

@@ -4193,6 +4193,19 @@
           ]
         },
         {
+          "id": "issue-2386-runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/oci.rs",
+            "src/config/app.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-grill-runc-tests-runc_image_root_binds_port_80_without_being_host_root",
           "binary": "reliaburger",
           "test": "grill::runc::tests::runc_image_root_binds_port_80_without_being_host_root",

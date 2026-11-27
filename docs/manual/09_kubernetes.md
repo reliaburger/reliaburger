@@ -188,7 +188,7 @@ and `runAsUser`/`runAsGroup`; a job's `max_attempts` becomes `backoffLimit` and
 `forbid` → `Forbid`); an omitted `overlap` still exports as `Forbid`, because
 that's Reliaburger's default and Kubernetes' is `Allow`. It reports what it
 can't express: firewall and egress rules on apps and jobs, process workloads,
-`run_before`, a job's `pids` and `replay_unknown`, and for now health checks,
+`run_before`, an app's, a sidecar's or a job's `pids`, a job's `replay_unknown`, and for now health checks,
 metrics, volumes, config files and placement. Init containers export as
 ordinary ones named `init-0`, `init-1` and so on, before any native sidecars,
 with the app's image when they name none and the app's `env` under their own,

@@ -956,6 +956,30 @@ We match runc's text, which is fragile in principle: a future runc could reword 
 
 Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
 
+### A ceiling on processes
+
+CPU and memory aren't the only things a container can exhaust. Run `:(){ :|:& };:` in a container with no process limit and within seconds the node hits `kernel.threads-max`. From then on every `fork` on the node fails with `EAGAIN`, Bun's included, and stopping the offender needs a `runc kill` child that Bun can no longer start. Until 0.3.4 that was every app: jobs had a `pids` field since #741, but an app, its init containers and its sidecars never got a `pids.max` (#2386).
+
+Now the resource builder takes a third argument, and an image app always passes one:
+
+```rust
+fn build_resources(spec: &AppSpec) -> Option<OciResources> {
+    let host = spec.exec.is_some() || spec.script.is_some();
+    let pids = (!host).then(|| container_pids(spec.pids));
+    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref(), pids)
+}
+
+fn container_pids(asked: Option<PidsLimit>) -> u32 {
+    asked.map_or(DEFAULT_CONTAINER_PIDS, |limit| limit.get())
+}
+```
+
+`map_or(default, f)` is `match asked { Some(limit) => f(limit), None => default }` in one call. The default, `DEFAULT_CONTAINER_PIDS`, is 4,096: enough for a JVM or a Postgres with hundreds of connections, and a tiny slice of a node's process table. An app that needs more sets `pids`, up to the same 32,768 a job may ask for, and `PidsLimit` (the type jobs already used) refuses 0 and anything above that when the TOML is parsed, so no later code has to check. A sidecar has its own cgroup and its own `pids`. An init container runs in the app's cgroup before the app does, so it takes the app's limit. A host app gets none: it's a process on the node, with no container cgroup to put the limit in, and `relish apply` refuses `pids` on one rather than accept a number it would ignore.
+
+Jobs keep their old rule, no limit unless they ask. Their commands already run under a 256 default when an executor reuses its container, and a fresh job container is the one place where "unset means unlimited" was a deliberate choice.
+
+The default changes behaviour for an app that already runs more than 4,096 threads, and that's a real cost: it fails with `EAGAIN` where it used to work. We took it because the alternative fails worse. An app over the limit breaks itself; an app with no limit can break the node and every other app on it.
+
 ### The last one out turns off the lights
 
 A cgroup is a directory, and a directory stays until someone removes it. runc removes the leaf it made for a container when it deletes the container, so `/sys/fs/cgroup/reliaburger/shop/web/g3-0` goes. Its parents, `shop/web` and `shop`, don't. runc made them on the way down, but it can't know whether anyone else uses them, so it leaves them alone. Nobody noticed for a long time, because a node's namespaces are few and long-lived. Then `relish test` arrived. Every run makes namespaces named `rbtest-<run id>-NN`, deploys into them, removes its apps and goes home. On the shared test VM, each run left one more empty namespace cgroup behind ([#2324](https://github.com/reliaburger/reliaburger/issues/2324)).

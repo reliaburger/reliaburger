@@ -2419,6 +2419,91 @@ mod tests {
         assert!(!probe.contains("nested-userns"), "{probe}");
     }
 
+    /// #2386: an app's container gets a `pids.max` by default, a fork bomb
+    /// fills its own limit, and the node still starts the next container.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let ids: Vec<InstanceId> = ["default__quiet-0", "default__bomb-0", "default__after-0"]
+            .iter()
+            .map(|id| InstanceId(id.to_string()))
+            .collect();
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.clone());
+        let cgroup = |id: &InstanceId| format!("/reliaburger-test/{}", id.0);
+        let host_cgroup =
+            |id: &InstanceId| std::path::PathBuf::from(format!("/sys/fs/cgroup{}", cgroup(id)));
+        let (grill, _) = image_app(tmp.path(), &ids[0], &format!("image = \"{ALPINE_IMAGE}\""));
+        let start = |id: &InstanceId, toml: String| {
+            // One grill for all three, as on a node; only the spec is new.
+            let (_, mut spec) = image_app(tmp.path(), id, &toml);
+            spec.linux.cgroups_path = Some(cgroup(id));
+            let (grill, id) = (&grill, id.clone());
+            async move {
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+            }
+        };
+
+        start(
+            &ids[0],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3609\"]\n"),
+        )
+        .await;
+        let default_limit = std::fs::read_to_string(host_cgroup(&ids[0]).join("pids.max")).unwrap();
+
+        // A small limit of its own keeps the bomb cheap for the test host.
+        start(
+            &ids[1],
+            format!(
+                "image = \"{ALPINE_IMAGE}\"\npids = 32\n\
+                 command = [\"/bin/sh\", \"-c\", \"while :; do sleep 600 & done\"]\n"
+            ),
+        )
+        .await;
+        let events = host_cgroup(&ids[1]).join("pids.events");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let refused = loop {
+            let text = std::fs::read_to_string(&events).unwrap_or_default();
+            let refused: u64 = text
+                .lines()
+                .find_map(|line| line.strip_prefix("max "))
+                .and_then(|count| count.trim().parse().ok())
+                .unwrap_or(0);
+            if refused > 0 || std::time::Instant::now() > deadline {
+                break refused;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let bomb_limit = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.max")).unwrap();
+
+        // The node can still fork runc for another container.
+        start(
+            &ids[2],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3610\"]\n"),
+        )
+        .await;
+        let after_state = grill.state(&ids[2]).await.ok();
+
+        for id in &ids {
+            grill.kill(id).await.unwrap();
+        }
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert_eq!(
+            default_limit.trim(),
+            crate::grill::oci::DEFAULT_CONTAINER_PIDS.to_string()
+        );
+        assert_eq!(bomb_limit.trim(), "32");
+        assert!(refused > 0, "the bomb never reached its limit");
+        assert_eq!(after_state, Some(ContainerState::Running));
+    }
+
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their
     /// own user, yet no container process is root on the node.
     #[tokio::test]

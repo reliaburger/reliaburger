@@ -811,6 +811,7 @@ fn import_sidecars(
             image: container.image.clone(),
             command: container.command.clone().unwrap_or_default(),
             args: container.args.clone().unwrap_or_default(),
+            pids: None,
             env,
             memory: resources.and_then(|resources| {
                 resource_range_from(
@@ -1693,6 +1694,7 @@ fn empty_app_spec() -> AppSpec {
         health: None,
         memory: None,
         cpu: None,
+        pids: None,
         gpu: None,
         env: BTreeMap::new(),
         config_file: Vec::new(),

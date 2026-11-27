@@ -554,7 +554,7 @@ An expression sees three things and nothing else:
 |------|---------------|
 | `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
 | `job` | The same for a job, every `[job.*]` field plus `job.name` and `job.namespace`, in a policy that applies to jobs |
-| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `env`, `firewall` and `egress` |
+| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `pids`, `env`, `firewall` and `egress` |
 | `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
 | `source` | `apply` or `gitops` |
 
