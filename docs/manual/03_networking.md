@@ -224,7 +224,10 @@ client's address through, every client shares the balancer's address, so raise
 it there.
 
 Streaming responses pass through, and so do WebSockets on routes that allow
-them. If your app refuses a WebSocket upgrade (a 401 for a missing token, say),
+them. A response is cut when your app sends nothing for 30 seconds, before
+its headers (the client gets 502) or in the middle of its body, so give a
+long-lived stream such as server-sent events a heartbeat. A quiet WebSocket
+is never cut for being idle. If your app refuses a WebSocket upgrade (a 401 for a missing token, say),
 the client gets your status, headers and up to 64 KiB of the body, not a 502. A stopping instance drains its connections before it goes. A WebSocket
 still open when the drain timeout ends gets a Close frame with code 1001
 (Going Away), so a well-behaved client reconnects to another instance rather
