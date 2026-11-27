@@ -439,6 +439,10 @@ build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
 exactly its commit.
 
+Bun decodes zstd image layers with the same `zstd` crate
+([#2465](https://github.com/reliaburger/reliaburger/issues/2465)), so the
+release targets must keep building it with `default-features = false`.
+
 From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
 ([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
 job runs `relish agent source version --offline` on the `relish` it built and

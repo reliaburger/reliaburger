@@ -81,6 +81,13 @@ impl BlobStore {
             })?
     }
 
+    /// Bytes still free under `[images] max_storage`, or `None` when no
+    /// ceiling is configured. A pull compares a layer's advertised size with
+    /// this before it asks for a single byte (#2424).
+    pub fn remaining_capacity(&self) -> Result<Option<u64>, PickleError> {
+        self.budget.remaining()
+    }
+
     /// Claim exclusive upload ownership and reclaim abandoned temporary files.
     /// Call before starting any writer. Waits up to `wait` for a busy lock,
     /// then refuses competing owners, unrecognised entries and cleanup errors
