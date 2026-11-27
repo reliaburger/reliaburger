@@ -555,6 +555,26 @@ The syncs are what make a flush durable, so they stay. The test changed instead.
 
 What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, needed room for that answer, until the next section gave every answer a ceiling. Everything else is flat.
 
+### Ten thousand footers
+
+Streaming fixed memory, but not time. Each flush writes one file, a flush runs every minute, and retention keeps seven days, so a node settles at about 10,080 `metrics_NNNNNN.parquet` files. The scan decides whether a file can match from its footer statistics, and to read the footer it has to open the file. So the alert check, asking every 30 seconds for the last two minutes, opened ten thousand files to read rows from two of them. The rollup worker did the same every minute. On a Wyse 3040's eMMC that's seconds of I/O per query, for ever; on the object-store backend, two ranged GETs per object per query ([#2425](https://github.com/reliaburger/reliaburger/issues/2425)).
+
+The file name doesn't help (it's a counter, not a time), but the file never changes once it's written. That's the property that makes a cache trivially correct: whatever a footer said, it will always say. So each store keeps a `SourceIndex`, a map from file to its `(min, max)` timestamp, behind an `Arc<Mutex<…>>` that the store, every snapshot of it, and the scan's blocking threads share. A flush records the range of the batch it's about to write, so a new file is never opened just to learn its range. Any other file, after a restart say, gets its entry the first time a query reads its footer. Before opening a source, the scan asks the index:
+
+```rust
+if let Some(range) = index.range(&described)
+    && !plan.bounds.admits_times(Some(range.min), Some(range.max))
+{
+    return Ok(Vec::new());
+}
+```
+
+That `if let ... && ...` is the let chain from Chapter 1. Prune deletes a file and forgets its entry, and reads a known file's newest timestamp from the index instead of its footer.
+
+The mutex is `std::sync::Mutex`, not tokio's. The project's rule is that a std mutex is for short synchronous critical sections only, and these are: one `HashMap` lookup or insert, never held across an `.await`, and taken from blocking threads too, where tokio's async lock would be awkward. The test `a_recent_window_query_reads_only_files_that_overlap_it` writes 50 one-minute files and counts footer reads for a one-minute query: at most two, where it used to be fifty. `a_reopened_store_reads_each_footer_once` pins the restart case, `a_recent_window_remote_query_skips_old_objects` the bucket, and `a_pruned_file_leaves_the_index` the cleanup.
+
+What it doesn't fix is the file count. Listing the directory still grows with history, and a query that *wants* a week still opens a week of files. Compacting minute files into hourly ones would bound both, but it changes what's on disk, so it's its own piece of work.
+
 ### Every read gets a ceiling
 
 Streaming bounded the memory a query *works* in. It didn't bound what a query *returns*, or how long it runs, and the November 2026 audit found seven read routes where the caller chose both ([#2382](https://github.com/reliaburger/reliaburger/issues/2382)). The commonest was the most innocent: `relish logs web` with no `--tail`. Every node built `SELECT ... FROM logs WHERE app = 'web' ... ORDER BY sequence`, sorted the app's whole history, collected it into a `Vec<LogEntry>` and serialised it. A chatty app with a 2 GiB log store could get Bun killed for memory by anyone allowed to read its logs, and Bun supervises every workload on the node.

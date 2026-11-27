@@ -16,7 +16,10 @@ use datafusion::prelude::*;
 use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 
-use super::scan::{ParquetTable, list_local_off_runtime, list_remote, streaming_session};
+use super::scan::{
+    ParquetTable, SourceIndex, batch_time_range, list_local_off_runtime, list_remote,
+    streaming_session,
+};
 use super::types::{MayoError, MetricKey, Sample};
 
 /// Where a [`MayoStore`] reads and writes Parquet.
@@ -892,6 +895,9 @@ pub struct MayoStore {
     /// node's own collector last measured, read by the cluster summary
     /// without a query. A handful of entries, never more.
     latest_node: std::collections::BTreeMap<String, Sample>,
+    /// Each Parquet file's time range, so a query skips the files outside
+    /// its window without reading their footers (#2425).
+    index: SourceIndex,
     #[cfg(test)]
     test_gate: Option<Arc<MayoWriteGate>>,
 }
@@ -913,6 +919,7 @@ impl MayoStore {
             backend: Backend::Local,
             flush_counter,
             latest_node: std::collections::BTreeMap::new(),
+            index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
         }
@@ -939,6 +946,7 @@ impl MayoStore {
             backend: Backend::Remote { store, prefix },
             flush_counter,
             latest_node: std::collections::BTreeMap::new(),
+            index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
         })
@@ -1063,6 +1071,19 @@ impl MayoStore {
         }
     }
 
+    /// Tell the index what a flush is about to write, so the new file is
+    /// never opened just to learn its range.
+    fn record_flush_range(&self, target: &FlushTarget, batch: &RecordBatch) {
+        let Some(range) = batch_time_range(batch) else {
+            return;
+        };
+        let key = match target {
+            FlushTarget::Local { path, .. } => path.display().to_string(),
+            FlushTarget::Remote { key, .. } => key.to_string(),
+        };
+        self.index.record(key, range);
+    }
+
     fn allocate_flush_target(&mut self) -> FlushTarget {
         let filename = format!("metrics_{:06}.parquet", self.flush_counter);
         self.flush_counter += 1;
@@ -1115,6 +1136,7 @@ impl MayoStore {
                 foreign_collision: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ..previous
             };
+            self.record_flush_range(&retargeted.target, &retargeted.batch);
             self.pending = Some(retargeted);
         }
         if let Some(pending) = &self.pending {
@@ -1140,6 +1162,7 @@ impl MayoStore {
                 .as_ref()
                 .and_then(|gate| gate.creation_confirmation_fault.lock().unwrap().clone()),
         };
+        self.record_flush_range(&pending.target, &pending.batch);
         self.buffer.clear();
         self.pending = Some(pending.clone());
         Ok(Some(pending))
@@ -1194,6 +1217,7 @@ impl MayoStore {
             memory,
             since,
             "metrics",
+            self.index.clone(),
         );
         ctx.register_table("metrics", Arc::new(table))
             .map_err(|e| MayoError::DataFusion(e.to_string()))?;
@@ -1516,8 +1540,9 @@ impl MayoStore {
                 FlushTarget::Local { path, .. } => Some(path.clone()),
                 _ => None,
             });
+        let index = self.index.clone();
         tokio::task::spawn_blocking(move || {
-            prune_directory(&data_dir, before, in_flight.as_deref())
+            prune_directory(&data_dir, before, in_flight.as_deref(), &index)
         })
         .await
         .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
@@ -1525,11 +1550,13 @@ impl MayoStore {
 }
 
 /// Delete the Parquet files under `data_dir` whose newest datapoint is older
-/// than `before`, leaving `in_flight` alone: how many went.
-fn prune_directory(
+/// than `before`, leaving `in_flight` alone: how many went. A file `index`
+/// knows isn't opened, and a deleted file leaves it.
+pub(crate) fn prune_directory(
     data_dir: &Path,
     before: u64,
     in_flight: Option<&Path>,
+    index: &SourceIndex,
 ) -> Result<usize, MayoError> {
     let mut deleted = 0;
     let entries = match std::fs::read_dir(data_dir) {
@@ -1558,20 +1585,27 @@ fn prune_directory(
         if in_flight == Some(path.as_path()) {
             continue;
         }
-        let newest = file_max_timestamp(&path).unwrap_or_else(|| {
-            std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map(|t| {
-                    t.duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                })
-                .unwrap_or(u64::MAX)
-        });
+        let key = path.display().to_string();
+        let known = index.newest(&key);
+        let newest = known
+            .or_else(|| file_max_timestamp(&path))
+            .unwrap_or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        t.duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    })
+                    .unwrap_or(u64::MAX)
+            });
         if newest < before {
             match std::fs::remove_file(&path) {
-                Ok(()) => deleted += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(()) => {
+                    index.forget(&key);
+                    deleted += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => index.forget(&key),
                 Err(error) => {
                     return Err(MayoError::Io(std::io::Error::new(
                         error.kind(),
@@ -1995,6 +2029,91 @@ mod tests {
 
         // Prune is a no-op for a remote backend (bucket lifecycle owns retention).
         assert_eq!(restarted.prune(u64::MAX).await.unwrap(), 0);
+    }
+
+    /// #2425: a node writes a Parquet file a minute, and every query read
+    /// every file's footer before deciding it was out of range. A query for
+    /// a recent window now reads only the files that overlap it.
+    #[tokio::test]
+    async fn a_recent_window_query_reads_only_files_that_overlap_it() {
+        let (mut store, _dir) = test_store();
+        let newest = 50 * 60;
+        for minute in 1..=50 {
+            store.insert(&MetricKey::simple("m"), Sample::at(minute * 60, 1.0));
+            store.flush().await.unwrap();
+        }
+        let first = store.query("m", newest - 60, newest).await.unwrap();
+        let after_first = store.index.footer_reads();
+        let second = store.query("m", newest - 60, newest).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+        assert!(
+            store.index.footer_reads() - after_first <= 2,
+            "a repeated query read {} footers",
+            store.index.footer_reads() - after_first
+        );
+        assert!(
+            after_first <= 2,
+            "the first query read {after_first} footers"
+        );
+    }
+
+    /// #2425: a store reopened after a restart learns each file's range from
+    /// its footer once, then skips the files outside a query unread.
+    #[tokio::test]
+    async fn a_reopened_store_reads_each_footer_once() {
+        let (mut store, dir) = test_store();
+        for minute in 1..=20 {
+            store.insert(&MetricKey::simple("m"), Sample::at(minute * 60, 1.0));
+            store.flush().await.unwrap();
+        }
+        let reopened = MayoStore::new(dir.path().to_path_buf());
+        reopened.query("m", 20 * 60, 20 * 60).await.unwrap();
+        let learned = reopened.index.footer_reads();
+        assert_eq!(learned, 20, "every file's footer is read once");
+        let rows = reopened.query("m", 20 * 60, 20 * 60).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            reopened.index.footer_reads() - learned,
+            1,
+            "then only the file that overlaps the window"
+        );
+    }
+
+    /// #2425: on an object-store backend each footer is two ranged GETs. A
+    /// recent-window query's reads don't grow with the old objects.
+    #[tokio::test]
+    async fn a_recent_window_remote_query_skips_old_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        let mut store = MayoStore::open(dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        for minute in 1..=30 {
+            store.insert(&MetricKey::simple("m"), Sample::at(minute * 60, 1.0));
+            store.flush().await.unwrap();
+        }
+        let rows = store.query("m", 30 * 60, 30 * 60).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            store.index.footer_reads() <= 1,
+            "read {} footers",
+            store.index.footer_reads()
+        );
+    }
+
+    /// #2425: pruning a file forgets what the index knew about it.
+    #[tokio::test]
+    async fn a_pruned_file_leaves_the_index() {
+        let (mut store, _dir) = test_store();
+        store.insert(&MetricKey::simple("m"), Sample::at(60, 1.0));
+        store.flush().await.unwrap();
+        let now = Sample::now(0.0).timestamp;
+        store.insert(&MetricKey::simple("m"), Sample::at(now, 1.0));
+        store.flush().await.unwrap();
+        assert_eq!(store.index.len(), 2);
+        assert_eq!(store.prune(now - 10).await.unwrap(), 1);
+        assert_eq!(store.index.len(), 1);
     }
 
     #[tokio::test]

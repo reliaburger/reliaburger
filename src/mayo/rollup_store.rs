@@ -17,7 +17,8 @@ use datafusion::prelude::*;
 
 use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
 use super::scan::{
-    ParquetSource, ParquetTable, list_local, list_local_off_runtime, streaming_session,
+    ParquetSource, ParquetTable, SourceIndex, batch_time_range, list_local, list_local_off_runtime,
+    streaming_session,
 };
 use super::store::{
     ALL_QUERY_ROW_LIMIT, dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet,
@@ -106,6 +107,9 @@ pub struct RollupStore {
     /// Newest window timestamp seen, used as the anchor for pruning
     /// `seen_windows` (kept off the wall clock for determinism).
     newest_window: u64,
+    /// Each Parquet file's time range, so a query skips the files outside
+    /// its window without reading their footers (#2425).
+    index: SourceIndex,
 }
 
 impl RollupStore {
@@ -122,6 +126,7 @@ impl RollupStore {
             flush_counter,
             seen_windows: HashSet::new(),
             newest_window: 0,
+            index: SourceIndex::default(),
         }
     }
 
@@ -285,6 +290,9 @@ impl RollupStore {
 
         let filename = format!("rollup_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
+        if let Some(range) = batch_time_range(&batch) {
+            self.index.record(path.display().to_string(), range);
+        }
         tokio::fs::create_dir_all(&self.data_dir)
             .await
             .map_err(MayoError::Io)?;
@@ -314,6 +322,7 @@ impl RollupStore {
             self.buffer_to_batch()?,
             None,
             "rollup",
+            self.index.clone(),
         );
         ctx.register_table("rollups", Arc::new(table))
             .map_err(|e| MayoError::DataFusion(e.to_string()))?;
@@ -599,9 +608,12 @@ impl RollupStore {
     /// on a blocking thread (#1417).
     pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
         let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || prune_directory(&data_dir, before))
-            .await
-            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+        let index = self.index.clone();
+        tokio::task::spawn_blocking(move || {
+            super::store::prune_directory(&data_dir, before, None, &index)
+        })
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Prune rollups older than `retention`, measured back from `now`.
@@ -627,59 +639,6 @@ impl RollupStore {
         let before = now_secs.saturating_sub(retention.as_secs());
         self.prune(before).await
     }
-}
-
-/// Delete the Parquet files under `data_dir` whose newest datapoint is older
-/// than `before`: how many went.
-fn prune_directory(data_dir: &std::path::Path, before: u64) -> Result<usize, MayoError> {
-    let mut deleted = 0;
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(entries) => entries,
-        // A new store has no directory until its first flush.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => {
-            return Err(MayoError::Io(std::io::Error::new(
-                error.kind(),
-                format!("list metrics {}: {error}", data_dir.display()),
-            )));
-        }
-    };
-    for entry in entries {
-        let path = entry
-            .map_err(|error| {
-                MayoError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!("read metrics directory {}: {error}", data_dir.display()),
-                ))
-            })?
-            .path();
-        if !path.extension().is_some_and(|e| e == "parquet") {
-            continue;
-        }
-        let newest = super::store::file_max_timestamp(&path).unwrap_or_else(|| {
-            std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map(|t| {
-                    t.duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                })
-                .unwrap_or(u64::MAX)
-        });
-        if newest < before {
-            match std::fs::remove_file(&path) {
-                Ok(()) => deleted += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(MayoError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("prune {}: {error}", path.display()),
-                    )));
-                }
-            }
-        }
-    }
-    Ok(deleted)
 }
 
 /// A cluster-wide aggregate row with full statistics.

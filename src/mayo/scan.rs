@@ -11,9 +11,10 @@
 //! its working set (one file plus the operator's state), not the history on
 //! disk.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -128,6 +129,116 @@ pub(crate) async fn list_remote(
         }
     }
     Ok(sources)
+}
+
+/// The timestamps one Parquet file holds, from its footer statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimeRange {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl TimeRange {
+    /// The range of a file's `timestamp` column across every row group, or
+    /// `None` when a row group lacks the statistics to say.
+    fn of_file(metadata: &ParquetMetaData) -> Option<Self> {
+        let schema = metadata.file_metadata().schema_descr();
+        let column = leaf_index(schema, TIMESTAMP_COLUMN)?;
+        let mut range: Option<Self> = None;
+        for group in metadata.row_groups() {
+            let Some(Statistics::Int64(stats)) = group.column(column).statistics() else {
+                return None;
+            };
+            // Unsigned timestamps are stored as INT64; reinterpreting the
+            // bits restores the value.
+            let min = *stats.min_opt()? as u64;
+            let max = *stats.max_opt()? as u64;
+            range = Some(match range {
+                Some(seen) => Self {
+                    min: seen.min.min(min),
+                    max: seen.max.max(max),
+                },
+                None => Self { min, max },
+            });
+        }
+        range
+    }
+}
+
+/// What each Parquet file's footer said about its time range, so a query
+/// skips a file outside its window without opening it (#2425).
+///
+/// A node writes a file a minute, about 10,000 in a week, and every query
+/// used to read every footer before deciding a file was out of range. A
+/// file never changes once written, so an entry is filled once, the first
+/// time its footer is read or when the flush that writes it knows its
+/// range, and never refreshed; pruning a file removes its entry. Cloning
+/// shares the index, so a query snapshot reads and fills the store's own.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceIndex {
+    // A std mutex: every critical section is one map lookup or insert, with
+    // no `.await` inside, and the scan calls it from blocking threads too.
+    ranges: Arc<std::sync::Mutex<HashMap<String, TimeRange>>>,
+    /// Footers read from storage, for tests to count.
+    footer_reads: Arc<AtomicUsize>,
+}
+
+impl SourceIndex {
+    fn ranges(&self) -> std::sync::MutexGuard<'_, HashMap<String, TimeRange>> {
+        self.ranges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the index knows about the file named `key`.
+    fn range(&self, key: &str) -> Option<TimeRange> {
+        self.ranges().get(key).copied()
+    }
+
+    /// Record the time range of the file named `key` (a local path or a
+    /// bucket key, as [`ParquetSource`] describes it).
+    pub fn record(&self, key: String, range: TimeRange) {
+        self.ranges().insert(key, range);
+    }
+
+    /// Forget a file that is gone.
+    pub fn forget(&self, key: &str) {
+        self.ranges().remove(key);
+    }
+
+    /// The newest timestamp the index knows the file named `key` holds.
+    pub fn newest(&self, key: &str) -> Option<u64> {
+        self.range(key).map(|range| range.max)
+    }
+
+    fn count_footer_read(&self) {
+        self.footer_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many footers queries have read from storage.
+    #[cfg(test)]
+    pub fn footer_reads(&self) -> usize {
+        self.footer_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many files the index knows.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.ranges().len()
+    }
+}
+
+/// The time range of a batch's `timestamp` column, for a flush to record
+/// before its file is first read. `None` for an empty batch.
+pub(crate) fn batch_time_range(batch: &RecordBatch) -> Option<TimeRange> {
+    let timestamps = batch
+        .column_by_name(TIMESTAMP_COLUMN)?
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::UInt64Array>()?;
+    Some(TimeRange {
+        min: datafusion::arrow::compute::min(timestamps)?,
+        max: datafusion::arrow::compute::max(timestamps)?,
+    })
 }
 
 /// What a query's predicates promise about the rows it wants, in the terms
@@ -419,14 +530,17 @@ struct ScanPlan {
 /// Decode the admitted row groups of one file, only the planned columns.
 /// All of a file or none of it: a file that fails part-way is skipped
 /// whole, as the eager reader did (OBS5).
+///
+/// Also returns the file's time range, for the [`SourceIndex`].
 fn decode<R: ChunkReader + 'static>(
     reader: R,
     plan: &ScanPlan,
-) -> Result<Vec<RecordBatch>, String> {
+) -> Result<(Option<TimeRange>, Vec<RecordBatch>), String> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| e.to_string())?;
+    let range = TimeRange::of_file(builder.metadata());
     let groups = admitted_row_groups(builder.metadata(), &plan.bounds);
     if groups.is_empty() {
-        return Ok(Vec::new());
+        return Ok((range, Vec::new()));
     }
     let file_schema = builder.parquet_schema();
     // A query that needs no column (`COUNT(*)`) still needs row counts, so
@@ -472,7 +586,7 @@ fn decode<R: ChunkReader + 'static>(
             .map_err(|e| e.to_string())?;
         batches.push(batch);
     }
-    Ok(batches)
+    Ok((range, batches))
 }
 
 /// A bucket object's footer, fetched with two range reads instead of the
@@ -507,14 +621,25 @@ fn blocking_failed(error: tokio::task::JoinError) -> DataFusionError {
 /// Read one source's admitted rows. A file that can't be read or decoded
 /// is logged and contributes nothing; only a failed object download fails
 /// the query, as before.
+///
+/// A source the [`SourceIndex`] already places outside the query's time
+/// bounds isn't opened at all (#2425); any other source's footer fills the
+/// index.
 async fn read_source(
     source: ParquetSource,
     plan: Arc<ScanPlan>,
+    index: SourceIndex,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
     let described = source.describe();
+    if let Some(range) = index.range(&described)
+        && !plan.bounds.admits_times(Some(range.min), Some(range.max))
+    {
+        return Ok(Vec::new());
+    }
     let decoded = match source {
         ParquetSource::Local(path) => {
             let plan = Arc::clone(&plan);
+            index.count_footer_read();
             tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
                 decode(file, &plan)
@@ -527,7 +652,12 @@ async fn read_source(
             location,
             size,
         } => {
-            if let Some(footer) = remote_footer(&store, &location, size).await
+            index.count_footer_read();
+            let footer = remote_footer(&store, &location, size).await;
+            if let Some(range) = footer.as_ref().and_then(TimeRange::of_file) {
+                index.record(described.clone(), range);
+            }
+            if let Some(footer) = footer
                 && admitted_row_groups(&footer, &plan.bounds).is_empty()
             {
                 return Ok(Vec::new());
@@ -547,7 +677,12 @@ async fn read_source(
         }
     };
     match decoded {
-        Ok(batches) => Ok(batches),
+        Ok((range, batches)) => {
+            if let Some(range) = range {
+                index.record(described, range);
+            }
+            Ok(batches)
+        }
         Err(error) => {
             eprintln!(
                 "mayo: skipping unreadable {} file {described}: {error}",
@@ -565,6 +700,7 @@ struct SourceStream {
     plan: Arc<ScanPlan>,
     sources: Arc<Vec<ParquetSource>>,
     buffer: Option<RecordBatch>,
+    index: SourceIndex,
 }
 
 impl PartitionStream for SourceStream {
@@ -575,10 +711,13 @@ impl PartitionStream for SourceStream {
     fn execute(&self, _context: Arc<TaskContext>) -> SendableRecordBatchStream {
         let plan = Arc::clone(&self.plan);
         let sources = Arc::clone(&self.sources);
+        let index = self.index.clone();
         // `then` runs one read at a time, so at most one file's batches are
         // decoded and waiting at once.
         let files = futures_util::stream::iter(0..sources.len())
-            .then(move |index| read_source(sources[index].clone(), Arc::clone(&plan)))
+            .then(move |source| {
+                read_source(sources[source].clone(), Arc::clone(&plan), index.clone())
+            })
             .flat_map(|read| {
                 let batches: Vec<Result<RecordBatch, DataFusionError>> = match read {
                     Ok(batches) => batches.into_iter().map(Ok).collect(),
@@ -604,17 +743,20 @@ pub(crate) struct ParquetTable {
     /// A lower time bound every query on this table promises to apply.
     floor: Option<u64>,
     kind: &'static str,
+    index: SourceIndex,
 }
 
 impl ParquetTable {
     /// A table over `sources` then `buffer`. `floor` is a lower time bound
-    /// the caller's SQL already filters on; `kind` names the files in logs.
+    /// the caller's SQL already filters on; `kind` names the files in logs;
+    /// `index` is the store's record of each file's time range.
     pub fn new(
         schema: SchemaRef,
         sources: Vec<ParquetSource>,
         buffer: Option<RecordBatch>,
         floor: Option<u64>,
         kind: &'static str,
+        index: SourceIndex,
     ) -> Self {
         Self {
             schema,
@@ -622,6 +764,7 @@ impl ParquetTable {
             buffer,
             floor,
             kind,
+            index,
         }
     }
 }
@@ -677,6 +820,7 @@ impl TableProvider for ParquetTable {
             }),
             sources: Arc::clone(&self.sources),
             buffer,
+            index: self.index.clone(),
         };
         let exec = StreamingTableExec::try_new(
             schema,
@@ -709,7 +853,14 @@ mod tests {
             Field::new("value", DataType::Float64, false),
         ]));
         let ctx = SessionContext::new();
-        let table = ParquetTable::new(schema, Vec::new(), None, None, "metrics");
+        let table = ParquetTable::new(
+            schema,
+            Vec::new(),
+            None,
+            None,
+            "metrics",
+            SourceIndex::default(),
+        );
         ctx.register_table("metrics", Arc::new(table)).unwrap();
         let plan = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
         let mut found = None;
@@ -864,6 +1015,7 @@ mod tests {
             Some(buffer.clone()),
             None,
             "metrics",
+            SourceIndex::default(),
         );
         ctx.register_table("t", Arc::new(table)).unwrap();
         let reference = SessionContext::new();
