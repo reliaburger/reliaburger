@@ -928,7 +928,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish events` | Recent cluster-wide events (the TUI streams them) | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
-| `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
+| `relish inspect <app>` | Every instance of an app across the cluster, with its node | `kubectl describe` |
 | `relish top` | Workloads with their latest CPU and memory, running array tasks included | `kubectl top` (requires metrics-server) |
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
