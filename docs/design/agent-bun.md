@@ -1401,6 +1401,21 @@ Three decisions shape everything that follows, and each earns its keep against t
    its boot checks, the node reverts the symlink to the previous version,
    execs it, and records the reverted upgrade_id so the leader observes the
    revert on its next version poll and pauses the run.
+
+   The new binary counts each boot before it reads its config (#2415).
+   Before the swap in 5, the old binary writes a pointer beside the entry
+   symlink, `{binary_dir}/.{stem}.upgrade-pending`, naming the marker's
+   absolute path and `max_boot_attempts`. The first thing an agent boot does
+   (after `--compatibility`, `testapp` and the appliance commands, which
+   are not boots, and also when its command line fails to parse) is find
+   the pointer from the executable path, load the marker and run
+   `decide_startup`. A counted boot is persisted at once; one past the
+   budget flips the symlink back and execs the previous version. Startup
+   recovery, after config load, takes that count as it is. The pointer is
+   removed with the marker: on commit, a completed revert, a stale-marker
+   archive and a failed exec. It is node-local, not cluster state. A node
+   whose `[upgrades] binary_dir` is not the directory the executable runs
+   from counts in startup recovery only.
 ```
 
 **Cluster-level upgrade orchestration (leader-side, `src/upgrade/orchestrator.rs`).**

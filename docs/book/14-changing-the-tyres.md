@@ -342,6 +342,16 @@ The logic reads like a table. Marker says `Staged`: the process died *between* s
 
 Trace the crash-loop story through it, because this is the automatic rollback promised at the start of the chapter. Upgrade swaps and execs: `Executed`, attempts 0. New binary boots, decision increments to 1 (under the limit of 2): `VerifyUpgrade`. It crashes. The supervisor (systemd in production, the test harness in tests) restarts the symlink, which still points at the new binary. Attempts 2: still `VerifyUpgrade`. Crashes again. Attempts 3: over budget. `RevertAndExecPrevious`. Startup flips the symlink back and execs the old binary, which wakes up, sees `RevertPending`-and-I'm-the-previous-version, and completes the revert: report the failure to the leader, archive the marker, get on with life. No human involved, and every step of that story is a unit test with the same name.
 
+### Count the boot before anything can fail
+
+That story has a quiet assumption: the new binary gets far enough to count. For a long time it counted in startup recovery, right after it had loaded its config, run about ten validations, checked the state format and taken the registry's upload lock. A release that renamed a config key, or tightened a validation this node's config broke, exited before any of that. The supervisor restarted it, it exited at the same line, and `boot_attempts` stayed at 0 for ever. The node was down until someone logged in and moved the symlink by hand, and on an appliance there's no one to log in (#2415).
+
+So now the very first thing an agent boot does, before it opens its config, is count. The trouble is that the marker lives in the data directory, and only the config says where that is. The old binary solves it for the new one: just before it swaps the symlink, it writes a small pointer beside it, `{binary_dir}/.bun.upgrade-pending`, holding the marker's absolute path and the boot budget. The new binary finds its own directory from the executable path alone, reads the pointer, loads the marker and runs the same `decide_startup`. That's `count_upgrade_boot` in `src/upgrade/manager.rs`. A counted boot is written to disk at once. A boot past the budget flips the symlink back and execs the previous version, still without a config. Everything else (completing a revert, archiving a stale marker) waits for startup recovery as before, and the pointer goes wherever the marker goes: commit, completed revert, stale archive, failed `execv`.
+
+Startup recovery runs later in the same boot, so it's handed what the early step did (`EarlyBoot::Counted`), and a boot is never counted twice. Even a command line the new release won't parse counts. `bun` calls clap's `Cli::try_parse()` instead of `Cli::parse()`: `parse` prints the error and exits on its own, while `try_parse` returns a `Result`, so we can count the boot before calling `error.exit()` ourselves. (`error.use_stderr()` tells a real error from `--help` and `--version`, which aren't boots.)
+
+The test is `an_upgrade_that_fails_before_config_load_reverts_by_itself` in `tests/self_upgrade.rs`. It poisons v0.2.0 with a `.fail-early` sidecar, a debug-only hook that exits before the config is read, and waits for the node to come back on v0.1.0 by itself.
+
 ### Why pure?
 
 `decide_startup` touches no filesystem, spawns nothing, execs nothing. All I/O happens before it (loading the marker) or after it (persisting the mutated marker the decision carries, then acting). That split is what makes the scariest logic in the chapter *boring to test*: the crash-loop test doesn't crash anything, it calls a function with `boot_attempts: 2` and asserts on the returned enum. Fourteen tests cover every phase-times-version combination, and they run in six milliseconds.
@@ -352,7 +362,8 @@ One Rust note for the road. The decision arms use *match guards* (`MarkerPhase::
 
 ### What we decided not to do
 
-- **Keeping attempts in the supervisor.** systemd's `StartLimitBurst` could count restarts, but then the logic lives in a unit file we don't ship and can't test, and macOS/test environments behave differently. The marker makes the binary self-contained: any dumb `while true; do bun; done` loop is an adequate supervisor.
+- **Keeping attempts in the supervisor.** systemd's `StartLimitBurst` could count restarts, but then the logic lives in a unit file we don't ship and can't test, and macOS/test environments behave differently. The marker makes the binary self-contained: any dumb `while true; do bun; done` loop is an adequate supervisor. The price is that the binary has to count before it can fail, which is why the count runs before the config is read.
+- **Having the old binary count, and a shim decide.** The old binary could bump `boot_attempts` before each exec, with a second small binary in front of `bun` deciding whether to revert. That's a second binary to ship, sign and upgrade. The pointer file gets the same result with one.
 - **Reverting on the *first* failed boot.** Transient failures exist (a port not yet released, a slow disk). One retry is cheap; the budget is configurable (`upgrades.max_boot_attempts`, default 2).
 - **Deleting stale markers.** Archiving costs nothing and the file is exactly what you'll want when diagnosing "why did node 7 revert last night".
 

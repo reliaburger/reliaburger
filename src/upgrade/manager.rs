@@ -12,6 +12,9 @@
 //!
 //! Startup-side recovery ([`UpgradeManager::startup_action`]) wraps the pure
 //! [`decide_startup`] state machine with the filesystem actions it demands.
+//! Its first half, counting the boot, runs earlier still, in
+//! [`count_upgrade_boot`]: before the new binary reads its config, so a
+//! version that can't even get that far still burns its attempts (#2415).
 
 use std::path::{Path, PathBuf};
 
@@ -104,6 +107,166 @@ pub enum StartupAction {
     /// [`UpgradeManager::exec_current_symlink`]. (Returned instead of
     /// exec'ing directly so the caller controls final flushes.)
     ExecPrevious,
+}
+
+/// What [`count_upgrade_boot`] did with this boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EarlyBoot {
+    /// No swap is waiting on this binary's verdict, or one is but needs the
+    /// full startup recovery (a completed revert, a stale marker). Startup
+    /// recovery decides as before.
+    Uncounted,
+    /// This boot of a freshly swapped-in binary was counted, and the marker
+    /// at `marker_path` now says so. [`UpgradeManager::startup_action`]
+    /// must not count it again.
+    Counted {
+        marker_path: PathBuf,
+        marker: UpgradeMarker,
+    },
+    /// The boot budget is spent, or the wrong version is running: the entry
+    /// symlink already points back at the previous version. Exec it now
+    /// with [`exec_symlink`].
+    ExecPrevious { symlink: PathBuf },
+}
+
+/// What the old binary leaves beside the entry symlink when it swaps, so the
+/// new binary can count its boot before it reads its config (#2415).
+///
+/// The marker lives in the data directory, which only the config names, and
+/// the config is the first thing a broken release may fail to read. The
+/// binary directory is found from the executable alone. The pointer is
+/// node-local and read only by the binary that wrote it or its successor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PendingPointer {
+    /// Absolute path of the upgrade marker.
+    marker: PathBuf,
+    /// The boot budget of the binary that started the upgrade.
+    max_boot_attempts: u32,
+}
+
+/// The pointer file for the store whose entry symlink is `symlink`:
+/// `{binary_dir}/.{stem}.upgrade-pending`.
+fn pending_pointer_path(symlink: &Path) -> PathBuf {
+    let stem = symlink
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bun");
+    symlink.with_file_name(format!(".{stem}.upgrade-pending"))
+}
+
+/// Remove the pointer, if any. A pointer with no marker behind it is
+/// harmless (the next boot removes it), so failure is only reported.
+fn remove_pending_pointer(symlink: &Path) {
+    match std::fs::remove_file(pending_pointer_path(symlink)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("bun: warning: cannot remove the upgrade boot pointer: {error}"),
+    }
+}
+
+/// Count this boot against an in-flight upgrade, before anything else.
+///
+/// Call it first thing in an agent boot, with only what the process knows
+/// without its config: the executable it was invoked as and the version it
+/// runs. It finds the old binary's [`PendingPointer`] beside the entry
+/// symlink, loads the marker it names and runs [`decide_startup`]. A boot
+/// that counts is persisted at once. One past the budget (or a version the
+/// marker doesn't expect) points the symlink back at the previous version
+/// and asks the caller to exec it. Everything else is left to
+/// [`UpgradeManager::startup_action`].
+///
+/// Only the binary directory the executable sits in is searched: a node
+/// whose `[upgrades] binary_dir` puts the store elsewhere counts its boots
+/// in startup recovery, as before.
+pub fn count_upgrade_boot(
+    invoked_path: &Path,
+    running: &BinaryVersion,
+) -> Result<EarlyBoot, UpgradeError> {
+    let resolved = std::fs::canonicalize(invoked_path)?;
+    let Some(binary_dir) = resolved.parent() else {
+        return Ok(EarlyBoot::Uncounted);
+    };
+    let store = BinaryStore::new(binary_dir.to_path_buf(), derive_stem(invoked_path));
+    let symlink = store.symlink_path();
+    let pointer_path = pending_pointer_path(&symlink);
+    let pointer: PendingPointer = match std::fs::read(&pointer_path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                eprintln!("bun: warning: ignoring an unreadable upgrade boot pointer: {error}");
+                remove_pending_pointer(&symlink);
+                return Ok(EarlyBoot::Uncounted);
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EarlyBoot::Uncounted);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let marker = match UpgradeMarker::load(&pointer.marker) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => {
+            // The upgrade ended without its pointer going too.
+            remove_pending_pointer(&symlink);
+            return Ok(EarlyBoot::Uncounted);
+        }
+        // Startup recovery archives a corrupt marker.
+        Err(_) => return Ok(EarlyBoot::Uncounted),
+    };
+    match decide_startup(Some(marker), running, pointer.max_boot_attempts) {
+        StartupDecision::VerifyUpgrade { marker } => {
+            marker.store(&pointer.marker)?;
+            Ok(EarlyBoot::Counted {
+                marker_path: pointer.marker,
+                marker,
+            })
+        }
+        StartupDecision::RevertAndExecPrevious { marker } => {
+            eprintln!(
+                "bun: upgrade to {} failed after {} boot attempt(s) running {running}; \
+                 reverting to {}",
+                marker.target_version, marker.boot_attempts, marker.previous_version
+            );
+            marker.store(&pointer.marker)?;
+            store.activate(&marker.previous_version)?;
+            Ok(EarlyBoot::ExecPrevious { symlink })
+        }
+        StartupDecision::NormalBoot
+        | StartupDecision::CompleteRevert { .. }
+        | StartupDecision::ArchiveStaleMarker { .. } => Ok(EarlyBoot::Uncounted),
+    }
+}
+
+/// Replace this process with `symlink`, passing `original_argv` after it.
+/// Never returns on success.
+pub fn exec_symlink(symlink: &Path, original_argv: &[String]) -> UpgradeError {
+    use std::ffi::CString;
+
+    let Ok(path_c) = CString::new(symlink.to_string_lossy().into_owned()) else {
+        return UpgradeError::ExecFailed {
+            reason: "binary path contains a NUL byte".to_string(),
+        };
+    };
+    // argv[0] is the symlink path; the rest is the original command line
+    // (config path, --cluster, ...), which the new binary re-parses.
+    let mut argv_c = vec![path_c.clone()];
+    for arg in original_argv.iter().skip(1) {
+        match CString::new(arg.as_str()) {
+            Ok(c) => argv_c.push(c),
+            Err(_) => {
+                return UpgradeError::ExecFailed {
+                    reason: format!("argument contains a NUL byte: {arg:?}"),
+                };
+            }
+        }
+    }
+
+    // execv only returns on failure.
+    let err = nix::unistd::execv(&path_c, &argv_c)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "execv returned without error".to_string());
+    UpgradeError::ExecFailed { reason: err }
 }
 
 /// Node-level upgrade manager. One per bun process.
@@ -506,12 +669,21 @@ impl UpgradeManager {
     pub fn execute(&self, prepared: PreparedUpgrade) -> UpgradeError {
         let mut marker = prepared.marker;
         marker.phase = MarkerPhase::Executed;
+        let symlink = self.store.symlink_path();
         if let Err(e) = marker.store(&self.marker_path) {
             let _ = UpgradeMarker::remove(&self.marker_path);
             return e;
         }
+        // The new binary counts its boot through this pointer before it
+        // reads its config (#2415), so it goes down before the swap.
+        if let Err(e) = self.store_pending_pointer() {
+            let _ = UpgradeMarker::remove(&self.marker_path);
+            remove_pending_pointer(&symlink);
+            return e;
+        }
         if let Err(e) = self.store.activate(&marker.target_version) {
             let _ = UpgradeMarker::remove(&self.marker_path);
+            remove_pending_pointer(&symlink);
             return e;
         }
 
@@ -529,6 +701,7 @@ impl UpgradeManager {
             );
         } else {
             let _ = UpgradeMarker::archive_stale(&self.marker_path);
+            remove_pending_pointer(&symlink);
         }
         let _ = self.append_history(&UpgradeHistoryEntry {
             upgrade_id: marker.upgrade_id.clone(),
@@ -544,34 +717,7 @@ impl UpgradeManager {
     /// Replace this process with whatever the entry symlink points at,
     /// passing the original argv. Never returns on success.
     pub fn exec_current_symlink(&self) -> UpgradeError {
-        use std::ffi::CString;
-
-        let path = self.store.symlink_path();
-        let Ok(path_c) = CString::new(path.to_string_lossy().into_owned()) else {
-            return UpgradeError::ExecFailed {
-                reason: "binary path contains a NUL byte".to_string(),
-            };
-        };
-        // argv[0] is the symlink path; the rest is the original command line
-        // (config path, --cluster, ...), which the new binary re-parses.
-        let mut argv_c = vec![path_c.clone()];
-        for arg in self.original_argv.iter().skip(1) {
-            match CString::new(arg.as_str()) {
-                Ok(c) => argv_c.push(c),
-                Err(_) => {
-                    return UpgradeError::ExecFailed {
-                        reason: format!("argument contains a NUL byte: {arg:?}"),
-                    };
-                }
-            }
-        }
-
-        // execv only returns on failure.
-        let err = nix::unistd::execv(&path_c, &argv_c)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "execv returned without error".to_string());
-        UpgradeError::ExecFailed { reason: err }
+        exec_symlink(&self.store.symlink_path(), &self.original_argv)
     }
 
     // -----------------------------------------------------------------
@@ -700,8 +846,10 @@ impl UpgradeManager {
 
     /// Run the startup decision and apply its filesystem effects.
     ///
-    /// Call once, immediately after config load, before subsystems start.
-    pub fn startup_action(&self) -> Result<StartupAction, UpgradeError> {
+    /// Call once, immediately after config load, before subsystems start,
+    /// with what [`count_upgrade_boot`] did earlier in the same boot. A
+    /// boot it already counted is not counted again.
+    pub fn startup_action(&self, early: &EarlyBoot) -> Result<StartupAction, UpgradeError> {
         // Nothing is fetching yet, so any candidate file is a killed
         // process's leftover, as big as a release (#892).
         match self.store.remove_stale_candidates() {
@@ -709,12 +857,24 @@ impl UpgradeManager {
             Ok(removed) => eprintln!("bun: removed {removed} unfinished upgrade candidate file(s)"),
             Err(e) => eprintln!("bun: warning: cannot remove unfinished upgrade candidates: {e}"),
         }
+        if let EarlyBoot::Counted {
+            marker_path,
+            marker,
+        } = early
+            && *marker_path == self.marker_path
+        {
+            return Ok(StartupAction::Continue {
+                verify: Some(marker.clone()),
+            });
+        }
+        let symlink = self.store.symlink_path();
         let marker = match UpgradeMarker::load(&self.marker_path) {
             Ok(marker) => marker,
             Err(e) => {
                 // Corrupt marker: archive it rather than refuse to boot.
                 eprintln!("bun: warning: {e}; archiving marker");
                 let _ = UpgradeMarker::archive_stale(&self.marker_path);
+                remove_pending_pointer(&symlink);
                 None
             }
         };
@@ -752,6 +912,7 @@ impl UpgradeManager {
                     recorded_at: std::time::SystemTime::now(),
                 })?;
                 let _ = UpgradeMarker::remove(&self.marker_path);
+                remove_pending_pointer(&symlink);
                 eprintln!(
                     "bun: revert to {} complete; upgrade {} failed",
                     marker.previous_version, marker.upgrade_id
@@ -762,6 +923,7 @@ impl UpgradeManager {
             StartupDecision::ArchiveStaleMarker { reason } => {
                 eprintln!("bun: warning: archiving stale upgrade marker: {reason}");
                 let _ = UpgradeMarker::archive_stale(&self.marker_path);
+                remove_pending_pointer(&symlink);
                 Ok(StartupAction::Continue { verify: None })
             }
         }
@@ -812,6 +974,7 @@ impl UpgradeManager {
             Err(e) => eprintln!("bun: warning: retention gc failed: {e}"),
         }
         UpgradeMarker::remove(&self.marker_path)?;
+        remove_pending_pointer(&self.store.symlink_path());
         Ok(())
     }
 
@@ -834,6 +997,26 @@ impl UpgradeManager {
     // -----------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------
+
+    /// Write the [`PendingPointer`] beside the entry symlink, atomically.
+    fn store_pending_pointer(&self) -> Result<(), UpgradeError> {
+        let pointer = PendingPointer {
+            marker: std::path::absolute(&self.marker_path)?,
+            max_boot_attempts: self.max_boot_attempts,
+        };
+        let path = pending_pointer_path(&self.store.symlink_path());
+        let directory = path.parent().ok_or_else(|| UpgradeError::InvalidMarker {
+            path: path.clone(),
+            reason: "boot pointer path has no parent directory".to_string(),
+        })?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer(&mut file, &pointer).map_err(std::io::Error::other)?;
+        file.as_file().sync_all()?;
+        file.persist(&path)
+            .map_err(|failed| UpgradeError::from(failed.error))?;
+        std::fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
 
     /// Refuse a same-version or unrequested downgrade directive before
     /// fetching anything. Identical bytes on the same version come back as
@@ -2661,5 +2844,155 @@ mod tests {
         assert_eq!(derive_stem(Path::new("target/debug/bun")), "bun");
         // A dash that isn't a version suffix stays put.
         assert_eq!(derive_stem(Path::new("/opt/bun-vnext")), "bun-vnext");
+    }
+
+    /// Do what [`UpgradeManager::execute`] does up to the `execv`: mark the
+    /// upgrade executed, leave the boot pointer and swap the symlink. The
+    /// test process can't exec, so the "new binary" is then played by
+    /// calling [`count_upgrade_boot`] with the target version.
+    async fn swap_without_exec(fixture: &Fixture) -> UpgradeMarker {
+        let directive = directive_for(fixture, b"new binary", "up-early");
+        let prepared = fixture
+            .manager
+            .prepare(&directive, inventory())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut marker = prepared.marker;
+        marker.phase = MarkerPhase::Executed;
+        marker.store(&fixture.manager.marker_path).unwrap();
+        fixture.manager.store_pending_pointer().unwrap();
+        fixture
+            .manager
+            .store()
+            .activate(&marker.target_version)
+            .unwrap();
+        marker
+    }
+
+    fn pointer_exists(fixture: &Fixture) -> bool {
+        fixture.binary_dir.join(".bun.upgrade-pending").exists()
+    }
+
+    /// #2415: the new binary counts each boot from the executable path
+    /// alone, before it has a config, and one past the budget points the
+    /// symlink back at the previous version.
+    #[tokio::test]
+    async fn a_swapped_in_binary_counts_its_boots_before_reading_config() {
+        let fixture = fixture();
+        swap_without_exec(&fixture).await;
+        let symlink = fixture.binary_dir.join("bun");
+        assert!(pointer_exists(&fixture));
+
+        for attempt in 1..=2 {
+            let early = count_upgrade_boot(&symlink, &v("0.2.0")).unwrap();
+            let EarlyBoot::Counted { marker, .. } = early else {
+                panic!("boot {attempt} was not counted: {early:?}");
+            };
+            assert_eq!(marker.boot_attempts, attempt);
+            let stored = fixture.manager.status().in_flight.unwrap();
+            assert_eq!(stored.boot_attempts, attempt, "the count is on disk");
+            assert_eq!(stored.phase, MarkerPhase::Verifying);
+        }
+
+        let early = count_upgrade_boot(&symlink, &v("0.2.0")).unwrap();
+        let EarlyBoot::ExecPrevious { symlink: exec } = early else {
+            panic!("the spent budget did not revert: {early:?}");
+        };
+        // The binary directory is found through `canonicalize`, which on
+        // macOS turns the temp dir's `/var` into `/private/var`.
+        assert_eq!(
+            exec,
+            std::fs::canonicalize(&symlink)
+                .unwrap()
+                .with_file_name("bun")
+        );
+        assert_eq!(
+            std::fs::read_link(&symlink).unwrap(),
+            Path::new("bun-v0.1.0")
+        );
+        let stored = fixture.manager.status().in_flight.unwrap();
+        assert_eq!(stored.phase, MarkerPhase::RevertPending);
+    }
+
+    /// #2415: startup recovery, run later in the same boot, takes the early
+    /// count as it is instead of counting the boot a second time.
+    #[tokio::test]
+    async fn startup_recovery_does_not_count_a_boot_counted_early() {
+        let fixture = fixture();
+        swap_without_exec(&fixture).await;
+        let early = count_upgrade_boot(&fixture.binary_dir.join("bun"), &v("0.2.0")).unwrap();
+        assert!(matches!(early, EarlyBoot::Counted { .. }), "{early:?}");
+
+        // The manager of the new binary, which runs 0.2.0.
+        let mut manager = fixture.manager.clone();
+        manager.running_version = v("0.2.0");
+        let action = manager.startup_action(&early).unwrap();
+
+        let StartupAction::Continue {
+            verify: Some(marker),
+        } = action
+        else {
+            panic!("expected verification, got {action:?}");
+        };
+        assert_eq!(marker.boot_attempts, 1);
+        assert_eq!(manager.status().in_flight.unwrap().boot_attempts, 1);
+    }
+
+    /// #2415: with no swap in flight there is nothing to count, and a
+    /// pointer whose upgrade has ended is cleared.
+    #[tokio::test]
+    async fn a_boot_with_no_upgrade_in_flight_is_not_counted() {
+        let fixture = fixture();
+        let symlink = fixture.binary_dir.join("bun");
+        assert_eq!(
+            count_upgrade_boot(&symlink, &v("0.1.0")).unwrap(),
+            EarlyBoot::Uncounted
+        );
+
+        fixture.manager.store_pending_pointer().unwrap();
+        assert_eq!(
+            count_upgrade_boot(&symlink, &v("0.1.0")).unwrap(),
+            EarlyBoot::Uncounted
+        );
+        assert!(
+            !pointer_exists(&fixture),
+            "a pointer with no marker is removed"
+        );
+    }
+
+    /// #2415: the pointer goes with the marker, on a commit and on a
+    /// completed revert.
+    #[tokio::test]
+    async fn the_boot_pointer_is_gone_after_a_commit_and_after_a_revert() {
+        let fixture = fixture();
+        let marker = swap_without_exec(&fixture).await;
+        fixture.manager.commit(&marker).unwrap();
+        assert!(!pointer_exists(&fixture), "commit left the pointer");
+
+        let fixture = fixture_reverted().await;
+        let action = fixture
+            .manager
+            .startup_action(&EarlyBoot::Uncounted)
+            .unwrap();
+        assert_eq!(action, StartupAction::Continue { verify: None });
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(
+            !pointer_exists(&fixture),
+            "the completed revert left the pointer"
+        );
+    }
+
+    /// A fixture whose upgrade crash-looped and was pointed back at 0.1.0:
+    /// the previous binary is about to boot.
+    async fn fixture_reverted() -> Fixture {
+        let fixture = fixture();
+        swap_without_exec(&fixture).await;
+        let symlink = fixture.binary_dir.join("bun");
+        while !matches!(
+            count_upgrade_boot(&symlink, &v("0.2.0")).unwrap(),
+            EarlyBoot::ExecPrevious { .. }
+        ) {}
+        fixture
     }
 }
