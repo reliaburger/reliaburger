@@ -441,24 +441,6 @@ pub(super) async fn rollback_handler(
     watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
-    state: State<ApiState>,
-    path: Path<(String, String)>,
-    query: Query<super::apps::ForceQuery>,
-    headers: HeaderMap,
-) -> Response {
-    // Like `apply --wait`: a token revoked mid-rollback ends the progress
-    // stream, not the rollback (#2399).
-    let response = rollback_stream(auth, binder, state, path, query, headers).await;
-    crate::sesame::auth::end_with_credential(
-        response,
-        watch.map(|extension| extension.0),
-        super::apply::credential_ended_apply_event(),
-    )
-}
-
-async fn rollback_stream(
-    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<super::apps::ForceQuery>,
@@ -469,6 +451,9 @@ async fn rollback_stream(
     {
         return resp;
     }
+    // Like `apply --wait`: a token revoked mid-rollback ends the progress
+    // stream, not the rollback (#2399).
+    let watch = watch.map(|extension| extension.0);
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
@@ -486,15 +471,14 @@ async fn rollback_stream(
     if let Some(council) = &state.council
         && !crate::bun::leadership::leads(council).await
     {
-        return forward_rollback_to_leader(
-            &state,
-            council,
-            &app,
-            &namespace,
-            query.force,
-            &headers,
-        )
-        .await;
+        let response =
+            forward_rollback_to_leader(&state, council, &app, &namespace, query.force, &headers)
+                .await;
+        return crate::sesame::auth::end_with_credential(
+            response,
+            watch,
+            super::apply::credential_ended_apply_event(),
+        );
     }
     // Who may roll back comes before whether we can (#1125).
     if let Some(council) = &state.council
@@ -569,7 +553,7 @@ async fn rollback_stream(
     let binder = binder.map(|extension| extension.0);
 
     if let Some(council) = &state.council {
-        return cluster_apply(
+        let response = cluster_apply(
             state.clone(),
             Arc::clone(council),
             config,
@@ -585,6 +569,11 @@ async fn rollback_stream(
             auth.map(|extension| extension.0),
         )
         .await;
+        return crate::sesame::auth::end_with_credential(
+            response,
+            watch,
+            super::apply::credential_ended_apply_event(),
+        );
     }
 
     let bindings = match &binder {
@@ -622,9 +611,13 @@ async fn rollback_stream(
             Event::default().data(serde_json::to_string(&e).unwrap_or_default()),
         )
     });
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+    crate::sesame::auth::end_with_credential(
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response(),
+        watch,
+        super::apply::credential_ended_apply_event(),
+    )
 }
 
 /// Send a rollback on to the leader as the caller, and stream its answer
