@@ -185,6 +185,16 @@ fn confine(spec: &mut OciSpec) {
     spec.process.no_new_privileges = true;
     spec.linux.masked_paths = MASKED_PATHS.iter().map(|p| p.to_string()).collect();
     spec.linux.readonly_paths = READONLY_PATHS.iter().map(|p| p.to_string()).collect();
+    if spec.reusable_executor {
+        // A shared-runc executor starts each task straight into a sibling
+        // of its own cgroup with `CLONE_INTO_CGROUP`, and the kernel refuses
+        // a target outside the caller's cgroup namespace with `ENOENT`. So
+        // the executor gets no cgroup namespace; it needs no cgroup path
+        // either (Bun hands it the task cgroup as a file descriptor), so the
+        // node's tree is masked instead.
+        spec.linux.masked_paths.push("/sys/fs/cgroup".to_string());
+        return;
+    }
     if !spec
         .linux
         .namespaces
@@ -436,6 +446,29 @@ mod tests {
             "{:?}",
             spec.mounts
         );
+    }
+
+    #[test]
+    fn a_shared_executor_gets_no_cgroup_namespace_and_a_masked_cgroup_tree() {
+        let mut executor = spec();
+        executor.reusable_executor = true;
+        apply(&mut executor).unwrap();
+        assert!(
+            !executor
+                .linux
+                .namespaces
+                .iter()
+                .any(|ns| ns.ns_type == "cgroup")
+        );
+        assert!(
+            executor
+                .linux
+                .masked_paths
+                .iter()
+                .any(|path| path == "/sys/fs/cgroup")
+        );
+        assert!(executor.process.no_new_privileges);
+        assert!(executor.linux.seccomp.is_some());
     }
 
     #[test]

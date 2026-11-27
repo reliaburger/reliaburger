@@ -777,7 +777,8 @@ with no configuration:
   as empty, and `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`,
   `/proc/fs` and `/proc/irq` are read-only.
 - **Its own cgroup.** `/sys/fs/cgroup` shows the container's own cgroup
-  as its root, never the node's tree or another app's statistics.
+  as its root, never the node's tree or another app's statistics. A
+  shared-runc executor's `/sys/fs/cgroup` is empty.
 - **A process limit** (`pids.max`) of 4,096 processes and threads unless
   the app sets `pids` (see `reference`).
 
