@@ -22,7 +22,9 @@ use super::units::ChartUnit;
 /// An environment variable value safe for UI display.
 ///
 /// Encrypted values are replaced with `"[encrypted]"` so the raw
-/// ciphertext never leaves the server.
+/// ciphertext never leaves the server, and plain values with
+/// `"[redacted]"`: the dashboard is a read-only session, which may not read
+/// what a read-only token can't read from the spec route (#2400).
 #[derive(Debug, Clone, Serialize)]
 pub struct SafeEnvValue {
     pub key: String,
@@ -38,7 +40,9 @@ pub fn safe_env(env: &BTreeMap<String, EnvValue>) -> Vec<SafeEnvValue> {
             value: match v {
                 // A provider reference names where the secret lives, not
                 // the secret, so it's safe to show.
-                EnvValue::Plain(s) => s.clone(),
+                // No pattern tells a password from a feature flag, so
+                // every plain value goes, as on the spec route (#1322).
+                EnvValue::Plain(_) => crate::redact::REDACTED.to_string(),
                 EnvValue::Provider(reference) => reference.as_str().to_string(),
                 EnvValue::Encrypted(_) => "[encrypted]".to_string(),
             },
@@ -117,12 +121,32 @@ mod tests {
         assert_eq!(safe.len(), 2);
 
         let plain = safe.iter().find(|e| e.key == "PLAIN").unwrap();
-        assert_eq!(plain.value, "hello");
         assert!(!plain.encrypted);
 
         let secret = safe.iter().find(|e| e.key == "SECRET").unwrap();
         assert_eq!(secret.value, "[encrypted]");
         assert!(secret.encrypted);
+    }
+
+    /// The dashboard is a read-only session, and a read-only token reading
+    /// an app's spec gets no env value back (#1322), because no pattern can
+    /// tell a password from a feature flag. The env page follows the same
+    /// rule (#2400). A provider reference names where a secret lives, so it
+    /// stays.
+    #[test]
+    fn safe_env_leaves_out_plain_values_and_keeps_provider_references() {
+        let env: BTreeMap<String, EnvValue> =
+            toml::from_str("DB_PASSWORD = 'hunter2'\nFROM_VAULT = 'PROVIDER[vault:kv/db]'\n")
+                .unwrap();
+        assert!(env["FROM_VAULT"].is_provider());
+
+        let safe = safe_env(&env);
+        let json = serde_json::to_string(&safe).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+        let password = safe.iter().find(|e| e.key == "DB_PASSWORD").unwrap();
+        assert_eq!(password.value, crate::redact::REDACTED);
+        let from_vault = safe.iter().find(|e| e.key == "FROM_VAULT").unwrap();
+        assert!(from_vault.value.contains("vault"), "{from_vault:?}");
     }
 
     #[test]

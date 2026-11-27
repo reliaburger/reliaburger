@@ -238,6 +238,73 @@ async fn deploy_history_merges_every_members_record_with_its_node() {
     assert!(view.warnings.is_empty(), "{:?}", view.warnings);
 }
 
+/// A deploy recorded with a plain secret in its env and an API key in an
+/// inline config file.
+fn history_entry_with_secrets() -> DeployHistoryEntry {
+    let spec: crate::config::app::AppSpec = toml::from_str(
+        "image = \"web:v1\"\n\
+         [env]\nDB_PASSWORD = \"hunter2\"\n\
+         [[config_file]]\npath = \"/etc/app.conf\"\ncontent = \"api_key=abc123\"\n",
+    )
+    .unwrap();
+    let mut entry = history_entry("web", "default", 1, 100);
+    entry.spec = Some(Box::new(spec));
+    entry
+}
+
+/// The history route answers with each recorded spec. Like the spec route
+/// (#1322), it must leave out env values and inline config content for
+/// any caller but a peer node (#2400).
+#[tokio::test]
+async fn deploy_history_leaves_out_env_values_and_config_content() {
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
+    setup.history = vec![history_entry_with_secrets()];
+    let app = setup.router().await;
+
+    let (status, body) = get(app, "/v1/deploys/history/web?namespace=default", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("hunter2"), "{body}");
+    assert!(!body.contains("abc123"), "{body}");
+    // The rest of the spec is still there to read.
+    let view: ClusterDeployHistory = serde_json::from_str(&body).unwrap();
+    let spec = view.history[0].row.spec.as_ref().unwrap();
+    assert_eq!(spec.image.as_deref(), Some("web:v1"));
+    assert!(spec.env.contains_key("DB_PASSWORD"));
+}
+
+/// A rollback picks its target from every node's history, read over this
+/// same route with the node's service token, and applies it. A peer must
+/// still get the spec as it was deployed (#2400).
+#[tokio::test]
+async fn a_peer_reading_history_for_a_rollback_still_gets_the_full_spec() {
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
+    setup.history = vec![history_entry_with_secrets()];
+    setup.service_token = Some("rbrg_service".to_string());
+    let app = setup.router().await;
+
+    let (status, body) = get(
+        app,
+        "/v1/deploys/history/web?namespace=default&local=true",
+        Some("rbrg_service"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let view: ClusterDeployHistory = serde_json::from_slice(&body).unwrap();
+    let history: Vec<DeployHistoryEntry> = view.history.into_iter().map(|row| row.row).collect();
+    // The app now runs v2, so the recorded v1 is the one to go back to.
+    let current: crate::config::app::AppSpec = toml::from_str("image = \"web:v2\"").unwrap();
+    let target = crate::bun::cluster_view::rollback_target(&history, Some(&current)).unwrap();
+    assert_eq!(
+        target.env.get("DB_PASSWORD"),
+        Some(&crate::config::EnvValue::Plain("hunter2".into()))
+    );
+    assert_eq!(
+        target.config_file[0].content.as_deref(),
+        Some("api_key=abc123")
+    );
+}
+
 #[tokio::test]
 async fn deploy_history_names_a_member_that_did_not_answer() {
     let dead = dead_address();

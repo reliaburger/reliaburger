@@ -100,6 +100,14 @@ relish token revoke ci-deploy
 | `deployer` | apply, deploy, stop and roll back workloads, inject workload faults |
 | `read-only` | status, logs, metrics and diagnostics (the default role) |
 
+No token reads an app's secrets back. The app's spec
+(`/v1/apps/{app}/{namespace}/spec`), the specs in its deploy history
+(`relish history`, `/v1/deploys/history/{app}`) and the dashboard's env page
+all show `[redacted]` for every env value, plain or encrypted, and for each
+inline config file's content, whatever the role. A `PROVIDER[...]` reference
+stays, because it names where the secret lives, not the secret. Only the
+nodes themselves read history whole, for a rollback.
+
 `--apps` and `--namespaces` narrow a token to those apps and namespaces. In the
 image registry that means repositories named `<namespace>/<app>` inside the
 scope; a scoped token can't push or pull a bare name like `api` at all (see
