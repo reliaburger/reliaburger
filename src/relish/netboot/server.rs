@@ -81,6 +81,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         architectures: artefacts.architectures.keys().copied().collect(),
         allowed: options.allowed.clone(),
     });
+    let peers = SharedPeers::default();
     let state = Arc::new(HttpState {
         artefacts,
         server,
@@ -97,11 +98,11 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         netlog: options
             .stream_logs
             .map(|_| SocketAddrV4::new(server, NETLOG_PORT)),
+        peers: peers.clone(),
         log: log.clone(),
     });
     let http_state = state.clone();
 
-    let peers = SharedPeers::default();
     let (dhcp_context, dhcp_log, dhcp_peers) = (context.clone(), log.clone(), peers.clone());
     let dhcp_task = async move {
         match dhcp_socket {
@@ -138,7 +139,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         TftpSettings::default(),
         move |peer, name, outcome| log_transfer(&tftp_log, peer, name, outcome),
     );
-    let http_task = axum::serve(listener, http::router(http_state));
+    let http_task = axum::serve(listener, http::service(http_state));
 
     // Ctrl-C and --for end the run; a server that stops ends it as a
     // failure, so the exit status says so.
