@@ -45,7 +45,9 @@ on:
     branches: [main, "release-*"]
     # src/os (the node's half of an OS update), src/appliance (prepare,
     # claim, the console) and relish netboot run only in the image's QEMU
-    # tests, against bun and relish built from the PR.
+    # tests, against bun and relish built from the PR. So do bun's start-up
+    # and its OS update API (the boot and fallback tests), relish's `os` and
+    # `image` commands, and the plan job's os_release.py (#2484).
     paths:
       - "image/**"
       - ".github/workflows/appliance.yml"
@@ -53,6 +55,10 @@ on:
       - "src/appliance/**"
       - "src/relish/netboot/**"
       - "scripts/demo/netboot.sh"
+      - "src/bun/**"
+      - "src/relish/os.rs"
+      - "src/relish/image.rs"
+      - "scripts/release/os_release.py"
     # A draft, or a 0-4-0/ branch, builds no image (24 November 2026):
     # ready_for_review starts the build, and converted_to_draft cancels one
     # still going.

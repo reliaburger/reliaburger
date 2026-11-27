@@ -1716,6 +1716,20 @@ class ApplianceTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, paths)
 
+    def test_the_image_tests_run_when_the_code_they_boot_changes(self):
+        # The image carries the PR's own bun and relish, and the boot, OS
+        # update and fallback tests run bun's start-up and its OS API, so a
+        # change there must build the image too (#2484). os_release.py is
+        # what the plan job calls.
+        triggers = self.text.split("\njobs:", 1)[0]
+        pull_request = triggers.split("\n  pull_request:", 1)[1]
+        paths = re.findall(r'(?m)^      - "([^"]+)"$', pull_request)
+        for path in ("src/bun/**", "src/relish/os.rs", "src/relish/image.rs",
+                     "scripts/release/os_release.py"):
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+                self.assertTrue(list(REPO.glob(path)), f"{path} matches no file")
+
     def test_every_build_checks_its_manifest_for_an_ssh_server_before_uploading(self):
         # #401: a published image has no SSH server. The check reads the
         # built image's manifest, so it must run after the build and before
