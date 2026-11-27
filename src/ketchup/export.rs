@@ -344,23 +344,38 @@ pub async fn export_logs(
     .await
     .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
 
-    let result = export_logs_locked(source_dir, destination, node_id, &mut current).await?;
+    // No `?` here: a run that fails part-way has still uploaded the files
+    // before the failure, and `current` records them. Saving it either way
+    // means the next run starts after them, not from the first file again
+    // (#2432). Each entry claims only that this content reached this
+    // destination, which a later failure doesn't undo.
+    let exported = export_logs_locked(source_dir, destination, node_id, &mut current).await;
     let path = source_dir.join(CHECKPOINT_FILENAME);
     // Move the lock into the blocking write: cancellation cannot release it while
     // a previous write is still replacing the authoritative checkpoint.
-    let committed = tokio::task::spawn_blocking(move || {
+    let (current, saved) = tokio::task::spawn_blocking(move || {
         let _lock = lock;
-        current.save(&path).map_err(|error| {
-            KetchupError::Io(std::io::Error::other(format!(
-                "files exported but checkpoint could not be saved: {error}; retry is safe"
-            )))
-        })?;
-        Ok::<_, KetchupError>(current)
+        let saved = current.save(&path);
+        (current, saved)
     })
     .await
-    .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
-    *checkpoint = committed;
-    Ok(result)
+    .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
+    *checkpoint = current;
+    match (exported, saved) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(error)) => Err(KetchupError::Io(std::io::Error::other(format!(
+            "files exported but checkpoint could not be saved: {error}; retry is safe"
+        )))),
+        (Err(error), saved) => {
+            if let Err(save_error) = saved {
+                eprintln!(
+                    "ketchup: log export failed and its checkpoint could not be saved: \
+                     {save_error}; the next export uploads these files again"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn export_logs_locked(
@@ -1045,6 +1060,50 @@ mod tests {
         .unwrap();
         assert_eq!(r2.files_exported, 1);
 
+        assert_eq!(exported_files(dest.path()).len(), 2);
+    }
+
+    /// An export that fails part-way used to drop its in-memory checkpoint, so
+    /// the next run uploaded every earlier file again and a flaky uplink never
+    /// got past them (#2432). The files already uploaded are now recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_export_keeps_the_files_it_already_uploaded() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            // Root reads a mode-000 file anyway, so the failure can't happen.
+            return;
+        }
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("logs_000000.parquet"), b"batch1").unwrap();
+        let second = source.path().join("logs_000001.parquet");
+        std::fs::write(&second, b"batch2").unwrap();
+        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut checkpoint = ExportCheckpoint::default();
+        let failed = export_logs(
+            source.path(),
+            dest.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint,
+        )
+        .await;
+        assert!(failed.is_err(), "{failed:?}");
+        let saved = ExportCheckpoint::load(&source.path().join(CHECKPOINT_FILENAME));
+        assert_eq!(saved.exported_files.len(), 1, "{saved:?}");
+
+        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut fresh = ExportCheckpoint::default();
+        let retried = export_logs(
+            source.path(),
+            dest.path().to_str().unwrap(),
+            "node-1",
+            &mut fresh,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.files_exported, 1, "only the second file is new");
         assert_eq!(exported_files(dest.path()).len(), 2);
     }
 
