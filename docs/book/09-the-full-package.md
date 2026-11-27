@@ -129,19 +129,17 @@ Cooldown adds a time buffer: 3 minutes between consecutive scale events for the 
 
 Can you see the problem? The git repo says `replicas = 3`. The autoscaler says `replicas = 7`. Who wins?
 
-Both. The trick is to treat them as different concerns. The git value is the *baseline*. The autoscaler's adjustment is a *runtime override*. When Lettuce syncs, it compares the git value against the *previous git value*, not the runtime count. If the git value hasn't changed, the autoscaler's override is left alone. If the git value *has* changed (from 3 to 5, say), the autoscaler's baseline resets to 5.
+Both. The trick is to treat them as different concerns. The git value is the *baseline*. The autoscaler's adjustment is a *runtime override*, kept in desired state beside the spec (`DesiredState::autoscale_overrides`). The council decides when an override still stands, in `apply_app_spec`: a write that changes the app's `replicas` drops it, because the operator has re-declared the count; a write that removes `[autoscale]` drops it too, and one that narrows the bounds clamps it. A GitOps re-sync that writes the same spec again leaves it alone. Deleting the app drops it, so a re-created app starts from its own spec.
+
+The leader's autoscale loop keeps its own memory beside that, an `AutoscaleTracker` with one `AutoscaleState` per app: the baseline, the current count and when it last scaled, which is what the cooldown reads. That memory had the same blind spot the override once had. Nothing ever removed an entry, so an app deleted at 12:01 and applied again under the same name sat inside the old app's ten-minute cooldown while its metric screamed, and the map grew by one entry for every app name that ever autoscaled ([#2434](https://github.com/reliaburger/reliaburger/issues/2434)). Each tick now starts by forgetting every app that doesn't autoscale any more:
 
 ```rust
-pub fn update_baseline(&mut self, app_id: &AppId, new_baseline: u32) {
-    if let Some(state) = self.states.get_mut(app_id) {
-        state.baseline_replicas = new_baseline;
-        state.current_replicas = new_baseline;
-        state.last_scale_event = None;
-    }
+pub fn retain_apps(&mut self, live: &std::collections::HashSet<AppId>) {
+    self.states.retain(|app_id, _| live.contains(app_id));
 }
 ```
 
-The `AutoscaleTracker` stores both the baseline (from git/config) and the current count (from the autoscaler). The `get_override` method returns `Some(n)` only if the current count differs from the baseline. Lettuce checks this to avoid resetting runtime adjustments.
+`HashMap::retain`, which earlier chapters used on vectors, keeps the entries the closure says yes to, in place. The gap left is small and documented in the test: an app deleted and applied again within one autoscale interval never leaves the desired state between two ticks, so it keeps its entry. The test, `an_app_that_stopped_autoscaling_is_forgotten`, scales an app, re-applies it without `[autoscale]`, and checks the next tick finds no cooldown. Two tracker methods, `update_baseline` and `get_override`, went at the same time: an earlier version of this section said GitOps called them, but nothing ever did, because the council's override rules above do that job.
 
 ### Configuration
 

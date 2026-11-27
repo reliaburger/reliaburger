@@ -2276,6 +2276,8 @@ The tests read like the issue: an over-quota app shows its reason, the reason cl
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
+The node view the pass starts from mixes two sources, and they have to agree on what they've already counted. A node's report gives its allocated totals, and each running instance's CPU and memory; the pass then reserves every committed placement, adding only what the report doesn't cover yet. GPUs broke that bargain: the node's total includes every instance's GPUs, but the per-instance report has no GPU field, so each instance looked as if it held none and its GPUs were reserved a second time ([#2476](https://github.com/reliaburger/reliaburger/issues/2476)). Nothing can request a GPU yet, so no cluster hit it, but a two-GPU node running one GPU app would have looked full. `reserve_committed_instance` now treats a reported instance's GPUs as already in the total. We didn't add the field to the report: that's a wire change, and it belongs with GPU requests themselves.
+
 ### Placing what fits
 
 A quota isn't the only reason an app can't get all its replicas. Ask for three replicas in a cluster with room for two, and until 0.2.1 you got none: `schedule_fixed` returned an error at the first replica that didn't fit, the pass threw away the two it had already placed, and the leader logged `cannot place web` every two seconds. Nothing recorded the reason anywhere `relish status` could see.
@@ -2295,6 +2297,8 @@ pub struct Unplaced {
 ```
 
 There's no `Result` here, because a short placement isn't an error the caller can bail out on with `?`. It's an answer with two parts: what we placed, and, if anything is left over, how much and why. Capacity admission still wants all or nothing, so `schedule_app` keeps that contract and turns a non-empty `unplaced` into `NoEligibleNodes`.
+
+`schedule_fixed` builds `placements` and `choices` with `Vec::new()`, not `Vec::with_capacity(replica_count)`. Pre-sizing a vector is a fine habit when the length is known and small, but here the length is a number someone typed, and a million replicas on three nodes would reserve room for a million placements to hold the few that fit. The vectors grow as replicas are placed, so the memory follows what happened rather than what was asked for ([#2368](https://github.com/reliaburger/reliaburger/issues/2368)).
 
 `UnplacedReason` is an enum of the hard constraints in filter order: no ready node, no node with the labels, no node that runs containers for an image app, no node that can enforce the app's needs or run its binary, no room. `unplaced_reason` walks the nodes once per constraint and stops at the first that nobody passes, so "no node in zone east" isn't misreported as "no room" just because the east nodes don't exist.
 

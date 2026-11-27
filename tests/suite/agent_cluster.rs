@@ -363,6 +363,184 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
     assert_eq!(placed.expect("the app was never placed"), ["idle"]);
 }
 
+/// The leader's tick publishes the endpoint catalogue before it plans. The
+/// pass must be planned from state read after that write: planned from the
+/// state read before it, the council refuses it ("admission revision
+/// changed") and every placement waits a tick (#2369).
+#[tokio::test]
+async fn a_pass_is_admitted_in_the_tick_that_also_publishes_the_catalogue() {
+    use reliaburger::cluster::orchestrate::spawn_leader_scheduler;
+    use reliaburger::meat::types::{Placement, Resources, SchedulingDecision};
+    use reliaburger::reporting::types::{AppResourceUsage, ReportHealthStatus, RunningApp};
+
+    let router = InMemoryRaftRouter::new();
+    let council = std::sync::Arc::new(
+        CouncilNode::new(
+            1,
+            fast_council_config(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    router.register(1, &council).await;
+    council
+        .initialize(BTreeMap::from([(1, node_info(1, 9446))]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.borrow().current_leader != Some(1) {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // `api` runs healthy on `idle`, so the first tick has a backend the
+    // committed (empty) catalogue lacks. `web` has no placement yet.
+    let api = reliaburger::meat::AppId::new("api", "default");
+    let web = reliaburger::meat::AppId::new("web", "default");
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: api.clone(),
+            spec: Box::new(toml::from_str("image = 'example:v1'\nport = 8080").unwrap()),
+        })
+        .await
+        .unwrap();
+    let placed = crate::admission_fixture::write_admission_fixture(
+        &council,
+        RaftRequest::SchedulingDecision(SchedulingDecision {
+            app_id: api.clone(),
+            placements: vec![Placement {
+                node_id: NodeId::new("idle"),
+                resources: Resources::default(),
+                ordinal: 0,
+            }],
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            placed,
+            reliaburger::council::types::CouncilResponse::Applied { .. }
+        ),
+        "{placed:?}"
+    );
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(toml::from_str("image = 'example:v1'").unwrap()),
+        })
+        .await
+        .unwrap();
+
+    let members = vec![MembershipSnapshot {
+        node_id: NodeId::new("idle"),
+        address: addr(7003),
+        state: NodeState::Alive,
+        incarnation: 1,
+        is_council: false,
+        is_leader: false,
+        labels: BTreeMap::new(),
+        first_seen: std::time::Instant::now(),
+        resources: None,
+    }];
+    let mut reports = reliaburger::reporting::aggregator::AggregatedState {
+        leadership_epoch: Some(council.current_term()),
+        ..Default::default()
+    };
+    let node = NodeId::new("idle");
+    let mut report = job_filled_report("idle", 0);
+    report.running_apps.push(RunningApp {
+        execution: None,
+        app_name: "api".to_string(),
+        namespace: "default".to_string(),
+        instance_id: 0,
+        image: "example:v1".to_string(),
+        port: Some(31080),
+        health_status: ReportHealthStatus::Healthy,
+        uptime: Duration::from_secs(5),
+        resource_usage: AppResourceUsage::default(),
+    });
+    reports.reports.insert(node.clone(), report);
+    reports.receive_deadlines.insert(
+        node.clone(),
+        tokio::time::Instant::now() + Duration::from_secs(300),
+    );
+    reports.capabilities.insert(
+        node.clone(),
+        reliaburger::reporting::types::NodeCapabilityReport {
+            node_id: node.clone(),
+            capabilities: reliaburger::meat::cluster_state::NodeCapabilities {
+                containers: true,
+                ..Default::default()
+            },
+            egress_enforcement: Vec::new(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
+        },
+    );
+    reports.readiness.insert(
+        node.clone(),
+        reliaburger::reporting::types::NodeReadinessReport {
+            node_id: node,
+            evidence: reliaburger::bun::readiness::NodeReadinessEvidence {
+                ready: true,
+                observed_at_unix_ms: 1,
+                subsystems: Vec::new(),
+            },
+        },
+    );
+    let (_members, membership_rx) = watch::channel(members);
+    let (_reports, reports_rx) = watch::channel(reports);
+    let shutdown = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let _admission = spawn_leader_scheduler(
+        council.clone(),
+        membership_rx,
+        reports_rx,
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
+        None,
+        shutdown.clone(),
+    );
+
+    // The first tick fires at once; the second only after 2 s.
+    let placed = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let desired = council.desired_state().await;
+            if desired.scheduling.get(&web).is_some_and(|p| !p.is_empty()) {
+                return desired;
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    let desired = placed.unwrap_or_else(|_| {
+        panic!("web was not placed by the first tick ({elapsed:?} after the scheduler started)")
+    });
+    assert!(
+        desired
+            .endpoint_catalog
+            .services
+            .contains_key("default__api"),
+        "the same tick published the catalogue: {:?}",
+        desired.endpoint_catalog.services.keys().collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn agent_nodes_returns_membership() {
     let shutdown = CancellationToken::new();
