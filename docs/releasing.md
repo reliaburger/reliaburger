@@ -2346,6 +2346,15 @@ the real `curl … | sh` install against it on every host we advertise.
     fixed. `scripts/ci/test_features_page.py` fails while the TOML names a
     release other than the bootstrap's default.
 
+    Don't leave those rows for after the release. At code freeze, run
+    `python3 scripts/ci/features_page.py check-issues` and
+    `python3 scripts/ci/features_page.py check-closing N...` with the gate
+    PR's `Fixes` numbers, and update every row that links an issue the gate
+    closes on the train before the gate PR merges: `features.yml`'s
+    `closing` job refuses the gate PR otherwise. A row fix after the release
+    goes to main directly, not to the next train
+    ([#2492](https://github.com/reliaburger/reliaburger/issues/2492)).
+
     Add the release's paragraph to the top of the
     [release log](release-log.md): the promotion date, how long qualifying it
     took and how many candidates, what each soak found and what fixed it, and
