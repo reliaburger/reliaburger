@@ -39,6 +39,12 @@ resolver. Set `upstream` to send them somewhere else. If DNS is on and there's
 no usable resolver (no `nameserver` lines, or only Bun's own address), Bun
 refuses to start and names `[dns] upstream`.
 
+Bun forwards at most 64 external lookups at once per node, and one container
+(one source address) can hold at most 16 of them; past that it gets SERVFAIL
+straight away. A resolver that didn't answer is tried after the others for
+10 seconds. Positive answers are cached for their TTL, at most 30 seconds, so
+a changed external record can take that long to reach containers.
+
 ## Who may connect
 
 Apps in the same namespace can reach each other; other namespaces can't. That
