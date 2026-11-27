@@ -48,8 +48,9 @@ pub enum JoinError {
         "node id {node_id:?} has the same Raft id as existing node {existing:?}; join under another name"
     )]
     RaftIdCollision { node_id: String, existing: String },
-    #[error("join token node id must not be empty")]
-    EmptyNodeId,
+    /// The node id isn't one DNS label (#2394).
+    #[error("invalid node id: {0}")]
+    InvalidNodeId(&'static str),
     #[error("no Node CA found in security state")]
     NoNodeCa,
     #[error("Node CA private key is not available")]
@@ -143,6 +144,12 @@ pub enum JoinClientError {
     Incompatible(#[from] crate::compatibility::CompatibilityError),
     #[error("malformed join bundle: {0}")]
     Malformed(String),
+    /// The node id isn't one DNS label (#2394); nothing was sent.
+    #[error("invalid node id {node_id:?}: {reason}")]
+    InvalidNodeId {
+        node_id: String,
+        reason: &'static str,
+    },
     #[error(
         "root CA fingerprint mismatch: member offered {offered}, expected {expected} — refusing to trust"
     )]
@@ -410,6 +417,8 @@ pub fn check_join_token(
     requested_node_id: &str,
     state: &SecurityState,
 ) -> Result<[u8; 32], JoinError> {
+    crate::cluster::retirement::validate_node_id(requested_node_id)
+        .map_err(JoinError::InvalidNodeId)?;
     if state.crl.retired_nodes.contains_key(requested_node_id) {
         return Err(JoinError::NodeRetired);
     }
@@ -568,9 +577,7 @@ fn mint_join_token(
             seconds: ttl.as_secs(),
         });
     }
-    if node_id.is_empty() {
-        return Err(JoinError::EmptyNodeId);
-    }
+    crate::cluster::retirement::validate_node_id(node_id).map_err(JoinError::InvalidNodeId)?;
     let (plaintext, hash) = ca::generate_join_token()?;
     let join_token = JoinToken {
         token_hash: hash,
@@ -598,6 +605,14 @@ pub async fn enrol(
     node_id: &str,
     expected_fingerprint: Option<&str>,
 ) -> Result<NodeIdentity, JoinClientError> {
+    // A name the cluster would refuse (#2394) never reaches it, so the
+    // token isn't spent on it.
+    crate::cluster::retirement::validate_node_id(node_id).map_err(|reason| {
+        JoinClientError::InvalidNodeId {
+            node_id: node_id.to_string(),
+            reason,
+        }
+    })?;
     let base = member_base.trim_end_matches('/');
     let tofu_client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
@@ -991,7 +1006,7 @@ mod tests {
         ));
         assert!(matches!(
             create_seed_join_token(week, ""),
-            Err(JoinError::EmptyNodeId)
+            Err(JoinError::InvalidNodeId(_))
         ));
     }
 
@@ -1121,7 +1136,56 @@ mod tests {
     #[test]
     fn create_join_token_refuses_an_empty_node_id() {
         let err = create_join_token(DEFAULT_JOIN_TOKEN_TTL, "").unwrap_err();
-        assert!(matches!(err, JoinError::EmptyNodeId));
+        assert!(matches!(err, JoinError::InvalidNodeId(_)));
+    }
+
+    /// A node's name is one DNS label (#2394), so a token, an issue and an
+    /// enrolment for any other name are refused before anything is minted,
+    /// signed or sent.
+    #[tokio::test]
+    async fn the_join_path_refuses_a_node_id_that_is_not_one_dns_label() {
+        let long = "a".repeat(64);
+        for bad in [
+            "Node-02",
+            "node_02",
+            "-node",
+            "node-",
+            "node.02",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    create_join_token(DEFAULT_JOIN_TOKEN_TTL, bad),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "token minted for {bad:?}"
+            );
+            assert!(
+                matches!(
+                    create_seed_join_token(DEFAULT_JOIN_TOKEN_TTL, bad),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "seed token minted for {bad:?}"
+            );
+            let (state, token, _) = setup_with_known_key();
+            assert!(
+                matches!(
+                    check_join_token(&token, bad, &state),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "join checked for {bad:?}"
+            );
+            // The enrolment refuses before it dials anyone: the address is
+            // unroutable, so reaching the network would fail differently.
+            let error = enrol("https://192.0.2.1:9117", "t", bad, Some("sha256:ab"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, JoinClientError::InvalidNodeId { .. }),
+                "enrolment for {bad:?}: {error}"
+            );
+        }
+        assert!(create_join_token(DEFAULT_JOIN_TOKEN_TTL, "node-02").is_ok());
     }
 
     #[test]

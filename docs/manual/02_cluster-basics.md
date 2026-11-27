@@ -82,6 +82,10 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+A node id is one DNS label, the same rule as `[node] name`: 1 to 63
+lowercase letters, digits and `-`, not starting or ending with `-`. `join-token
+create` and `join` refuse any other name before a token is minted or sent.
+
 Pick node names that differ by more than their last two characters. Raft
 numbers each member from a hash of its name, and a few short names collide
 (`worker-c0` and `worker-ar`, for instance). The council refuses a join token,

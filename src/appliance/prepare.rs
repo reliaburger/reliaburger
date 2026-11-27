@@ -604,7 +604,9 @@ async fn enrol(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
 fn is_final(error: &crate::sesame::join::JoinClientError) -> bool {
     use crate::sesame::join::JoinClientError;
     match error {
-        JoinClientError::FingerprintMismatch { .. } | JoinClientError::Incompatible(_) => true,
+        JoinClientError::FingerprintMismatch { .. }
+        | JoinClientError::Incompatible(_)
+        | JoinClientError::InvalidNodeId { .. } => true,
         JoinClientError::Rejected(reason) => {
             let reason = reason.to_ascii_lowercase();
             [
@@ -612,6 +614,7 @@ fn is_final(error: &crate::sesame::join::JoinClientError) -> bool {
                 "expired",
                 "invalid join token",
                 "different node id",
+                "invalid node id",
                 "retired",
             ]
             .iter()
