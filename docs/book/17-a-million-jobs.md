@@ -1300,6 +1300,18 @@ determinism: `max_by_key` keeps the *last* maximum it sees, so walking the
 `BTreeMap` backwards makes ties go to the first namespace by name. Every Raft
 replica prunes the same runs, or their snapshots disagree.
 
+Per namespace needs to know whose a run is, and finite batches got that wrong
+(#2519). `relish batch FILE` stores its parent under `default`, whatever its
+jobs' namespaces, because one batch may span several. So a tenant in `team-a`
+running twenty batches filled `default`'s twenty slots and pushed out runs that
+really were `default`'s. Retention now asks `retention_namespace`, which looks
+through a finite batch to its jobs: if they all share a namespace, the batch
+counts there, and only a batch spanning several stays under `default`. That
+reads the children, not a new field, so nothing stored changes and batches
+already retained are counted right too.
+`finite_batches_are_retained_under_their_jobs_namespace` registers twenty
+`team-a` batches beside one `default` run and checks that run survives a prune.
+
 **Counters live on the node that ran the attempts.** The leader already
 computed accepted rates, but in memory: they reset whenever leadership moved.
 So each node's executor now feeds a `JobTelemetry` on every sync, with each

@@ -1504,6 +1504,25 @@ impl TaskArrays {
         });
     }
 
+    /// The namespace a manifest's finished runs count against. A finite
+    /// batch is stored under `default` whatever its jobs' namespaces, so it
+    /// counts against the namespace its jobs share; a batch spanning several
+    /// stays under `default` (#2519).
+    fn retention_namespace<'a>(&'a self, manifest: &'a TaskManifest) -> &'a str {
+        if !manifest.common_jobs {
+            return &manifest.namespace;
+        }
+        let mut namespaces = manifest
+            .cohorts
+            .iter()
+            .filter_map(|(_, child)| self.arrays.get(child))
+            .map(|record| record.namespace.as_str());
+        match namespaces.next() {
+            Some(first) if namespaces.all(|namespace| namespace == first) => first,
+            _ => &manifest.namespace,
+        }
+    }
+
     /// Finished retention units to drop, as `(id, is_manifest_parent)`.
     fn expired(&self, now_epoch_secs: u64, retention_secs: u64) -> Vec<(u64, bool)> {
         let pinned: std::collections::BTreeSet<_> = self
@@ -1532,7 +1551,7 @@ impl TaskArrays {
                     finished_at: times.into_iter().max().unwrap_or(0),
                     id: *id,
                     parent: true,
-                    namespace: &m.namespace,
+                    namespace: self.retention_namespace(m),
                 })
             })
             .chain(self.arrays.iter().filter_map(|(id, r)| {
@@ -2831,6 +2850,54 @@ mod tests {
             .filter(|(_, record)| record.namespace == "busy")
             .count();
         assert!(busy <= MAX_TERMINAL_PER_NAMESPACE, "{busy} kept for busy");
+    }
+
+    #[test]
+    fn finite_batches_are_retained_under_their_jobs_namespace() {
+        let mut arrays = TaskArrays::default();
+        cancelled_in(&mut arrays, "default", 1, 100);
+        let mut next = 100;
+        for i in 0..MAX_TERMINAL_PER_NAMESPACE as u64 {
+            let mut spec = *template();
+            spec.namespace = Some("team-a".into());
+            let write = TaskArrayWrite::RegisterJobs {
+                request_id: format!("r-{i}"),
+                jobs: vec![("work".into(), spec)],
+                submitted_at_epoch_secs: 101 + i,
+            };
+            let TaskArrayApplied::Registered { batch_id } = arrays
+                .apply(&write, || {
+                    next += 1;
+                    next
+                })
+                .unwrap()
+            else {
+                panic!("expected a registration");
+            };
+            let child = arrays.manifest(batch_id).unwrap().cohorts[0].1;
+            arrays
+                .apply(
+                    &TaskArrayWrite::Cancel {
+                        batch_id: child,
+                        now_epoch_secs: 101 + i,
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        arrays
+            .apply(
+                &TaskArrayWrite::Prune {
+                    now_epoch_secs: 200,
+                    retention_secs: TERMINAL_RETENTION_SECS,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert!(
+            arrays.get(1).is_some(),
+            "team-a's batches evicted default's only run"
+        );
     }
 
     #[test]

@@ -236,6 +236,9 @@ Each profile is one active run, so a manifest counts against the active-run
 limits under [Execution and capacity limits](#execution-and-capacity-limits). Reduce chunk
 size for expensive tasks and straggler tails; larger chunks amortise dispatch
 and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
+An array also has at most 65,536 chunks, so `count` divided by `chunk_size`
+(rounded up) can't exceed it: a million tasks need a chunk size of at least
+16, and a smaller one is refused.
 
 ## Observe summaries and inspect selected tasks
 
@@ -289,7 +292,9 @@ Detail remains on the worker disk for one hour **after completion**. Each
 namespace keeps its newest 20 finished submissions, and the cluster keeps 24
 in all: when more finish, the namespace keeping the most loses its oldest
 first, so a per-minute cron in one namespace can't push out another
-namespace's runs. The leader checks every second and prunes expired runs with
+namespace's runs. A finite batch (`relish batch FILE`) counts against the
+namespace its jobs share; one whose jobs span several namespaces counts
+against `default`. The leader checks every second and prunes expired runs with
 one replicated write, whether or not anyone submits new work; workers then
 delete the run's ledger, index and kept output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
@@ -397,6 +402,7 @@ Every namespace shares the cluster, so no namespace may take all of it:
 | Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
 | Outcomes remembered per definition | 10 | The oldest outcome is dropped |
 | Named jobs in one finite batch | 64 | Refused |
+| Chunks in one array (`count` / `chunk_size`, rounded up) | 65,536 | Refused; raise the chunk size |
 
 Cron fires and deployment hooks never compete with bulk work for their
 headroom, so a tenant filling its arrays can't stop another tenant's nightly
