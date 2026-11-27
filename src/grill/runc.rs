@@ -2580,7 +2580,15 @@ mod tests {
                 .unwrap()
         };
         let upper = as_nobody(&planted);
-        let images = as_nobody(&tmp.path().join("images/rootfs"));
+        // Something inside the store: reaching it needs search permission
+        // on `rootfs`, which stat of `rootfs` itself doesn't.
+        let unpacked = std::fs::read_dir(tmp.path().join("images/rootfs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let images = as_nobody(&unpacked);
         let writable_state = grill.state(&writable).await.ok();
         let read_only_state = grill.state(&read_only).await.ok();
         for id in [&writable, &read_only] {
@@ -2592,9 +2600,12 @@ mod tests {
             0o4000,
             "the container's file is set-uid: {mode:o}"
         );
-        for output in [&upper, &images] {
+        for (what, output) in [("the writable layer", &upper), ("the image store", &images)] {
             let said = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "a local user reached it: {said}");
+            assert!(
+                !output.status.success(),
+                "a local user reached {what}: {said}"
+            );
             assert!(said.contains("Permission denied"), "{said}");
         }
         assert_eq!(writable_state, Some(ContainerState::Running));
