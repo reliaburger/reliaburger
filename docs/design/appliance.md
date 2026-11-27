@@ -349,7 +349,10 @@ and open no window. A machine outside the network the cluster admits
 ### 3.5 Seeds and the prepare state machine
 
 A seed is a gzipped tar of at most 1 MiB, with safe relative paths only
-(`src/appliance/seed.rs`). `seed.toml` (schema 1) names the `cluster`, the
+(`src/appliance/seed.rs`). Unpacked, it holds at most 64 entries and 4 MiB
+of files, each at most 1 MiB; the parser adds up the sizes the tar headers
+state and refuses a seed past either limit before reading the entry that
+crosses it, so a body that gzip shrank a thousand to one can't fill memory. `seed.toml` (schema 1) names the `cluster`, the
 `node`, the `role` (`create` or `join`), `advertise`, `peers` and
 `operators`. A create seed may also set `council_size` and `faults =
 "development"`. A join seed has `[join] members, ca_fingerprint, token`.
