@@ -926,7 +926,7 @@ it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-Five things to check before you start the fresh cluster:
+Six things to check before you start the fresh cluster:
 
 - **Node names.** `[node] name` must be one DNS label: 1 to 63 lowercase
   letters, digits and `-`. Bun refuses to start otherwise, and
@@ -954,6 +954,11 @@ Five things to check before you start the fresh cluster:
   non-root user and relies on `sudo` or another set-uid binary must start as
   root instead
   ([#2402](https://github.com/reliaburger/reliaburger/issues/2402)).
+- **Council backups.** A backup's ciphertext is now stored as base64, and
+  `relish council recover --from` skips a backup written before 0.3.4.
+  Don't plan to carry state over through an old backup; take new ones once
+  the 0.3.4 cluster runs
+  ([#2452](https://github.com/reliaburger/reliaburger/issues/2452)).
 
 ## Signing identity
 
