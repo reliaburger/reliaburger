@@ -110,6 +110,43 @@ async fn one_node_handles_10k_member_protocol_state() {
     );
 }
 
+/// `run` publishes the membership after every datagram (#2439). With
+/// 10,000 members, datagrams that change nothing must not rebuild the
+/// snapshot: nothing is sent on either watch.
+#[tokio::test]
+async fn datagrams_that_change_nothing_publish_nothing_at_10k_members() {
+    let network = InMemoryNetwork::new();
+    let mut observer = observer_with_members(&network, 10_000).await;
+    let (members, mut members_rx) = tokio::sync::watch::channel(Vec::new());
+    observer.set_membership_watch(members);
+    let (roster, mut roster_rx) = tokio::sync::watch::channel(Vec::new());
+    observer.set_roster_watch(roster);
+    observer.publish_membership();
+    assert_eq!(members_rx.borrow_and_update().len(), 10_000);
+    roster_rx.mark_unchanged();
+
+    let started = Instant::now();
+    for _ in 0..1_000 {
+        observer
+            .handle_message(
+                address(1),
+                GossipMessage::new(
+                    NodeId::new("n1"),
+                    1,
+                    GossipPayload::Ping { updates: vec![] },
+                ),
+            )
+            .await;
+        observer.publish_membership();
+    }
+    eprintln!(
+        "1,000 datagrams with the publish step at 10,000 members took {:.1?}",
+        started.elapsed()
+    );
+    assert!(!members_rx.has_changed().unwrap());
+    assert!(!roster_rx.has_changed().unwrap());
+}
+
 /// Anti-entropy must not undo the per-node bound: however large the table,
 /// one push-pull reply is at most `MAX_SYNC_DATAGRAMS` datagrams of at most
 /// `MAX_PIGGYBACK_UPDATES` entries, and successive exchanges rotate through

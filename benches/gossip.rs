@@ -174,8 +174,60 @@ fn bench_dissemination_queue(c: &mut Criterion) {
     });
 }
 
+/// The per-datagram cost of `run`'s loop body with both membership
+/// watches wired, as in production: handle one PING that changes nothing,
+/// then publish (#2439). Before the version check, each publish rebuilt,
+/// digested and sorted two full snapshots of the table.
+fn bench_publish_after_datagram(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("gossip_publish_after_datagram");
+    for &size in &[1_000usize, 10_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let net = InMemoryNetwork::new();
+                    let transport = net.register(addr(1)).await;
+                    let _peer = net.register(addr(2)).await;
+                    let mut node: MustardNode<InMemoryTransport> =
+                        MustardNode::new(NodeId::new("n0"), addr(1), fast_config(), transport);
+                    let now = std::time::Instant::now();
+                    let labels: std::collections::BTreeMap<String, String> = (0..5)
+                        .map(|i| (format!("label-{i}"), format!("value-{i}")))
+                        .collect();
+                    for i in 0..size {
+                        let id = NodeId::new(format!("m{i:05}"));
+                        node.membership
+                            .add_node(id.clone(), addr(2), 1, labels.clone(), now);
+                    }
+                    let (members, _members_rx) = tokio::sync::watch::channel(Vec::new());
+                    node.set_membership_watch(members);
+                    let (roster, _roster_rx) = tokio::sync::watch::channel(Vec::new());
+                    node.set_roster_watch(roster);
+                    node.publish_membership();
+
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let ping = GossipMessage::new(
+                            NodeId::new("m00000"),
+                            1,
+                            GossipPayload::Ping { updates: vec![] },
+                        );
+                        let start = Instant::now();
+                        node.handle_message(addr(2), ping).await;
+                        node.publish_membership();
+                        elapsed += start.elapsed();
+                    }
+                    elapsed
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_publish_after_datagram,
     bench_transport_throughput,
     bench_single_gossip_round,
     bench_convergence,

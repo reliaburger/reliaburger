@@ -1315,6 +1315,7 @@ All reporting connections use mTLS via Sesame's Node CA. In the shipped flat sta
 | Convergence time | O(log N) protocol periods | Each protocol period, each node probes one random peer and piggybacks updates. Information spreads like an epidemic. |
 | Per-node network overhead | O(1) | Each node sends/receives a constant number of messages per protocol period regardless of cluster size. |
 | Bandwidth per node | ~3 KB/s at 10,000 nodes | 1 PING + 1 ACK per protocol period (500ms), ~1400 bytes each. Plus occasional PING-REQ. |
+| CPU per received datagram | Independent of N when nothing changed | `run` republishes the membership after every datagram, but only when the table's version or the council roles moved since the last publish (#2439). A change still costs O(N log N): a snapshot, a digest and a sort, on the active and the roster watch. Before the version check every datagram paid that, 813 µs at 1,000 members and 12.8 ms at 10,000 with five labels each, against about 210 ns at either size after it (`gossip_publish_after_datagram` in `benches/gossip.rs`). |
 | Membership table memory | ~256 bytes per node | NodeMembership struct. At 10,000 nodes: ~2.5 MB total per node. |
 
 ### 9.2 Leader Election Performance

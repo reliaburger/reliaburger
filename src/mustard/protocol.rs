@@ -272,6 +272,12 @@ pub struct MustardNode<T: MustardTransport> {
     roster_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
     /// Digest of the last-published roster.
     last_published_roster_digest: Vec<MembershipDigest>,
+    /// The membership table's version at the last publish, or `None` before
+    /// the first (#2439).
+    last_published_version: Option<u64>,
+    /// How many membership snapshots `publish_membership` has built.
+    #[cfg(test)]
+    snapshots_taken: usize,
     /// Process-local proof that a peer has acknowledged our gossip.
     rejoin_watch: Option<watch::Sender<bool>>,
     /// Flips to `true` the first time a peer's membership table arrives in
@@ -403,6 +409,9 @@ impl<T: MustardTransport> MustardNode<T> {
             membership_watch: None,
             roster_watch: None,
             last_published_roster_digest: Vec::new(),
+            last_published_version: None,
+            #[cfg(test)]
+            snapshots_taken: 0,
             rejoin_watch: None,
             synced_watch: None,
             last_published_digest: Vec::new(),
@@ -476,9 +485,7 @@ impl<T: MustardTransport> MustardNode<T> {
         // Keep our own membership record's labels in sync so a snapshot of
         // the local table already carries them (the scheduler reads labels
         // from the membership snapshot).
-        if let Some(member) = self.membership.get_mut(&self.node_id) {
-            member.labels = labels;
-        }
+        self.membership.set_labels(&self.node_id, &labels);
         self.publish_directory();
     }
 
@@ -792,11 +799,8 @@ impl<T: MustardTransport> MustardNode<T> {
         // raise the floor first, so a stale hint here is refused.
         let mut changed = self.refresh_recovery_floor();
         changed |= self.directory.observe(extension);
-        if let Some(member) = self.membership.get_mut(&extension.node_id)
-            && member.labels != extension.labels
-        {
-            member.labels = extension.labels.clone();
-        }
+        self.membership
+            .set_labels(&extension.node_id, &extension.labels);
         if changed {
             self.publish_directory();
         }
@@ -871,13 +875,37 @@ impl<T: MustardTransport> MustardNode<T> {
     /// changed. Comparing a digest (not just the member count) means state
     /// transitions like Alive→Suspect — which keep the count constant until the
     /// reap — are published promptly to the council reconciler and `relish nodes`.
-    fn publish_membership(&mut self) {
+    ///
+    /// `run` calls this after every probe tick and every received datagram,
+    /// so it returns straight away when neither the table's
+    /// [`version`](MembershipTable::version) nor the council roles changed
+    /// since the last call (#2439): before, each datagram cost two full
+    /// snapshots, two digests and two sorts, mostly to learn that nothing
+    /// had changed. Public so a benchmark can drive the same step.
+    pub fn publish_membership(&mut self) {
+        let roles_changed = self
+            .council_roles_rx
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false));
+        if !roles_changed && self.last_published_version == Some(self.membership.version()) {
+            return;
+        }
         // Refresh council/leader flags from the latest Raft-derived roles before
-        // snapshotting. Clone the value out first so the watch borrow is released
+        // snapshotting: a member added since the roles last changed needs its
+        // flags too. Clone the value out first so the watch borrow is released
         // before taking `&mut self.membership` (different fields, but the borrow
         // checker can't see that through method calls).
-        if let Some(roles) = self.council_roles_rx.as_ref().map(|rx| rx.borrow().clone()) {
+        if let Some(roles) = self
+            .council_roles_rx
+            .as_mut()
+            .map(|rx| rx.borrow_and_update().clone())
+        {
             self.membership.set_roles(&roles);
+        }
+        self.last_published_version = Some(self.membership.version());
+        #[cfg(test)]
+        {
+            self.snapshots_taken += 1;
         }
         let snapshot = self.membership.snapshot();
         let digest = membership_digest(&snapshot);
@@ -889,6 +917,10 @@ impl<T: MustardTransport> MustardNode<T> {
             self.last_published_digest = digest;
         }
         if let Some(tx) = &self.roster_watch {
+            #[cfg(test)]
+            {
+                self.snapshots_taken += 1;
+            }
             let roster = self.membership.roster();
             let digest = membership_digest(&roster);
             if digest != self.last_published_roster_digest {
@@ -1316,11 +1348,9 @@ impl<T: MustardTransport> MustardNode<T> {
         // membership record. `ingest_extension` above ran before `add_node`,
         // so a first-contact sender wouldn't yet have a record to label;
         // do it here now the record exists.
-        if let Some(extension) = extension
-            && let Some(member) = self.membership.get_mut(&extension.node_id)
-            && member.labels != extension.labels
-        {
-            member.labels = extension.labels.clone();
+        if let Some(extension) = extension {
+            self.membership
+                .set_labels(&extension.node_id, &extension.labels);
         }
 
         // Disseminate newly discovered nodes so the whole cluster learns,
@@ -1470,13 +1500,7 @@ impl<T: MustardTransport> MustardNode<T> {
                 // Mark the acknowledged node alive: the sender itself, or the
                 // probed node a relay vouches for.
                 let acknowledged = relayed_for.as_ref().unwrap_or(&message.sender);
-                if let Some(member) = self.membership.get_mut(acknowledged) {
-                    if member.state == NodeState::Suspect {
-                        member.state = NodeState::Alive;
-                        member.state_changed = now;
-                    }
-                    member.last_ack = now;
-                }
+                self.membership.acknowledge(acknowledged, now);
                 if relayed_for.is_none() {
                     self.forward_relay_acks(&message.sender).await;
                 }
@@ -2167,6 +2191,99 @@ mod tests {
                 .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Suspect),
             "state transition not published without a count change"
         );
+    }
+
+    /// #2439: `run` publishes after every datagram, and each publish built
+    /// and sorted two full snapshots even when nothing had changed.
+    #[tokio::test]
+    async fn a_datagram_that_changes_nothing_takes_no_snapshot() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        for i in 0..100u16 {
+            node.membership.add_node(
+                NodeId::new(format!("m{i}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let (tx, _rx) = tokio::sync::watch::channel(Vec::new());
+        node.set_membership_watch(tx);
+        let (tx, _roster) = tokio::sync::watch::channel(Vec::new());
+        node.set_roster_watch(tx);
+        let (_roles_tx, roles_rx) =
+            watch::channel(super::super::membership::CouncilRoles::default());
+        node.set_council_roles_watch(roles_rx);
+        node.handle_message(addr(1000), ping_from("m0")).await;
+        node.publish_membership();
+        let before = node.snapshots_taken;
+        for _ in 0..50 {
+            node.handle_message(addr(1000), ping_from("m0")).await;
+            node.publish_membership();
+        }
+        assert_eq!(node.snapshots_taken - before, 0);
+    }
+
+    /// The other side of skipping: whatever a snapshot shows still
+    /// publishes, including an ACK that clears a suspicion, a label change
+    /// with no state change, and new council roles.
+    #[tokio::test]
+    async fn every_visible_change_still_publishes() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+        node.set_membership_watch(tx);
+        let (roles_tx, roles_rx) =
+            watch::channel(super::super::membership::CouncilRoles::default());
+        node.set_council_roles_watch(roles_rx);
+        node.publish_membership();
+        let n2 = |rx: &watch::Receiver<Vec<MembershipSnapshot>>| {
+            rx.borrow()
+                .iter()
+                .find(|member| member.node_id == NodeId::new("n2"))
+                .cloned()
+                .unwrap()
+        };
+
+        node.membership.suspect(&NodeId::new("n2"));
+        node.publish_membership();
+        assert_eq!(n2(&rx).state, NodeState::Suspect);
+
+        let ack = GossipMessage::new(
+            NodeId::new("n2"),
+            1,
+            GossipPayload::Ack {
+                updates: vec![],
+                relayed_for: None,
+            },
+        );
+        node.handle_message(addr(2), ack).await;
+        node.publish_membership();
+        assert_eq!(n2(&rx).state, NodeState::Alive);
+
+        node.membership.set_labels(
+            &NodeId::new("n2"),
+            &BTreeMap::from([("zone".to_string(), "b".to_string())]),
+        );
+        node.publish_membership();
+        assert_eq!(n2(&rx).labels.get("zone").map(String::as_str), Some("b"));
+
+        roles_tx.send_replace(super::super::membership::CouncilRoles {
+            council: [NodeId::new("n2")].into(),
+            leader: Some(NodeId::new("n2")),
+        });
+        node.publish_membership();
+        assert!(n2(&rx).is_council && n2(&rx).is_leader);
     }
 
     /// The active watch drops a member the moment it goes down; the roster
