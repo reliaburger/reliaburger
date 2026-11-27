@@ -119,6 +119,22 @@ The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parame
 
 A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
+"Cut short" isn't the only shape a crash leaves, though (#2377). Some
+filesystems and mount modes (ext4 with `data=writeback`, some network
+filesystems) can record a file's new size before its data, so after a power
+cut the last, unsynced block comes back as zeros. Its header then says it
+holds zero records, and the scan used to call that corruption unless less than
+one block's worth of bytes followed. The node refused the whole array and the
+leader ran its held chunks again, including outcomes that were already
+durable. Now a header of all zeros, followed by nothing but zeros to the end of
+the file, is a torn tail too: `Ledger::open` truncates it and carries on. The
+check reads the rest in 64 KiB buffers, so it doesn't load the tail into
+memory. It's deliberately that narrow. Zeros followed by anything else are
+still corruption, as `zeros_followed_by_data_are_still_corruption` checks,
+because forgiving any bad final region would also hide real damage in the
+middle of a file. `a_zero_filled_tail_is_a_torn_tail` appends 4,096 zero bytes
+to a one-record ledger and expects that record back and the file trimmed.
+
 #### A stopping node starts no new attempts
 
 The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.
