@@ -140,8 +140,8 @@ so, and that node may accept the token until it catches up.
 
 A stream that is already open ends too. A followed log (`relish logs -f`), the
 event stream (`/v1/events?follow=true`), their WebSocket versions, the
-dashboard's live panes and the progress of `relish apply` or `relish rollback`
-re-check the token that opened them every 15 seconds. Once it's revoked or
+dashboard's live panes and the progress of `relish apply`, `relish rollback` or
+`relish scale` re-check the token that opened them every 15 seconds. Once it's revoked or
 expired, the stream ends with a warning, `the token that opened this stream was
 revoked or has expired`, and a WebSocket closes with code 1008 (policy). A
 deploy whose progress stream ended this way carries on; follow it with
