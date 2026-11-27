@@ -1202,6 +1202,37 @@ because binding only asks the registry for a digest and never sees the
 manifest; checking there would mean fetching it, which is a change to the
 binder for another day.
 
+### A restart shouldn't need a leader
+
+Chapter 17 tells how a warm digest pin stopped asking the registry (#790):
+the pull keeps the index, manifest and config it verified under
+`metadata/sha256/`, and the next pull of that pin resolves from disk. The
+audit found the shortcut covered only images fetched straight from an
+external registry (#2421). Images that came through Pickle, pushed to the
+cluster or filled by the pull-through cache (the default path for external
+images), went through `unpack_local`, which kept nothing. So every container
+create asked the catalogue again, and a catalogue read needs a leader to
+confirm it. Lose quorum, and a crashed replica couldn't restart, though its
+rootfs and `.complete` marker sat right there on disk.
+
+The fix gives the runtime what the direct pull already had. `LocalImageBlobs`,
+what the cluster source hands over, gained the platform manifest and the
+index that named it, as paths into the blob store: Pickle keeps raw manifest
+bytes as blobs anyway, so there's nothing new to fetch. After a successful
+unpack of a digest pin, `unpack_local` stores those bytes and the config
+through the same `store_metadata`, which checks each against its digest
+first. `pinned_image_from_local` doesn't change at all, and keeps re-hashing
+every file it reads. A failure to store is a warning, not a failed pull: the
+metadata is a cache, and a miss only means the next start asks the source.
+
+The fields are `Option`s, so a test double, or a source that has no manifest
+to give, leaves them `None` and gets the old behaviour. Tags still never take
+the shortcut. The unit test serves an image once from a fake source that
+then answers "no leader", as the catalogue does without quorum: the second
+pull succeeds with the same rootfs and the source sees one call, for a
+cluster image and a pull-through one alike. Then it overwrites the stored
+metadata, and the next pull goes back to the source.
+
 ## Who owns these bytes?
 
 Content addressing answers "are these the right bytes?". It says nothing about

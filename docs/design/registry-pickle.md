@@ -803,6 +803,10 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
      whole blob). All attempts together get six minutes, or the time the
      layer takes at 64 KiB/s if that's longer. Bun's direct pull does the
      same (`grill::oci_pull::pull_layer_to_store`).
+   - The runtime keeps a pinned image's index, platform manifest and config
+     as pin metadata after it unpacks the image, as a direct pull does, so the
+     next start of that pin resolves locally, without the catalogue read that
+     needs the council leader (#2421).
    - Fills of one image are serialised by a lock per cached repository and
      tag (or platform digest); fills of different images run side by side.
    - Store locally and commit the manifest to Raft (same as a regular push); the heal loop replicates to peers afterwards.

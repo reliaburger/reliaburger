@@ -2239,6 +2239,8 @@ mod capacity_contract {
             layers: vec![layer_path],
             config: config_path,
             config_digest,
+            manifest: None,
+            index: None,
         })));
         store
     }

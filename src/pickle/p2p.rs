@@ -339,6 +339,7 @@ impl ClusterSource {
         )>,
     ) -> Result<LocalImageBlobs, PickleError> {
         let mut manifest = root;
+        let mut index = None;
         // A multi-platform image: materialise the index (and the platform
         // manifests it pins), then pick this node's platform. The index bytes
         // name the platform manifest by digest and every blob is
@@ -349,7 +350,8 @@ impl ClusterSource {
                 .await?;
             let store = self.state.store.clone();
             let index_digest = manifest.digest.clone();
-            let index_bytes = tokio::task::spawn_blocking(move || store.read_blob(&index_digest))
+            let read_digest = index_digest.clone();
+            let index_bytes = tokio::task::spawn_blocking(move || store.read_blob(&read_digest))
                 .await
                 .map_err(|error| {
                     PickleError::ReplicationFailed(format!(
@@ -379,11 +381,12 @@ impl ClusterSource {
                     manifest.digest
                 )));
             }
+            index = Some(index_digest);
         }
 
         self.materialise(repository, &manifest, &catalog, peers)
             .await?;
-        Ok(local_blobs(&self.state.store, &manifest))
+        Ok(local_blobs(&self.state.store, &manifest, index.as_ref()))
     }
 
     /// Make every blob a catalogue entry pins local (its own manifest blob
@@ -861,11 +864,18 @@ impl ClusterSource {
     }
 }
 
-/// Where a catalogued image's blobs sit in this node's store.
+/// Where a catalogued image's blobs sit in this node's store: its layers and
+/// config, and its manifest and the index that named it (when it was asked
+/// for by one), which the runtime keeps as pin metadata (#2421).
 fn local_blobs(
     store: &super::store::BlobStore,
     manifest: &super::types::ImageManifest,
+    index: Option<&Digest>,
 ) -> LocalImageBlobs {
+    let metadata = |digest: &Digest| crate::grill::image::LocalMetadataBlob {
+        digest: digest.as_str().to_string(),
+        path: store.blob_path(digest),
+    };
     LocalImageBlobs {
         layers: manifest
             .layers
@@ -875,6 +885,8 @@ fn local_blobs(
         config: store.blob_path(&manifest.config.digest),
         // Digest's Display abbreviates; the image store re-checks the full value.
         config_digest: manifest.config.digest.as_str().to_string(),
+        manifest: Some(metadata(&manifest.digest)),
+        index: index.map(metadata),
     }
 }
 

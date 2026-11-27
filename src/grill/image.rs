@@ -257,6 +257,22 @@ pub struct LocalImageBlobs {
     pub config: PathBuf,
     /// The config blob's digest, as the manifest names it.
     pub config_digest: String,
+    /// The platform manifest that names the config and layers.
+    pub manifest: Option<LocalMetadataBlob>,
+    /// The image index that named the platform manifest, when the image was
+    /// asked for by its index.
+    pub index: Option<LocalMetadataBlob>,
+}
+
+/// A manifest or index blob held locally: its digest and where its bytes
+/// are. Kept as pin metadata after an unpack, so a warm digest pin starts
+/// without asking the source again (#2421).
+#[derive(Debug, Clone)]
+pub struct LocalMetadataBlob {
+    /// The digest that names the bytes, `sha256:…`.
+    pub digest: String,
+    /// The blob's path in local storage.
+    pub path: PathBuf,
 }
 
 /// An unpacked image: its root filesystem and the config that says how
@@ -774,7 +790,7 @@ impl ImageStore {
             for (repo, tag) in cluster_candidates(&image_ref) {
                 match source.fetch_cluster_image(&repo, &tag).await {
                     Ok(Some(blobs)) => {
-                        return self.unpack_local(blobs, rootfs).await;
+                        return self.unpack_local(&image_ref, blobs, rootfs).await;
                     }
                     Ok(None) => continue,
                     // The catalog knows the image but its layers are
@@ -794,7 +810,7 @@ impl ImageStore {
             // the same either way, so degrading is safe (and logged).
             match source.fetch_pull_through(&image_ref).await {
                 Ok(Some(blobs)) => {
-                    return self.unpack_local(blobs, rootfs).await;
+                    return self.unpack_local(&image_ref, blobs, rootfs).await;
                 }
                 Ok(None) => {}
                 Err(reason) => {
@@ -1086,8 +1102,13 @@ impl ImageStore {
 
     /// Unpack blobs the cluster already holds, re-checking the config
     /// blob's digest: it decides what the container runs, and as whom.
+    ///
+    /// For a digest pin, the index, manifest and config are then kept as pin
+    /// metadata, as a direct pull keeps them, so the next start of this
+    /// image needs neither the catalogue nor the council leader (#2421).
     async fn unpack_local(
         &self,
+        image_ref: &ImageReference,
         blobs: LocalImageBlobs,
         rootfs: PathBuf,
     ) -> Result<PulledImage, ImageError> {
@@ -1102,6 +1123,26 @@ impl ImageStore {
         }
         let config = parse_config(&bytes, &blobs.config_digest)?;
         let rootfs = self.unpack_to(blobs.layers, rootfs).await?;
+        if image_ref.tag.starts_with("sha256:") {
+            let metadata = [blobs.index, blobs.manifest]
+                .into_iter()
+                .flatten()
+                .map(|blob| (blob.digest, blob.path));
+            for (digest, path) in metadata {
+                // A cache, not the pull: a miss only means the next start
+                // asks the source again.
+                let stored = match tokio::fs::read(&path).await {
+                    Ok(bytes) => self.store_metadata(&digest, bytes).await,
+                    Err(error) => Err(error.into()),
+                };
+                if let Err(error) = stored {
+                    eprintln!("warning: could not keep pin metadata {digest}: {error}");
+                }
+            }
+            if let Err(error) = self.store_metadata(&blobs.config_digest, bytes).await {
+                eprintln!("warning: could not keep pin metadata for {image_ref:?}: {error}");
+            }
+        }
         Ok(PulledImage { rootfs, config })
     }
 }
@@ -3980,6 +4021,151 @@ mod tests {
             assert_eq!(warm.rootfs, cold.rootfs);
             assert_eq!(warm.config, cold.config);
         }
+    }
+
+    /// A cluster source that serves one image once and then fails, as the
+    /// Pickle catalogue does when there is no council leader to confirm a
+    /// read. `pull_through` picks which of the two lookups answers.
+    struct OnceThenNoLeader {
+        blobs: LocalImageBlobs,
+        pull_through: bool,
+        calls: AtomicUsize,
+    }
+
+    impl OnceThenNoLeader {
+        fn answer(&self) -> Result<Option<LocalImageBlobs>, String> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(Some(self.blobs.clone())),
+                _ => Err("no leader".into()),
+            }
+        }
+    }
+
+    impl ClusterImageSource for OnceThenNoLeader {
+        fn fetch_cluster_image<'a>(
+            &'a self,
+            _repository: &'a str,
+            _tag: &'a str,
+        ) -> ClusterFetchFuture<'a> {
+            let answer = if self.pull_through {
+                Ok(None)
+            } else {
+                self.answer()
+            };
+            Box::pin(std::future::ready(answer))
+        }
+
+        fn fetch_pull_through<'a>(&'a self, _image: &'a ImageReference) -> ClusterFetchFuture<'a> {
+            let answer = if self.pull_through {
+                self.answer()
+            } else {
+                Ok(None)
+            };
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    /// Write an image's layer, config and manifest into the blob store at
+    /// `root`, as Pickle leaves them after a peer pull or a cache fill, and
+    /// return the manifest's digest with the blobs a source hands over.
+    fn cluster_image_blobs(root: &Path) -> (String, LocalImageBlobs) {
+        let store = ImageStore::new(root.to_path_buf());
+        let write = |bytes: &[u8]| {
+            let digest = format!("sha256:{}", sha256_hex(bytes));
+            let path = store.blob_path(&digest);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            (digest, path)
+        };
+        let staging = tempfile::tempdir().unwrap();
+        let layer_file = staging.path().join("layer.tar.gz");
+        create_test_layer(&layer_file, &[("bin/app", b"cluster app")]);
+        let layer = std::fs::read(layer_file).unwrap();
+        let (layer_digest, layer_path) = write(&layer);
+        let config = br#"{"config":{"Entrypoint":["/bin/app"]}}"#;
+        let (config_digest, config_path) = write(config);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        let (manifest_digest, manifest_path) = write(&manifest);
+        let blobs = LocalImageBlobs {
+            layers: vec![layer_path],
+            config: config_path,
+            config_digest,
+            manifest: Some(LocalMetadataBlob {
+                digest: manifest_digest.clone(),
+                path: manifest_path,
+            }),
+            index: None,
+        };
+        (manifest_digest, blobs)
+    }
+
+    /// #2421: a node that unpacked a pinned cluster or pull-through image
+    /// restarts it with no leader; a pin whose local metadata was tampered
+    /// with goes back to the source.
+    #[tokio::test]
+    async fn a_warm_pinned_cluster_image_starts_without_the_cluster_source() {
+        // The pull-through image's registry is a closed loopback port: a
+        // source error falls through to a direct pull, which must fail fast
+        // and offline.
+        for (pull_through, name) in [(false, "web"), (true, "127.0.0.1:1/acme/web")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pin, blobs) = cluster_image_blobs(tmp.path());
+            let source = std::sync::Arc::new(OnceThenNoLeader {
+                blobs,
+                pull_through,
+                calls: AtomicUsize::new(0),
+            });
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            store.set_cluster_source(source.clone());
+            let reference = format!("{name}@{pin}");
+
+            let cold = store.pull_and_unpack(&reference).await.unwrap();
+            let warm = store
+                .pull_and_unpack(&reference)
+                .await
+                .unwrap_or_else(|error| panic!("pull_through={pull_through}: {error}"));
+            assert_eq!(warm.rootfs, cold.rootfs);
+            assert_eq!(warm.config, cold.config);
+            assert_eq!(source.calls.load(Ordering::SeqCst), 1, "{name}");
+
+            for file in stored_metadata(tmp.path()) {
+                std::fs::write(file, b"tampered").unwrap();
+            }
+            assert!(store.pull_and_unpack(&reference).await.is_err());
+            assert_eq!(source.calls.load(Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
+    /// A tag is never resolved locally, cluster image or not: only a digest
+    /// says which bytes are right.
+    #[tokio::test]
+    async fn a_warm_cluster_image_named_by_tag_still_asks_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, blobs) = cluster_image_blobs(tmp.path());
+        let source = std::sync::Arc::new(OnceThenNoLeader {
+            blobs,
+            pull_through: false,
+            calls: AtomicUsize::new(0),
+        });
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        store.set_cluster_source(source.clone());
+        store.pull_and_unpack("web:v1").await.unwrap();
+        assert!(store.pull_and_unpack("web:v1").await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -64,7 +64,9 @@ if that's longer; past that the pull fails with `layer … did not arrive
 within N s`.
 
 Once a node has pulled and unpacked a digest-pinned image, it doesn't ask any
-registry about it again. Bun keeps the index, manifest and config it verified
+registry about it again, nor the cluster's catalogue: a replica of a pushed
+or pull-through image restarts even while the cluster has no council
+leader. Bun keeps the index, manifest and config it verified
 and checks each against its digest before reusing it, so a burst of
 containers or job executors from that image can't trip a registry's rate
 limit. A tag reference, or a pin whose local copy is missing or no longer
