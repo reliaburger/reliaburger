@@ -254,6 +254,8 @@ Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instanc
 
 ## 4. Data Structures
 
+This section is a design sketch, not the code. The types that exist in `src/wrapper/` are `RoutingTable`, `PathRoute`, `Backend`, `TlsMode`, `RateLimitConfig`, `RateLimiter`, `TokenBucket`, `HealthProbeConfig` and `WrapperConfig`, and their fields differ from the sketch. `BackendPool`, `LoadBalanceStrategy`, `DrainingBackend`, `ConnectionDrainState`, `DrainInfo`, `TrackedConnection`, `IngressRoute`, `HeaderRule` and `TlsVersion` don't exist: routes hold their backends directly, the drain tracker lives in `src/wrapper/draining.rs`, and headers and the TLS minimum aren't configurable.
+
 ```rust
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -761,24 +763,23 @@ max_tls_handshakes_per_source = 16
 max_request_body_bytes = 10485760
 request_body_budget_bytes = 268435456
 
-# Default drain timeout for rolling deploys.
-# Per-app drain_timeout in the app spec overrides this.
-# Default: "30s".
-drain_timeout = "30s"
-
-# Global default rate limit (requests per second per client IP).
-# Applied to routes that do not specify their own rate limit.
-# Default: none (no rate limiting).
-# rate_limit_rps = 1000
-# rate_limit_burst = 2000
-
-# NOTE: the keys below are PLANNED, not parsed today.
+# NOTE: the keys below are PLANNED, not parsed today. The section refuses
+# unknown keys, so uncommenting one stops Bun at startup.
+#   - `drain_timeout` would set a node-wide default drain timeout. Today
+#     each app's `[app.<name>.deploy] drain_timeout` (default 30s) is the
+#     only one.
+#   - `rate_limit_rps` / `rate_limit_burst` would set a node-wide default
+#     rate limit per client IP. Today only routes that set their own are
+#     limited.
 #   - `min_tls_version` does not exist as a config key. The TLS minimum is
 #     not configurable; rustls 0.23's default (TLS 1.2+) applies, so 1.0/1.1
 #     are rejected, but there is no key to force 1.3-only.
 #   - the `health_probe_*` keys would tune the Wrapper-local active health
 #     probe (§3.3). The probe runs today, but only with its built-in
 #     defaults (5s interval, 2s timeout, GET "/").
+# drain_timeout = "30s"
+# rate_limit_rps = 1000
+# rate_limit_burst = 2000
 # min_tls_version = "1.2"
 # health_probe_interval = "5s"
 # health_probe_timeout = "2s"
@@ -807,7 +808,7 @@ websocket = false
 # rate_limit_burst = 200
 
 [app.web.deploy]
-# Drain timeout for this app during rolling deploys. Default: node-level setting.
+# Drain timeout for this app during rolling deploys. Default: 30s.
 drain_timeout = "30s"
 ```
 
