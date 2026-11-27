@@ -33,6 +33,19 @@ pub const NODE_TIMEOUT: Duration = Duration::from_secs(300);
 /// restarting under systemd with room to spare.
 pub const DIRECTIVE_RETRY_WINDOW: Duration = Duration::from_secs(120);
 
+/// How long one node's `/v1/version` + `/v1/health` probe may take. A node
+/// that accepts the connection and then says nothing (deadlocked, stopped,
+/// a half-open connection after a power cut) counts as unreachable after
+/// this, so the stuck-node timeout still runs (#2416). The start handler
+/// gives its own probe the same bound.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a directive may take to be answered. Longer than a probe: the
+/// node answers `/v1/upgrade/apply` only once it has fetched (up to 75 s)
+/// and checked (up to 60 s for `--compatibility`) the binary. A directive
+/// with no answer by then is a transient failure, retried like any other.
+pub const DIRECTIVE_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// The wait after the first transient failure; it doubles per attempt.
 const DIRECTIVE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(3);
 
@@ -262,13 +275,30 @@ async fn poll_and_drive_group<C: NodeControl>(
     // latched that and moved on, the next node would upgrade PAST a failure
     // the reverting node is about to report. Re-checking Healthy catches the
     // subsequent revert and pauses the run instead.
+    //
+    // The probes run side by side, each within PROBE_TIMEOUT, and their
+    // answers are applied in node order: one silent node must not stall the
+    // tick, and many unreachable ones must not cost a bound each (#2416).
+    let probed: Vec<String> = state
+        .nodes
+        .iter()
+        .filter(|n| n.role == role && !is_terminal_failure(&n.phase))
+        .map(|n| n.address.clone())
+        .collect();
+    let answers = futures_util::future::join_all(probed.iter().map(|address| async move {
+        tokio::time::timeout(PROBE_TIMEOUT, control.probe(address))
+            .await
+            .ok()
+            .flatten()
+    }))
+    .await;
+    let mut answers = answers.into_iter();
     for record in state.nodes.iter_mut().filter(|n| n.role == role) {
-        match record.phase {
-            NodeUpgradePhase::Failed { .. } | NodeUpgradePhase::RolledBack => continue,
-            _ => {}
+        if is_terminal_failure(&record.phase) {
+            continue;
         }
 
-        let Some(probe) = control.probe(&record.address).await else {
+        let Some(probe) = answers.next().flatten() else {
             // Unreachable is normal mid-swap (the exec blip); the timeout
             // below catches nodes that never come back. A Healthy node that
             // briefly stops answering is left Healthy (its check_timeout is a
@@ -449,11 +479,15 @@ async fn poll_and_drive_group<C: NodeControl>(
         let sent = match direction {
             UpgradeDirection::Upgrade => {
                 match directive_for(&binaries, record.platform.as_deref()) {
-                    Ok(directive) => control.direct_upgrade(&record.address, &directive).await,
+                    Ok(directive) => {
+                        bounded_directive(control.direct_upgrade(&record.address, &directive)).await
+                    }
                     Err(reason) => Err(DirectiveError::Refused(reason)),
                 }
             }
-            UpgradeDirection::Rollback => control.direct_rollback(&record.address, &target).await,
+            UpgradeDirection::Rollback => {
+                bounded_directive(control.direct_rollback(&record.address, &target)).await
+            }
         };
         match sent {
             Ok(()) => {
@@ -488,9 +522,32 @@ async fn poll_and_drive_group<C: NodeControl>(
                 && !directed_this_tick.contains(&record.node_id)
                 && let Ok(directive) = directive_for(&binaries, record.platform.as_deref())
             {
-                let _ = control.direct_upgrade(&record.address, &directive).await;
+                let _ =
+                    bounded_directive(control.direct_upgrade(&record.address, &directive)).await;
             }
         }
+    }
+}
+
+/// Is this node done with the run for good, so pass 1 skips it?
+fn is_terminal_failure(phase: &NodeUpgradePhase) -> bool {
+    matches!(
+        phase,
+        NodeUpgradePhase::Failed { .. } | NodeUpgradePhase::RolledBack
+    )
+}
+
+/// Wait for a directive's answer for at most [`DIRECTIVE_TIMEOUT`]; no
+/// answer by then is a transient failure (#2416).
+async fn bounded_directive(
+    sent: impl std::future::Future<Output = Result<(), DirectiveError>>,
+) -> Result<(), DirectiveError> {
+    match tokio::time::timeout(DIRECTIVE_TIMEOUT, sent).await {
+        Ok(answer) => answer,
+        Err(_) => Err(DirectiveError::Transient(format!(
+            "no answer within {}s",
+            DIRECTIVE_TIMEOUT.as_secs()
+        ))),
     }
 }
 
@@ -1105,6 +1162,9 @@ mod tests {
         /// Scripted directive answers per address, consumed in order; an
         /// address with none left accepts.
         answers: Mutex<HashMap<String, std::collections::VecDeque<DirectiveError>>>,
+        /// Addresses that accept a connection and then never answer: their
+        /// probes and directives never resolve (#2416).
+        silent: Mutex<std::collections::HashSet<String>>,
     }
 
     impl MockControl {
@@ -1166,8 +1226,22 @@ mod tests {
         }
     }
 
+    impl MockControl {
+        /// Make `address` go silent: connected, never answering.
+        fn silence(&self, address: &str) {
+            self.silent.lock().unwrap().insert(address.to_string());
+        }
+
+        fn is_silent(&self, address: &str) -> bool {
+            self.silent.lock().unwrap().contains(address)
+        }
+    }
+
     impl NodeControl for MockControl {
         async fn probe(&self, address: &str) -> Option<NodeProbe> {
+            if self.is_silent(address) {
+                return std::future::pending().await;
+            }
             self.nodes.lock().unwrap().get(address).cloned()
         }
 
@@ -1176,6 +1250,9 @@ mod tests {
             address: &str,
             directive: &UpgradeDirective,
         ) -> Result<(), DirectiveError> {
+            if self.is_silent(address) {
+                return std::future::pending().await;
+            }
             self.directives.lock().unwrap().push(address.to_string());
             self.directed_binaries
                 .lock()
@@ -1435,6 +1512,119 @@ mod tests {
             NodeUpgradePhase::Failed { .. }
         ));
         assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    /// #2416: a node that accepts the probe and never answers counts as
+    /// unreachable once the probe's bound passes, so the stuck-node timeout
+    /// for another node still fires and the run pauses. Before the bound,
+    /// `step` never returned and nothing was ever written to Raft.
+    ///
+    /// The clock is paused (and nothing is spawned), so tokio skips ahead
+    /// through every timer instead of the test waiting in real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_never_answers_its_probe_does_not_stall_the_step() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        control.silence("addr-w1");
+        let mut state = cluster_state(
+            vec![
+                record("w1", NodeRole::Worker, NodeUpgradePhase::Healthy),
+                record("w2", NodeRole::Worker, NodeUpgradePhase::Directed),
+            ],
+            1,
+        );
+        state.nodes[1].since = Some(SystemTime::now() - (NODE_TIMEOUT + Duration::from_secs(1)));
+
+        let state =
+            tokio::time::timeout(Duration::from_secs(30), step(state, &control, &context()))
+                .await
+                .expect("one silent node stalled the whole step");
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        assert!(
+            matches!(state.nodes[1].phase, NodeUpgradePhase::Failed { .. }),
+            "{:?}",
+            state.nodes[1].phase
+        );
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    /// #2416: the probes of one group run side by side, so a tick with
+    /// several silent nodes costs one probe bound, not one per node.
+    #[tokio::test(start_paused = true)]
+    async fn a_groups_probes_run_concurrently() {
+        let control = MockControl::default();
+        let mut nodes = Vec::new();
+        for worker in ["w1", "w2", "w3"] {
+            control.silence(&format!("addr-{worker}"));
+            nodes.push(record(worker, NodeRole::Worker, NodeUpgradePhase::Healthy));
+        }
+        let state = cluster_state(nodes, 1);
+
+        let started = tokio::time::Instant::now();
+        step(state, &control, &context()).await;
+
+        assert!(
+            started.elapsed() < PROBE_TIMEOUT * 2,
+            "three silent probes took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #2416: a directive the node never answers is a transient failure
+    /// within its bound, and the node is retried like any other.
+    #[tokio::test(start_paused = true)]
+    async fn a_directive_that_never_answers_is_a_transient_failure() {
+        let control = HangingDirectives::default();
+        control.inner.set("addr-w1", "0.1.0", true, false);
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Pending)],
+            1,
+        );
+
+        let state = tokio::time::timeout(
+            DIRECTIVE_TIMEOUT + Duration::from_secs(30),
+            step(state, &control, &context()),
+        )
+        .await
+        .expect("a silent directive stalled the step");
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Pending);
+        let retry = state.nodes[0].directive_retry.as_ref().expect("a retry");
+        assert_eq!(retry.attempts, 1);
+        assert!(
+            retry.last_error.contains("no answer"),
+            "{}",
+            retry.last_error
+        );
+    }
+
+    /// Answers probes like [`MockControl`]; never answers a directive.
+    #[derive(Default)]
+    struct HangingDirectives {
+        inner: MockControl,
+    }
+
+    impl NodeControl for HangingDirectives {
+        async fn probe(&self, address: &str) -> Option<NodeProbe> {
+            self.inner.probe(address).await
+        }
+
+        async fn direct_upgrade(
+            &self,
+            _address: &str,
+            _directive: &UpgradeDirective,
+        ) -> Result<(), DirectiveError> {
+            std::future::pending().await
+        }
+
+        async fn direct_rollback(
+            &self,
+            _address: &str,
+            _version: &BinaryVersion,
+        ) -> Result<(), DirectiveError> {
+            std::future::pending().await
+        }
     }
 
     #[tokio::test]

@@ -2103,3 +2103,23 @@ let directory = directory.borrow();
 The project's async rules gained a line too: never hold two `watch` borrows at once. Two more places broke it with other pairs of gossip channels: the council reconciler's membership filter in `src/cluster/recovery_fence.rs` held the membership and the directory, and Bun's roster refresher held the directory and the roster. Neither had a partner taking the pair the other way round yet, but neither should wait for one. Each now borrows one channel per statement.
 
 `directory_write_waits_for_metrics_read` in the same file is the test fixture. It holds a metrics borrow, as the maintainer does, and queues an openraft write behind it. Then it runs the code under test on its own thread, which blocks on the metrics behind that queued writer, and checks whether a gossip write can still land. Three tests use it: one each for `resolve_leader` and `leader_api_address`, and `forwarding_reads_the_metrics_without_holding_the_gossip_directory` for Pickle's forwarder. With the directory borrowed first, all three fail with "a gossip directory write waited for the metrics read". Every wait in the fixture has a timeout, so a regression fails the test instead of hanging it.
+
+## One node that never answers
+
+The leader's walk polls every node in the group it's working on, every 3 seconds. Pass 1 of `poll_and_drive_group` calls `control.probe(address)` for each one, and `HttpNodeControl::probe` is two plain reqwest calls, `GET /v1/version` and `GET /v1/health`. Neither had a timeout. Nor did the cluster's HTTP client: `crate::http_client::builder()` sets HTTP/1 and the bundled roots, and its doc comment says the caller adds timeouts. The orchestrator's caller didn't (#2416).
+
+Now picture a node that accepts the connection and then says nothing. Its bun is deadlocked, or `SIGSTOP`ped, or the box lost power and the leader's pooled connection went half-open. The kernel still finishes the handshake from the listen backlog. `send()` writes the request and waits for headers that never come. `step()` never returns, so `check_timeout` never runs for the node that's actually stuck, nothing reaches Raft, and the run neither moves nor pauses. `relish upgrade abort` and `resume` both answer that the run isn't paused. The 300 s stuck-node timeout we built for exactly this case sits behind the call that hangs.
+
+The fix bounds every call in `step` itself, not just in `HttpNodeControl`, so every `NodeControl` gets it, the test mock included:
+
+- A probe gets `PROBE_TIMEOUT`, 5 s, the bound the start handler already gave its own probe. A probe that runs out counts as unreachable, the same as a refused connection, so the stuck-node timeout runs as before.
+- A directive gets `DIRECTIVE_TIMEOUT`, 150 s. A node answers `/v1/upgrade/apply` only once it has fetched the binary (75 s at most) and asked it for its formats (60 s at most), so 5 s would turn every slow fetch into a retry storm. A directive with no answer by then is `DirectiveError::Transient`, retried with the usual backoff.
+- The group's probes run side by side with `futures_util::future::join_all`, then the results are applied in node order. Done one after another, 200 silent workers would cost 200 × 5 s a tick.
+
+`tokio::time::timeout(duration, future)` wraps any future and returns `Err(Elapsed)` if it hasn't finished in time. Dropping the inner future cancels it. For a reqwest call that closes the connection, so nothing is left waiting behind it.
+
+Both cluster clients, plaintext and mTLS, also got a 5 s `connect_timeout`, so no peer call anywhere waits out the kernel's two-minute SYN timeout. They didn't get an overall `.timeout()`. The same client carries streaming calls (the log fan-out, build transfers) that legitimately run for minutes.
+
+### Tests
+
+`a_node_that_never_answers_its_probe_does_not_stall_the_step` gives `MockControl` a silent node whose probe is `std::future::pending()`, a future that never finishes, beside a node that's been `Directed` for longer than `NODE_TIMEOUT`. Before the fix `step` never returned and the test's outer 30 s timeout fired. Now the silent node stays `Healthy` and the stuck one fails and pauses the run. `a_groups_probes_run_concurrently` checks that three silent nodes cost one probe bound, and `a_directive_that_never_answers_is_a_transient_failure` that a silent directive leaves the node `Pending` with a retry booked. All three run with `#[tokio::test(start_paused = true)]`. With the clock paused, Tokio jumps straight to the next timer whenever every task is waiting, so a 150 s bound takes no real time. That's safe here because nothing in the test calls `tokio::spawn`.

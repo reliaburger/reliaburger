@@ -569,6 +569,7 @@ fn cluster_http_client(
     // Peer API authority is resolved explicitly; redirects must not replay receipts or tokens.
     let mut builder = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(crate::cluster::http::PEER_CONNECT_TIMEOUT)
         .use_preconfigured_tls(tls);
     if let Some(headers) = bearer_default_headers(bearer)? {
         builder = builder.default_headers(headers);

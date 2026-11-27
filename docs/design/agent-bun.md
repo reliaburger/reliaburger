@@ -1460,6 +1460,14 @@ A node reaches "Healthy" only when it is on the target version, HTTP-healthy,
 AND back in the gossip mesh. A node that comes up HTTP-healthy but never
 rejoins gossip is held (and eventually times out and pauses the run) — it is
 isolated, not done.
+
+Every call a tick makes is bounded, in `step` itself, so one silent node can't
+stall the walk (#2416). A group's probes run concurrently, each within
+PROBE_TIMEOUT (5 s); one that runs out counts as unreachable, and the 300 s
+stuck-node timeout runs as usual. A directive gets DIRECTIVE_TIMEOUT (150 s:
+the node answers only after its fetch, up to 75 s, and its compatibility
+query, up to 60 s); one with no answer is a transient failure, retried with
+backoff. Both cluster HTTP clients connect within 5 s.
 ```
 
 **Rollback:**
