@@ -286,13 +286,21 @@ pub struct Compatibility {
 /// after the apply's stream has answered `200`, so `relish apply` on a
 /// cluster reports an image nobody built as `404`, not `500` (#2157).
 ///
+/// 0.3.4, audit fixes (62/77): one bump for the whole release, made by its
+/// first wire or state change. Each later 0.3.4 change adds its line below
+/// this one.
+/// `RaftRpc::InstallSnapshot` carries its chunk's `data` as a base64
+/// string, not a JSON array of numbers (`snapshot_chunk_wire` in
+/// `src/council/network.rs`), so nodes on either side of the change can't
+/// exchange snapshots (#2367).
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 61,
-    state: 76,
+    protocol: 62,
+    state: 77,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -603,6 +611,28 @@ mod tests {
             ensure_state_compatible(directory.path()),
             Err(CompatibilityError::StateMismatch { found, expected, .. })
                 if found == BEFORE_APPLIANCE.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    /// 0.3.2's and 0.3.3's generation, which 0.3.4's audit fixes left
+    /// behind (#2367's snapshot chunks, among others).
+    const BEFORE_AUDIT_FIXES: Compatibility = Compatibility {
+        protocol: 61,
+        state: 76,
+    };
+
+    #[test]
+    fn peers_and_state_from_0_3_3_are_refused() {
+        assert!(BEFORE_AUDIT_FIXES.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_AUDIT_FIXES.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_AUDIT_FIXES.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }

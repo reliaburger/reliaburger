@@ -91,8 +91,8 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E '(binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos))'
 
-test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
-	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
+test-hollow: ## Run the 20-node hollow-node harness check (#1401), the 100-node, 1,000-app summary budget and the 500-worker report storm (#1411); measured fleets run through scripts/release/qualify-hollow-nodes.sh
+	$(NEXTEST) --run-ignored=only -E '(binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))) | (binary(reporting_tcp) & test(five_hundred_workers))'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -177,10 +177,11 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 outdated: ## Report crates that cargo update would move and those a major version behind (never fails)
 	-$(CARGO) update --dry-run --verbose
 
-bench: ## Run reproducible transport and 5-250 node gossip benchmarks, the 1k and 10k node scheduling pass, and policy evaluation for 10-1,000 policies
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks, the 1k and 10k node scheduling pass, policy evaluation for 10-1,000 policies and the ingress drain tracker
 	$(CARGO) bench --bench gossip
 	$(CARGO) bench --bench scheduler
 	$(CARGO) bench --bench policy
+	$(CARGO) bench --bench wrapper_drains
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large

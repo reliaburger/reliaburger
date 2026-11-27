@@ -3655,6 +3655,39 @@ a 404 whose `error` says the leader may run an older release, the rule
 #2302 settled for every forwarded read. Adding a route is additive, so the
 protocol version stays where it was.
 
+The rule only holds if every read of a spec follows it, and one didn't.
+Each deploy history entry carries the spec that deploy ran, and `GET
+/v1/deploys/history/{app}` handed the entries back whole to any token, so a
+read-only token got from the history route exactly what the spec route took
+out (#2400). The history route now runs each entry's spec through the same
+`redact_spec`, made `pub(crate)` for it, unless the caller is the service
+principal:
+
+```rust
+if let Some(spec) = entry.row.spec.as_mut() {
+    **spec = crate::bun::spec_read::redact_spec(spec, "spec", &mut Vec::new());
+}
+```
+
+`spec` is a `&mut Box<AppSpec>` here, so it takes two `*`s to reach the
+`AppSpec`: one through the reference, one through the box. The exception
+is there because nodes read each other's history over this same route, and
+a rollback applies what they return; a peer that got `[redacted]` back
+would roll the app onto the placeholder. The first version forgot the
+cluster with no tokens yet, where a peer sends no token at all and the
+handler sees no `AuthContext`: `make test-cluster` caught a rollback
+restoring `VERSION = "[redacted]"`. With no tokens nothing is
+access-controlled anyway, so `Option::is_none_or` now reads "no caller, or
+the service principal" in one call. A rollback on the node you asked
+calls `cluster_deploy_history` in-process, and only the handler redacts,
+so that path never sees a redacted spec. The dashboard's env page followed
+the same rule for the same reason: a browser session is read-only, so
+`safe_env` now shows `[redacted]` for a plain value, as it already did
+`[encrypted]` for a sealed one, and keeps a provider reference.
+`deploy_history_leaves_out_env_values_and_config_content` and
+`a_peer_reading_history_for_a_rollback_still_gets_the_full_spec` pin both
+sides.
+
 **A scoped token's events, filtered first.** A controller reads events
 through a token scoped to its namespace (#1125). The first version read
 each node's whole buffer, merged them, took the newest `limit` and only then

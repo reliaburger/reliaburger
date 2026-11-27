@@ -384,6 +384,14 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
 | `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
+Fixed limits on the image directory, not settings (see `images-and-volumes`):
+
+| Limit | Value |
+|-------|-------|
+| One image's unpacked file content | 16 GiB, and at most the image filesystem's free space less 1 GiB |
+| One image's files (tar entries, across all layers) | 1,000,000 |
+| Unpacked images no container uses | collected at most hourly after a create from an image, or at once when the image filesystem is 95% full; anything a pull handed out, or an interrupted unpack left, within the last hour stays |
+
 ## Node config sections
 
 Every section is optional, and an unknown key is an error, so a typo fails at

@@ -119,6 +119,22 @@ The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parame
 
 A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
+"Cut short" isn't the only shape a crash leaves, though (#2377). Some
+filesystems and mount modes (ext4 with `data=writeback`, some network
+filesystems) can record a file's new size before its data, so after a power
+cut the last, unsynced block comes back as zeros. Its header then says it
+holds zero records, and the scan used to call that corruption unless less than
+one block's worth of bytes followed. The node refused the whole array and the
+leader ran its held chunks again, including outcomes that were already
+durable. Now a header of all zeros, followed by nothing but zeros to the end of
+the file, is a torn tail too: `Ledger::open` truncates it and carries on. The
+check reads the rest in 64 KiB buffers, so it doesn't load the tail into
+memory. It's deliberately that narrow. Zeros followed by anything else are
+still corruption, as `zeros_followed_by_data_are_still_corruption` checks,
+because forgiving any bad final region would also hide real damage in the
+middle of a file. `a_zero_filled_tail_is_a_torn_tail` appends 4,096 zero bytes
+to a one-record ledger and expects that record back and the file trimmed.
+
 #### A stopping node starts no new attempts
 
 The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.
@@ -399,6 +415,30 @@ schedule text. Before checking the shared counter, the store computes whether
 this exact write needs an ID. Replaying an accepted run or skipping an occurrence
 still works when the counter has no IDs left.
 
+"A candidate clone" used to mean a clone of the whole store, and that got
+expensive (#2445). `TaskArrays` holds every retained array's chunk sets and
+every deployment's whole config, up to 128 KiB each, so it can run to
+megabytes. Admitting one manual job copied all of it three times inside one
+Raft apply, on every council member, while every other write waited: once to
+count the ids it needed, once in that preview's own capacity check, and once
+more in the real apply. Now a read-only `admit_job(&self, ...)` makes every
+check against borrowed state and a copy of the job catalogue alone, and returns
+a `JobAdmission` enum saying what would happen. `apply_job` publishes it;
+counting ids just matches on it. Capacity doesn't need a pruned copy either,
+because pruning only ever removes finished runs, so the active count is the
+same before and after. What pruning would do to the catalogue, it does to the
+catalogue's copy, by asking `expired` the same question `prune` asks.
+
+`&self` in that signature is the point. The borrow checker won't let a
+function that takes `&self` change the store, so "the preview can't leak into
+the real state" isn't a convention any more; it's checked. A test-only counter
+in `copy_for_preview` pins the cost: `admitting_one_job_copies_the_store_at_most_once`
+failed at 3 and now sees none. Deployment writes still try the whole
+transaction on one candidate copy, which is what makes them atomic. The `relish
+apply` stream that polls ten times a second now reads its one deployment
+through `read_control` instead of copying the store, and so does the leader's
+`settle`.
+
 The public paths now use those transactions. TOML apply persists a deployment
 intent, admits prerequisite hooks, and waits for accepted successful results.
 A leader commits app publication and ordinary run admission together. The
@@ -408,7 +448,8 @@ event stream. Tokio's `OwnedMutexGuard` keeps an `Arc` reference to the mutex,
 so a spawned task can hold it without borrowing a departed stack frame.
 
 Standalone writes clone the checkpoint, preflight identities and progress
-capacity, then publish private JSON with file and directory fsync. Only durable
+capacity, then publish private JSON with file and directory fsync. The JSON is
+serialised once and the same bytes are sized, reserved for and written. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
 dispatch.
 
@@ -482,6 +523,52 @@ leads. Production deposition had the same flaw, and 0.2.1 gave it the same fix
 (chapter 2, "Deposed is not replaced"). The test also registers its schedule early in a minute: the minute a
 schedule lands in counts as already seen, so a request sent at 59 seconds could
 miss the occurrence it was waiting for.
+
+### Every bound the decoder checks, `apply` must keep
+
+`TaskArrays` doesn't trust what it reads back. It deserialises through
+`#[serde(try_from = "ArraysWire")]`, the same trick `IndexRangeSet` uses at the
+start of this chapter, and the `TryFrom` refuses a store that's too big: too
+many arrays, too many manifests, too many deployment receipts. That's the right
+instinct for a Raft snapshot, which can come from another node or from a
+backup. It has a sharp edge, though. The decoder's bounds only protect you if
+`apply`, the one function that changes the state, never goes past them. If it
+does, a node writes a snapshot that it and every other node refuses to read,
+and a council node that restarts doesn't start at all.
+
+That could happen three ways in 0.3.3 (#2365). Completed deployment receipts
+were trimmed to 19 when a deployment began, never when one settled, so two
+overlapping `relish apply` runs that settled in turn left 21 where the decoder
+allowed 20. The decoder allowed 84 manifests, one namespace's worth of active
+runs plus its finished ones, while admission let 96 run across namespaces. And
+nothing counted arrays against the decoder's 2,048: a finite batch with one
+long job keeps all its finished siblings, so 32 of them fill the store.
+
+The fix names every number as a constant (`MAX_ARRAYS`, `MAX_MANIFESTS`,
+`MAX_COMPLETED_DEPLOYMENTS`, `MAX_UNSETTLED_DEPLOYMENTS`) and uses the same
+constant in the decoder and in `apply`. Settling now trims receipts too. A new
+`check_room` refuses a registration that would leave more than `MAX_ARRAYS`
+arrays or `MAX_MANIFESTS` manifests once pruning has run. It asks `expired`,
+the function pruning itself uses, what a prune would drop, so it can refuse
+before it changes anything. `MAX_MANIFESTS` is now what admission can really
+reach: the 96 bulk slots plus the 24 finished units retention keeps.
+
+One bound goes the other way. A cluster running 0.3.3 may already hold more
+than 20 completed receipts. If the decoder stayed at 20, the fixed binary
+couldn't open that cluster's snapshot either, and the operator would be
+hand-editing `snapshot.redb`. So the decoder accepts up to
+`MAX_DECODED_COMPLETED_DEPLOYMENTS`, 84, the most the old code could write, and
+the next deployment trims the store back to 20. Loosening a decoder bound
+doesn't change the format: everything that decoded before still decodes.
+
+Three tests drive `apply` the way the state machine does and round-trip the
+store through JSON after each step: `completed_receipts_stay_within_decoder_bound`,
+`active_manifests_across_namespaces_stay_within_decoder_bound` and
+`arrays_retained_by_running_batches_stay_within_decoder_bound`. Each failed
+before the fix with "job state exceeds its capacity or clock bounds". The
+generated lifecycle test now also begins and settles deployments and registers
+manifests and finite batches, so its `Reopen` step checks the same invariant
+over random sequences.
 
 ### A contract you can retry, and can't misspell
 
@@ -1213,6 +1300,18 @@ determinism: `max_by_key` keeps the *last* maximum it sees, so walking the
 `BTreeMap` backwards makes ties go to the first namespace by name. Every Raft
 replica prunes the same runs, or their snapshots disagree.
 
+Per namespace needs to know whose a run is, and finite batches got that wrong
+(#2519). `relish batch FILE` stores its parent under `default`, whatever its
+jobs' namespaces, because one batch may span several. So a tenant in `team-a`
+running twenty batches filled `default`'s twenty slots and pushed out runs that
+really were `default`'s. Retention now asks `retention_namespace`, which looks
+through a finite batch to its jobs: if they all share a namespace, the batch
+counts there, and only a batch spanning several stays under `default`. That
+reads the children, not a new field, so nothing stored changes and batches
+already retained are counted right too.
+`finite_batches_are_retained_under_their_jobs_namespace` registers twenty
+`team-a` batches beside one `default` run and checks that run survives a prune.
+
 **Counters live on the node that ran the attempts.** The leader already
 computed accepted rates, but in memory: they reset whenever leadership moved.
 So each node's executor now feeds a `JobTelemetry` on every sync, with each
@@ -1505,6 +1604,21 @@ page and the logs endpoint ask every node for that grant instead of one.
 `compaction_keeps_accepted_grant_answers_correct` checks every chunk's answer
 after a round trip through JSON: the attempt always survives, and the owner is
 either right or absent.
+
+Asking every node had a side effect (#2473). A node that
+never ran any of the array answers "not found", and the results handler filed
+that answer under `unreachable`, the list for nodes whose tasks are missing.
+On a 30-node cluster where ten nodes ran a folded array, a complete page came
+back listing twenty healthy nodes as unreachable. Now a small `node_answer`
+function decides what each answer means, and it needs one more fact: whether
+the node was asked because the record names it as an owner. A named owner that
+holds nothing really has lost its detail, so it's still listed. Any node whose
+call fails is listed too. A node asked only because the owners are forgotten,
+and that holds nothing, just has nothing to add. The test
+`a_node_holding_nothing_for_a_folded_array_is_not_reported_unreachable` checks
+all four cases. What the folded page can't do is tell a node that lost its
+ledger from one that never had it: both say "not found". The manual's rule
+still holds, never read missing detail as success.
 
 The Criterion suite now has a `leader_tick` group, so the cost is a number,
 not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three

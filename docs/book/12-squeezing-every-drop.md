@@ -579,6 +579,25 @@ The refactor keeps the handler body (it was correct) and lifts it into a spawned
 
 The second gap was placement. A macOS node (or any node without `buildah`) used to answer 501. Now capability travels with the state reports: each worker probes `buildah --version` once at startup and carries a `has_buildah` flag in every report, and a submit on an incapable node *delegates*: it picks a capable peer from the aggregated reports, forwards the request to that peer's `/v1/build/run`, and records the build locally as `Delegated { url, remote_id }` so status reads proxy through. The client polls one node and never learns the build ran elsewhere. No builder anywhere is an honest 503 naming the actual problem.
 
+That probe ran in `ReportWorker::new` as `std::process::Command::new("buildah").arg("--version").output()`, and `output()` blocks the calling thread until the child exits. `new` is called from the async cluster start-up, so the probe sat on a tokio worker thread with no deadline. A `buildah` that hangs, waiting on a storage lock a crashed build left behind or on a dead NFS mount somewhere in `PATH`, then held that thread for as long as it hung, and the start-up task never got past the line: the node joined gossip but never reported, so the leader never scheduled on it, and nothing was logged ([#2459](https://github.com/reliaburger/reliaburger/issues/2459)).
+
+The probe now runs at the top of `ReportWorker::run`, before the first report, through `tokio::process::Command` (chapter 1 met it) inside `tokio::time::timeout` with a two-second deadline:
+
+```rust
+let output = tokio::process::Command::new(program)
+    .arg("--version")
+    .stdin(std::process::Stdio::null())
+    .kill_on_drop(true)
+    .output();
+match tokio::time::timeout(deadline, output).await {
+    Ok(Ok(out)) => out.status.success(),
+    Ok(Err(_)) => false,
+    Err(_) => { /* log once */ false }
+}
+```
+
+`tokio::process` waits for the child through the runtime's reactor, so the thread is free while it waits. The timeout alone isn't enough, though. When it fires it drops the `output()` future, and by default dropping a tokio `Child` leaves the process running. `kill_on_drop(true)` makes the drop kill it, so a hung `buildah` costs the worker two seconds and leaves no process behind. A timeout counts as no buildah, the honest answer for a builder that can't answer. `a_hanging_buildah_probe_does_not_block_the_worker` points the probe at a script that runs `exec sleep 30`: before the change the test sat for 30 seconds, now it's back in 200 ms. `the_first_report_carries_the_probed_buildah` checks a script that exits 0 still reaches the leader as `has_buildah = true`.
+
 That delegation path is also a trust boundary, and the first cut got it wrong. `/v1/build/run` receives a `context_digest` from another node and later joins it into a temp directory to unpack the context tar, as a privileged process. Nothing validated it, so a digest of `sha256:../../something` (the `replace(':', "-")` that sanitises the colon leaves the `../` untouched) would escape the build sandbox. The fix is to treat the digest as the untrusted input it is: `Digest::new` already enforces `sha256:` + exactly 64 hex characters, and `.` and `/` are not hex, so validating the digest the moment the request arrives makes the traversal unrepresentable. The general lesson for any delegated endpoint: an identifier you received over the wire and are about to turn into a filesystem path is attacker-controlled until proven otherwise: validate its shape before it touches the filesystem, not after.
 
 There was a second, sharper trust problem in the same neighbourhood, and it's worth dwelling on because it's the kind of bug that hides in plain sight in a distributed system. The node-to-node endpoints (`/v1/batch/run`, `/v1/batch/{id}/report` and `/v1/build/run`) had no authorization at all. They sit behind the general auth middleware, which during the bootstrap window (before the first token exists) waves everything through, and even afterwards only checks that *a* valid token is present, not *which* principal it is. So a ReadOnly token (or an anonymous caller against a node bound beyond loopback) could POST a batch of jobs and make the node execute them. Worse: the completion callback attaches the cluster **service token** (the `__system` principal, Admin-equivalent everywhere) to a `callback_base_url` taken straight from the request body. Point that URL at your own server and the node hands you the keys to the cluster.
