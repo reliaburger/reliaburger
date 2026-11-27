@@ -460,6 +460,10 @@ pub fn apply_manifest_commit(&mut self, commit: &ManifestCommit) {
 
 The `retain` + `push` pattern for updating the tag list is idiomatic Rust for "replace if exists, insert if not" on a `Vec`. It's not the most efficient approach, but it's clear and correct. At registry scale (hundreds of tags, not millions), clarity wins.
 
+That joined key, `repository:tag`, only works while it splits one way. For a long time the registry took the repository as whatever came before `/manifests/` in the URL and the tag as whatever came after, so a hand-made push of tag `x:y` to `team/app` and of tag `y` to `team/app:x` produced the same key, and the second quietly replaced the first (#2413). Stock clients never send such names, because the OCI distribution spec has a grammar for them: lowercase path components joined by single `.`, `_`, `__` or runs of `-`, and tags of letters, digits, `_`, `.` and `-` that can't start with `.` or `-`. `dispatch_v2` now checks both before anything else reads the name, answering 400 `NAME_INVALID` or `TAG_INVALID`. `apply_manifest_commit` checks again and drops a commit that fails, the same way on every replica, so a name that reaches Raft by some other path can't collide either. Two kinds of name the cluster makes for itself pass by rule rather than by grammar: the `_buildcontext` scratch repository, and pull-through cache copies under `cache/`, whose upstream host may carry a port.
+
+We check the grammar by hand rather than pull in a regular-expression crate. `valid_name_component` walks the bytes with an index: a run of letters and digits, then either the end or one separator and another run. `bytes.get(index)` returns an `Option<&u8>`, `None` past the end, so the loop never indexes out of bounds and never needs a length check of its own.
+
 ### Axum extractors: parse, don't validate
 
 The OCI API handlers show a pattern that axum encourages: let the framework extract and parse, then validate the domain logic yourself.

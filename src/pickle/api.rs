@@ -804,6 +804,24 @@ async fn dispatch_v2(
     let Some(route) = parse_v2_route(rest) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #2413: names and tags follow the OCI grammar before anything reads,
+    // stores or authorises them.
+    if !super::types::valid_repository_name(route.repository()) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "NAME_INVALID",
+            format!("invalid repository name {:?}", route.repository()),
+        );
+    }
+    if let V2Route::Manifest { reference, .. } = &route
+        && !super::types::valid_reference(reference)
+    {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "TAG_INVALID",
+            format!("invalid tag {reference:?}"),
+        );
+    }
 
     // O1: writes authorise per handler (they have different role bars and
     // quota checks); reads are uniform, so one gate covers every GET/HEAD.
@@ -4699,7 +4717,9 @@ mod tests {
                 StatusCode::CREATED,
                 "own namespace, envelope {index}"
             );
-            for elsewhere in ["team-b/web", "web", "library/redis", "team-a//web"] {
+            // `team-a//web` no longer gets this far: the OCI name grammar
+            // refuses it with NAME_INVALID first (#2413).
+            for elsewhere in ["team-b/web", "web", "library/redis"] {
                 let response = app
                     .clone()
                     .oneshot(client_request(
@@ -5544,6 +5564,81 @@ mod tests {
         )
         .await;
         assert_oci_error(resp, "MANIFEST_BLOB_UNKNOWN").await;
+    }
+
+    /// #2413: a tag follows the OCI grammar, so it can never hold a `:` and
+    /// make its catalogue key ambiguous with another repository's.
+    #[tokio::test]
+    async fn a_tag_with_a_colon_is_refused_with_tag_invalid() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let config = push_blob(&app, "web", b"config").await;
+        for tag in ["x:y", ".hidden", "-dash", &"t".repeat(129)] {
+            let resp = put_manifest(
+                &app,
+                &format!("/v2/web/manifests/{tag}"),
+                manifest_body(&config, 6),
+            )
+            .await;
+            assert_oci_error(resp, "TAG_INVALID").await;
+        }
+        // The longest valid tag and a digest reference still pass.
+        let resp = put_manifest(
+            &app,
+            &format!("/v2/web/manifests/{}", "t".repeat(128)),
+            manifest_body(&config, 6),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// #2413: a repository name follows the OCI grammar.
+    #[tokio::test]
+    async fn a_repository_name_outside_the_oci_grammar_is_refused_with_name_invalid() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        for name in [
+            "Web%20App",
+            "web:x",
+            "Web",
+            "team//web",
+            "web/",
+            "-web",
+            "web..x",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/{name}/blobs/uploads/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_oci_error(resp, "NAME_INVALID").await;
+        }
+        // The internal names relish and the cluster use still pass.
+        for name in [
+            "_buildcontext",
+            "reliaburger-bun",
+            "cache/docker.io/library/redis",
+            "team-a/web.api__x/v-1",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/{name}/blobs/uploads/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{name}");
+        }
     }
 
     #[tokio::test]

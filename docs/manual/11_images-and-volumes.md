@@ -377,6 +377,11 @@ docker push NODE:5050/api:v1
 docker pull NODE:5050/api:v1
 ```
 
+Repository names and tags follow the OCI grammar: lowercase letters and
+digits in `/`-separated parts joined by `.`, `_`, `__` or `-`, and tags of up
+to 128 letters, digits, `_`, `.` and `-` that don't start with `.` or `-`.
+Anything else is refused with 400 `NAME_INVALID` or `TAG_INVALID`.
+
 podman takes the same `login`, `push` and `pull`. skopeo takes the token as
 `--creds push:"$TOKEN"` (or `--src-creds` and `--dest-creds` on a `copy`),
 and crane as `crane auth login NODE:5050 -u push -p "$TOKEN"`. Apps refer to
