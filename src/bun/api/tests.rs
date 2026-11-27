@@ -7264,6 +7264,196 @@ async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
     (status, bytes.to_vec())
 }
 
+/// A router over `store` whose agent names every app as its own log
+/// selection, so the log query routes reach the store (#2382).
+fn log_router_over(store: crate::ketchup::log_store::LogStore) -> Router {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            if let AgentCommand::ResolveExecutionLogs {
+                app_name,
+                instance,
+                response,
+                ..
+            } = command
+            {
+                let _ = response.send(Ok(crate::bun::agent::LogExecutionSelection {
+                    logical_name: app_name,
+                    instances: Vec::new(),
+                    selected_instance: instance,
+                }));
+            }
+        }
+    });
+    router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    )
+}
+
+/// A log store holding `lines` lines of `web` in `default`, unflushed.
+fn log_store_with_lines(lines: usize) -> (crate::ketchup::log_store::LogStore, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::ketchup::log_store::LogStore::new(dir.path().to_path_buf());
+    for _ in 0..lines {
+        store.append(
+            "web",
+            "default",
+            crate::ketchup::types::LogStream::Stdout,
+            "x",
+        );
+    }
+    (store, dir)
+}
+
+/// #2382: a tail far above the maximum (here `u64::MAX`) is clamped to it,
+/// never handed to the query engine as asked.
+#[tokio::test]
+async fn a_tail_above_the_maximum_is_refused_or_clamped() {
+    use crate::ketchup::log_store::MAX_LOG_QUERY_ROWS;
+    let (store, _dir) = log_store_with_lines(MAX_LOG_QUERY_ROWS + 5);
+    let app = log_router_over(store);
+    let (status, body) = get_bytes(
+        app,
+        "/v1/logs/entries/web/default?tail=18446744073709551615",
+    )
+    .await;
+    if status == StatusCode::BAD_REQUEST {
+        return;
+    }
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let entries: Vec<LogEntry> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.len(), MAX_LOG_QUERY_ROWS);
+}
+
+/// #2382: `relish logs` with no `--tail` gets the newest lines up to the
+/// default cap, and a warning saying the answer was cut.
+#[tokio::test]
+async fn a_log_query_cut_at_the_default_cap_says_so() {
+    use crate::ketchup::log_store::DEFAULT_LOG_QUERY_ROWS;
+    let (store, _dir) = log_store_with_lines(DEFAULT_LOG_QUERY_ROWS + 5);
+    let app = log_router_over(store);
+    let (status, body) = get_bytes(app.clone(), "/v1/logs/query/web/default").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: LogQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.entries.len(), DEFAULT_LOG_QUERY_ROWS);
+    assert_eq!(
+        result.warnings,
+        [LogQueryWarning::Truncated {
+            limit: DEFAULT_LOG_QUERY_ROWS
+        }]
+    );
+
+    // An explicit tail the answer fits is not a cut.
+    let (_, body) = get_bytes(app, "/v1/logs/query/web/default?tail=10").await;
+    let result: LogQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.entries.len(), 10);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+}
+
+/// #2449: the metrics handlers held the store's read guard through their
+/// queries, so one slow dashboard request stalled the collector's write and
+/// every read queued behind it. A write now goes through while a metrics
+/// query runs.
+#[tokio::test]
+async fn the_metrics_query_handler_releases_the_store_before_it_queries() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::mayo::store::MayoStore::new(dir.path().to_path_buf());
+    store.insert(
+        &crate::mayo::types::MetricKey::simple("cpu"),
+        crate::mayo::types::Sample::at(1, 1.0),
+    );
+    let gate = Arc::new(crate::mayo::store::QueryGate::default());
+    store.set_query_gate(Arc::clone(&gate));
+    let mayo = Arc::new(RwLock::new(store));
+    let app = router(
+        cmd_tx,
+        Some(Arc::clone(&mayo)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let request = tokio::spawn(get_bytes(app, "/v1/metrics?name=cpu"));
+    gate.entered.notified().await;
+    let write = tokio::time::timeout(std::time::Duration::from_millis(200), mayo.write()).await;
+    assert!(write.is_ok(), "a write waited for the query to finish");
+    drop(write);
+    gate.release.notify_one();
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+/// #2451: `/v1/metrics/cluster` with no `start` read the whole rollup
+/// retention, which is what a dashboard's first request looks like. It now
+/// reads the last hour.
+#[tokio::test]
+async fn a_cluster_query_without_a_start_reads_the_last_hour() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rollups = crate::mayo::rollup_store::RollupStore::new(dir.path().to_path_buf());
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    for timestamp in [60, now - now % 60 - 60] {
+        rollups.ingest(&crate::mayo::rollup::NodeRollup {
+            node_id: crate::meat::NodeId::new("w1"),
+            timestamp,
+            part: 0,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "cpu".into(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        });
+    }
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(rollups))),
+        None,
+        None,
+        9117,
+        None,
+    );
+    let (status, body) = get_bytes(app, "/v1/metrics/cluster?name=cpu").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.data.len(), 1, "{:?}", result.data);
+    assert_eq!(result.data[0].timestamp, now - now % 60 - 60);
+}
+
 /// #1499: `relish logs-export` copies a node's archive to the operator's
 /// machine through these two routes. The listing names each Parquet file
 /// with its size and SHA-256, the file route serves those exact bytes, and

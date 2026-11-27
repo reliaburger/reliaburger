@@ -26,6 +26,46 @@ use crate::config::app::AppSpec;
 /// kept as `exported_<name>`, the way Prometheus handles the clash.
 const TARGET_LABELS: [&str; 4] = ["app", "namespace", "instance", "node"];
 
+/// Name prefixes the node uses for metrics it writes itself: the
+/// collector's `node_*`, the ingress counters, the log store, the agent
+/// loop, the rollup worker and the leader's withdrawal ledger.
+const RESERVED_PREFIXES: [&str; 6] = [
+    "node_",
+    "ingress_",
+    "ketchup_",
+    "bun_",
+    "mayo_",
+    "discovery_withdrawal_",
+];
+
+/// Names the node writes that share a prefix apps commonly use as well
+/// (`process_`, `job_`), reserved one by one so an app's
+/// `process_cpu_seconds_total` keeps its name. `up` is the scraper's own.
+const RESERVED_NAMES: [&str; 12] = [
+    "up",
+    "process_cpu_percent",
+    "process_memory_bytes",
+    "job_attempts_started_total",
+    "job_tasks_succeeded_total",
+    "job_tasks_failed_total",
+    "job_task_retries_total",
+    "job_tasks_running",
+    "job_task_duration_ms_bucket",
+    "job_task_duration_ms_count",
+    "job_cpu_percent",
+    "job_memory_bytes",
+];
+
+/// Whether `name` is one the node writes itself. A scraped app's sample
+/// with such a name is stored as `exported_<name>`, so an app can't feed
+/// the node's alerts or charts (#2387).
+pub fn is_reserved_metric_name(name: &str) -> bool {
+    RESERVED_NAMES.contains(&name)
+        || RESERVED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
 /// Largest response body accepted from one scrape (8 MiB).
 ///
 /// A metrics endpoint is app-controlled; without a cap a broken or
@@ -360,8 +400,12 @@ pub async fn scrape_app_targets(
 }
 
 /// Add the target's labels to a scraped key, keeping any clashing label
-/// the app set itself as `exported_<name>`.
+/// the app set itself as `exported_<name>`, and a metric name the node
+/// writes itself as `exported_<name>` too.
 fn relabel(mut key: MetricKey, target_labels: &BTreeMap<String, String>) -> MetricKey {
+    if is_reserved_metric_name(&key.name.0) {
+        key.name.0 = format!("exported_{}", key.name.0);
+    }
     for name in TARGET_LABELS {
         if let Some(value) = key.labels.remove(name) {
             key.labels.insert(format!("exported_{name}"), value);
@@ -378,6 +422,7 @@ fn relabel(mut key: MetricKey, target_labels: &BTreeMap<String, String>) -> Metr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn store() -> (
         tempfile::TempDir,
@@ -499,6 +544,127 @@ instance{instance=\"self-reported\"} 1
             value("instance", &[("exported_instance", "self-reported")]),
             Some(1.0)
         );
+    }
+
+    /// An app exporting `node_cpu_usage_percent` used to raise the node's
+    /// own CPU alert, one alert per label set (#2387). A name the node
+    /// writes is kept under `exported_<name>`, like a clashing label.
+    #[tokio::test]
+    async fn a_scraped_app_cannot_write_a_node_metric_name() {
+        let address = serve_metrics(
+            "node_cpu_usage_percent{shard=\"1\"} 99\nup 5\nprocess_memory_bytes 1\nhttp_requests_total 3\n",
+        )
+        .await;
+        let (_dir, store) = store();
+        scrape_app_targets(
+            &store,
+            &reqwest::Client::new(),
+            &[target(address, "web-0")],
+            "node-a",
+            Duration::from_secs(5),
+        )
+        .await;
+        let rows = rows(store).await;
+        let names: BTreeSet<&str> = rows.iter().map(|(_, name, ..)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "exported_node_cpu_usage_percent",
+                "exported_process_memory_bytes",
+                "exported_up",
+                "http_requests_total",
+                "up",
+            ])
+        );
+        // The scraper's own `up` is the only one under that name.
+        let up: Vec<f64> = rows
+            .iter()
+            .filter(|(_, name, ..)| name == "up")
+            .map(|(.., value)| *value)
+            .collect();
+        assert_eq!(up, vec![1.0]);
+    }
+
+    /// Every name the node writes itself is reserved, so the list can't fall
+    /// behind a new collector metric.
+    #[test]
+    fn every_metric_the_node_writes_is_reserved() {
+        let collector = super::super::collector::SystemCollector::new();
+        let mut names: Vec<String> = collector
+            .collect_node_metrics()
+            .into_iter()
+            .chain(collector.collect_process_metrics(std::process::id(), "self"))
+            .map(|metric| metric.key.name.0)
+            .collect();
+        names.extend(
+            [
+                "node_memory_usage_percent",
+                "node_disk_usage_percent",
+                "ingress_requests_total",
+                "ingress_responses_5xx",
+                "ketchup_log_lines_dropped_total",
+                crate::bun::loop_meter::TURN_METRIC,
+                super::super::rollup_worker::ROLLUPS_REFUSED_METRIC,
+                "job_attempts_started_total",
+                "job_tasks_succeeded_total",
+                "job_tasks_failed_total",
+                "job_task_retries_total",
+                "job_tasks_running",
+                "job_task_duration_ms_bucket",
+                "job_task_duration_ms_count",
+                "job_cpu_percent",
+                "job_memory_bytes",
+                "up",
+            ]
+            .map(str::to_string),
+        );
+        names.extend(
+            crate::cluster::orchestrate::withdrawal_ledger_gauge()
+                .samples()
+                .map(|(name, _)| name.to_string()),
+        );
+        for name in names {
+            assert!(is_reserved_metric_name(&name), "{name} is not reserved");
+        }
+        assert!(!is_reserved_metric_name("http_requests_total"));
+        assert!(!is_reserved_metric_name("process_cpu_seconds_total"));
+    }
+
+    /// One sample over the limit fails the whole scrape: nothing but
+    /// `up = 0` is stored (#2521 documents it).
+    #[tokio::test]
+    async fn a_scrape_over_the_sample_limit_is_refused_whole() {
+        let body: String = (0..=MAX_SAMPLES_PER_SCRAPE)
+            .map(|n| format!("big{{n=\"{n}\"}} 1\n"))
+            .collect();
+        let address = serve_metrics(Box::leak(body.into_boxed_str())).await;
+        let url = format!("http://{address}/metrics");
+        let refused = fetch_metrics(&reqwest::Client::new(), &url, Duration::from_secs(5)).await;
+        assert!(
+            matches!(refused, Err(ScrapeError::TooManySamples(count)) if count == MAX_SAMPLES_PER_SCRAPE + 1),
+            "{:?}",
+            refused.map(|metrics| metrics.len())
+        );
+
+        let (_dir, store) = store();
+        let summary = scrape_app_targets(
+            &store,
+            &reqwest::Client::new(),
+            &[target(address, "web-0")],
+            "node-a",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            summary,
+            AppScrapeSummary {
+                ingested: 1,
+                failed: 1
+            }
+        );
+        let rows = rows(store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].1.as_str(), rows[0].3), ("up", 0.0));
     }
 
     #[tokio::test]

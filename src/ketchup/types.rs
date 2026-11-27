@@ -179,6 +179,10 @@ pub enum LogQueryWarning {
         node_id: String,
         reason: NodeFailureReason,
     },
+    /// The caller named no tail and the answer reached the default cap, or
+    /// asked for more than the maximum: only the newest `limit` lines came
+    /// back (#2382).
+    Truncated { limit: usize },
 }
 
 impl std::fmt::Display for LogQueryWarning {
@@ -187,6 +191,10 @@ impl std::fmt::Display for LogQueryWarning {
             Self::NodeFailed { node_id, reason } => {
                 write!(f, "no logs from node {node_id}: {reason}")
             }
+            Self::Truncated { limit } => write!(
+                f,
+                "showing the newest {limit} lines; use --since or --tail to choose others"
+            ),
         }
     }
 }

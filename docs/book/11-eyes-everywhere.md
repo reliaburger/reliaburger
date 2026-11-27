@@ -138,16 +138,23 @@ pub enum ReportingMessage {
 The `ReportAggregator` already handles `Report`. We add a case for `MetricsRollup`:
 
 ```rust
-Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+ReportingMessage::MetricsRollup(rollup) => {
     if Self::report_identity_ok(&peer, &rollup.node_id)
-        && let Some(ref store) = self.rollup_store
+        && let Some(tx) = &self.rollup_tx
+        && tx.try_send(rollup).is_err()
     {
-        store.write().await.ingest(&rollup);
+        self.rollups_dropped += 1;
+        // ...and say so in Bun's log, at 1, 2, 4, 8... drops
     }
+    false
 }
 ```
 
 `peer` is the node id the connection's mTLS certificate proves, and `report_identity_ok` refuses a rollup that claims to be from anyone else. Without that check node X could send a rollup for node Y, poisoning Y's metrics and pre-claiming Y's dedup keys so Y's real rollups were dropped as duplicates.
+
+The first version of this arm ingested inline: `store.write().await.ingest(&rollup)`. That looks harmless, since `ingest` only appends to a buffer. The `await` is the problem ([#2443](https://github.com/reliaburger/reliaburger/issues/2443)). This one `select!` loop handles every state, capability and readiness report the leader receives, and three other tasks held the rollup store's lock across slow work: the autoscaler and the metrics API across DataFusion queries, and the flush task across a Parquet write. While the aggregator waited for the write lock, no report was processed, its 16-slot admission queue filled, and workers were refused. Report handling depended on query latency.
+
+So rollups leave the loop. When `run` starts it spawns an ingest task that owns the write side of the store and reads a bounded `mpsc` queue of 1,024 rollups; the arm above only `try_send`s into it. `try_send` never waits: if the queue is full the rollup is dropped and counted, and the worker's five-minute backfill after a failed push covers most such gaps. When `run` returns it drops the sender, and the task ingests whatever is still queued and ends, because `recv()` returns `None` once every sender is gone. The other two holders changed as well. Queries now read a snapshot taken in one statement (see [Watching Everything](06-watching-everything.md)), and the flush task calls `rollup_store::flush_off_lock`, which takes the write lock only to freeze the buffer into a pending batch and again to drop it once the file is written; the Parquet write itself runs with no lock held, and queries read the pending batch from memory until then. `a_report_is_published_while_the_rollup_store_is_locked` holds a read guard on the store, sends a rollup and then a report, and expects the report published within 500 ms and the rollup ingested once the guard is dropped. Measured on a debug build with six hours of rollups from three nodes (360 files), the autoscaler's five-minute aggregate took 9 ms (33 ms for the first, which reads every footer once) and a flush 9 ms: the stall was a structural bug before it was a slow one.
 
 The enum used to have one more variant, `AggregatedReport { reports: HashMap<NodeId, StateReport> }`, for a council member forwarding its workers' reports to the leader. It carried many nodes' reports, so it couldn't be bound to one certificate, and the aggregator stored every report in it unchecked. Production never sent it (every worker reports straight to the leader), but any authenticated peer could, and keep a dead node "fresh" or inject endpoints for it. We deleted it in 0.2.1. If the two-level tree is ever built, the forwarding message comes back with council-peer authentication rather than trust.
 
@@ -232,6 +239,16 @@ Two related fixes from the same review live in chapter 2, where the aggregator i
 
 The reporting topology stays a flat star: every node reports straight to the leader. The consistent-hash tree this chapter's title promises is real in the library (`assignment.rs`) and deliberately unwired — with the council capped at seven and reports every few seconds, a star to the leader handles thousands of nodes before the maths says otherwise. When it does, the tree slots in behind the same `watch` channel interface without touching the workers. What did change in 12b.2 is who can *find* the star's centre: the gossip directory (chapter 2) now tells every node, voter or not, where the leader's reporting endpoint lives, so the star finally extends past the council.
 
+
+### A minute too big for one message
+
+A rollup carries one entry per series the node had in that minute, and the reporting transport refuses any frame over 1 MiB. We measured an entry at about 149 bytes in postcard, for a series labelled the way an app scrape labels it (`app`, `namespace`, `instance`, `node` and one label of its own), so a node with about 7,000 series, 30 instances of an ordinary instrumented service, crossed the limit ([#2426](https://github.com/reliaburger/reliaburger/issues/2426)). Every push then failed with `ReportTooLarge`. The worker treated that like any failed send and asked for a backfill, which built five rollups of the same size and failed on the first, every minute, for ever. The node vanished from `/v1/metrics/cluster` and the only trace was a line in its stderr.
+
+Now `split_to_fit` cuts a minute into parts that each fit. It measures every entry with `postcard::experimental::serialized_size` (which walks the value without allocating the encoding) and fills a part greedily up to the frame limit, less the part's fixed cost. The split depends only on the entries, which come out of the store sorted by name and labels, so a backfill re-sending the same minute cuts it the same way. That matters because of the dedup above: each part carries a `part` number, and the council's key is now `(node_id, window, part)`. That's a wire format change (`NodeRollup` grew a field), so it moves the protocol version.
+
+A part can still be refused if one entry is over the limit on its own, a label with a megabyte in it say. Retrying can't help, so the worker no longer starts a backfill for `ReportTooLarge`. It counts the part in a node metric, `mayo_rollups_refused_total`, logs it, and sends the minute's other parts. `a_rollup_larger_than_one_report_frame_still_reaches_the_parent` pushes 8,000 series through an in-memory transport that now applies the same frame check as TCP, and expects all 8,000 at the other end in more than one part; `a_rollup_too_large_to_send_does_not_start_a_backfill` and `a_split_is_deterministic_and_every_part_fits` pin the rest.
+
+One edge we chose rather than fixed: after a restart the council seeds its dedup set from the Parquet files, which don't record parts. So any part of a minute already on disk counts as seen, and a part that arrives across a restart is dropped rather than risk counting the minute twice.
 ## Two merge strategies
 
 When results come back from multiple sources, how you combine them depends on the query type.
@@ -316,10 +333,15 @@ pub struct MetricsQueryResult {
 pub enum QueryWarning {
     NodeUnresponsive { node_id: String },
     DataUnavailable { node_id: String, from: u64, to: u64 },
+    QueryRefused { node_id: String, reason: String },
 }
 ```
 
 Graceful degradation is the goal. If one council member is down, you get partial results plus a warning telling you which data is missing. No 500 error, no empty response, no silent data loss. The caller can decide whether partial data is good enough for their use case.
+
+`QueryRefused` arrived with the audit ([#2451](https://github.com/reliaburger/reliaburger/issues/2451)), and it's the log fan-out's lesson below, learned a second time. Each member refused any answer of more than 10,000 contributions, one row per node, minute and series. With no `start`, the window was the whole 24-hour rollup retention, and one unlabelled series on one node is 1,440 rows a day, so a member aggregating seven nodes failed a dashboard's very first request. It answered 500 with "narrow the time range", the fan-out's `error_for_status()` threw that body away, and the operator saw every council member "unresponsive" on a healthy cluster.
+
+Three changes. With no `start`, `/v1/metrics/cluster` reads the last hour. A member answers in pages: `/v1/metrics/rollup/owned` returns at most 10,000 rows ending on a whole minute, plus an `x-reliaburger-next-start` header naming where the next page begins, and the entry node follows it until there's no header. A header rather than a new response type keeps the body the same `Vec<OwnedRollupRow>`. And a member's refusal (past `MAX_OWNED_ROWS`, 200,000 rows, or one minute too big for a page) comes back as `QueryRefused` with the member's own words, read from the error body, instead of `NodeUnresponsive`. A single node with no council refuses the same way, as a 400. `a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds` is 14,400 contributions that used to be refused; `a_member_answer_in_pages_is_read_to_the_end` and `a_member_that_refuses_the_query_is_not_reported_as_unresponsive` drive the fan-out against a small axum server.
 
 ## Testing hierarchical aggregation
 

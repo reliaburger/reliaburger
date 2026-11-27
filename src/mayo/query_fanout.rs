@@ -11,15 +11,23 @@ use super::rollup::{
     MetricsQuery, MetricsQueryResult, MetricsQueryRow, OwnedRollupRow, QueryWarning,
 };
 
+/// The response header a council member's `/v1/metrics/rollup/owned` sets
+/// when its answer continues in another page: the `start` to ask for next
+/// (#2451).
+pub const NEXT_START_HEADER: &str = "x-reliaburger-next-start";
+
 /// Merge metrics results from multiple sources, sorted by timestamp.
 ///
 /// Deduplicates entries with the same (timestamp, metric_name, labels).
 /// Use this for single-app queries where each node reports its own data.
 pub fn merge_metrics_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
     let mut all: Vec<MetricsQueryRow> = sources.drain(..).flatten().collect();
-    all.sort_by_key(|r| r.timestamp);
+    // Sorting on the whole identity, not the timestamp alone, puts equal
+    // rows next to each other: `dedup_by` only removes neighbours (#2477).
+    all.sort_by(|a, b| {
+        (a.timestamp, &a.metric_name, &a.labels).cmp(&(b.timestamp, &b.metric_name, &b.labels))
+    });
 
-    // Deduplicate by (timestamp, metric_name, labels)
     all.dedup_by(|a, b| {
         a.timestamp == b.timestamp && a.metric_name == b.metric_name && a.labels == b.labels
     });
@@ -114,7 +122,7 @@ pub async fn fan_out_cluster_query(
     )
     .await;
 
-    let mut result = merge_owned_rollups(data_sources);
+    let mut result = merge_owned_rollups(data_sources.into_iter().map(|(_, rows)| rows).collect());
     result.warnings.extend(warnings);
     result
 }
@@ -140,10 +148,40 @@ pub async fn fan_out_app_query(
     )
     .await;
 
+    merge_app_answers(data_sources, warnings)
+}
+
+/// Merge the per-node answers of a single-app query, `(node URL, rows)`
+/// each, keeping `warnings`.
+///
+/// A node answers with at most its newest
+/// [`APP_QUERY_ROW_LIMIT`](super::store::APP_QUERY_ROW_LIMIT) rows, so an
+/// answer of exactly that many may have lost older ones: it adds a
+/// [`QueryWarning::Truncated`] naming the node (#2477).
+pub fn merge_app_answers(
+    sources: Vec<(String, Vec<MetricsQueryRow>)>,
+    mut warnings: Vec<QueryWarning>,
+) -> MetricsQueryResult {
+    warnings.extend(
+        sources
+            .iter()
+            .filter_map(|(node_id, rows)| truncation_warning(node_id, rows.len())),
+    );
     MetricsQueryResult {
-        data: merge_metrics_results(data_sources),
+        data: merge_metrics_results(sources.into_iter().map(|(_, rows)| rows).collect()),
         warnings,
     }
+}
+
+/// A [`QueryWarning::Truncated`] for `node_id` when its answer of `rows`
+/// rows reached the per-node limit. The leaf query ends in `LIMIT`, so a
+/// full answer means more rows may exist.
+pub fn truncation_warning(node_id: &str, rows: usize) -> Option<QueryWarning> {
+    let limit = super::store::APP_QUERY_ROW_LIMIT;
+    (rows >= limit).then(|| QueryWarning::Truncated {
+        node_id: node_id.to_string(),
+        limit,
+    })
 }
 
 /// Internal helper: fan out a query to a set of URLs, collect results.
@@ -154,7 +192,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     client: &reqwest::Client,
     timeout: Duration,
     service_token: Option<&str>,
-) -> (Vec<Vec<T>>, Vec<QueryWarning>) {
+) -> (Vec<(String, Vec<T>)>, Vec<QueryWarning>) {
     let mut handles = Vec::new();
 
     for url in urls {
@@ -170,7 +208,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
         let token = service_token.map(str::to_string);
 
         handles.push(tokio::spawn(async move {
-            let mut params = vec![("start", start.to_string()), ("end", end.to_string())];
+            let mut params = vec![("end", end.to_string())];
             if let Some(name) = metric_name {
                 params.push(("name", name));
             }
@@ -180,21 +218,18 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
             if let Some(per_series) = per_series {
                 params.push(("per_series", per_series.to_string()));
             }
-            let request = crate::sesame::auth::bearer_get(&client, &endpoint, token.as_deref())
-                .query(&params);
-            // Cover response decoding too: a peer can send headers then stall its body.
-            let response = tokio::time::timeout(timeout, async {
-                request
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Vec<T>>()
-                    .await
-            })
-            .await;
-            match response {
-                Ok(Ok(rows)) => Ok(rows),
-                _ => Err(node_url),
+            // The whole answer, every page and its body, inside one wait: a
+            // peer can send headers then stall its body.
+            let pages = read_pages::<T>(&client, &endpoint, token.as_deref(), &params, start);
+            match tokio::time::timeout(timeout, pages).await {
+                Ok(Ok(rows)) => Ok((node_url, rows)),
+                Ok(Err(MemberFailure::Refused(reason))) => Err(QueryWarning::QueryRefused {
+                    node_id: node_url,
+                    reason,
+                }),
+                Ok(Err(MemberFailure::Unresponsive)) | Err(_) => {
+                    Err(QueryWarning::NodeUnresponsive { node_id: node_url })
+                }
             }
         }));
     }
@@ -204,10 +239,8 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
 
     for handle in handles {
         match handle.await {
-            Ok(Ok(rows)) => sources.push(rows),
-            Ok(Err(node_url)) => {
-                warnings.push(QueryWarning::NodeUnresponsive { node_id: node_url });
-            }
+            Ok(Ok(answer)) => sources.push(answer),
+            Ok(Err(warning)) => warnings.push(warning),
             Err(_join_err) => {
                 // Task panicked — treat as unresponsive
                 warnings.push(QueryWarning::NodeUnresponsive {
@@ -220,6 +253,80 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     (sources, warnings)
 }
 
+/// Why one member contributed nothing.
+enum MemberFailure {
+    /// No usable answer: connection, timeout or an unreadable body.
+    Unresponsive,
+    /// It answered, refusing the query, with this reason.
+    Refused(String),
+}
+
+/// Ask `endpoint` for rows from `start`, following [`NEXT_START_HEADER`]
+/// page by page until the member says there are no more (#2451). Stops
+/// with a refusal past [`MAX_OWNED_ROWS`](super::rollup_store::MAX_OWNED_ROWS)
+/// rows, which bounds what one member can make the entry node hold.
+async fn read_pages<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: Option<&str>,
+    params: &[(&str, String)],
+    start: u64,
+) -> Result<Vec<T>, MemberFailure> {
+    let mut rows = Vec::new();
+    let mut cursor = start;
+    loop {
+        let response = crate::sesame::auth::bearer_get(client, endpoint, token)
+            .query(params)
+            .query(&[("start", cursor)])
+            .send()
+            .await
+            .map_err(|_| MemberFailure::Unresponsive)?;
+        if !response.status().is_success() {
+            return Err(MemberFailure::Refused(refusal_reason(response).await));
+        }
+        let next = response
+            .headers()
+            .get(NEXT_START_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let page = response
+            .json::<Vec<T>>()
+            .await
+            .map_err(|_| MemberFailure::Unresponsive)?;
+        rows.extend(page);
+        if rows.len() > super::rollup_store::MAX_OWNED_ROWS {
+            return Err(MemberFailure::Refused(
+                super::rollup_store::too_many_contributions().to_string(),
+            ));
+        }
+        match next {
+            // A cursor that doesn't advance would ask for the same page for
+            // ever.
+            Some(next) if next > cursor => cursor = next,
+            _ => return Ok(rows),
+        }
+    }
+}
+
+/// What a member's error answer says: the `error` field of a JSON body, or
+/// the body itself, cut short, or the status when the body is empty.
+async fn refusal_reason(response: reqwest::Response) -> String {
+    const MAX_REASON: usize = 512;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let reason = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| json.get("error")?.as_str().map(str::to_string))
+        .unwrap_or(body);
+    if reason.trim().is_empty() {
+        return format!("HTTP {status}");
+    }
+    match reason.char_indices().nth(MAX_REASON) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -227,6 +334,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     fn row(ts: u64, name: &str, labels: &str, value: f64) -> MetricsQueryRow {
         MetricsQueryRow {
@@ -301,6 +409,43 @@ mod tests {
         ];
         let result = merge_metrics_results(vec![s1, s2]);
         assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn equal_rows_from_two_sources_are_merged_even_when_not_adjacent() {
+        let result = merge_metrics_results(vec![
+            vec![row(10, "cpu", "{}", 1.0), row(10, "mem", "{}", 2.0)],
+            vec![row(10, "cpu", "{}", 1.0), row(10, "mem", "{}", 2.0)],
+        ]);
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn a_node_answer_at_the_row_limit_is_reported_as_truncated() {
+        use crate::mayo::store::APP_QUERY_ROW_LIMIT;
+        let full: Vec<_> = (0..APP_QUERY_ROW_LIMIT as u64)
+            .map(|ts| row(ts, "cpu", r#"{"node":"a"}"#, 1.0))
+            .collect();
+        let short = vec![
+            row(1, "cpu", r#"{"node":"b"}"#, 1.0),
+            row(2, "cpu", r#"{"node":"b"}"#, 1.0),
+            row(3, "cpu", r#"{"node":"b"}"#, 1.0),
+        ];
+        let result = merge_app_answers(
+            vec![
+                ("http://node-a:9117".to_string(), full),
+                ("http://node-b:9117".to_string(), short),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            result.warnings,
+            vec![QueryWarning::Truncated {
+                node_id: "http://node-a:9117".to_string(),
+                limit: APP_QUERY_ROW_LIMIT,
+            }]
+        );
+        assert_eq!(result.data.len(), APP_QUERY_ROW_LIMIT + 3);
     }
 
     #[test]
@@ -428,6 +573,95 @@ mod tests {
             assert!(result.data.is_empty());
             assert_eq!(result.warnings.len(), 1);
         }
+    }
+
+    /// Serve `handler` at the owned-rollup route on a local port.
+    async fn serve_owned(
+        handler: axum::routing::MethodRouter,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route("/v1/metrics/rollup/owned", handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    fn cpu_query() -> MetricsQuery {
+        MetricsQuery {
+            metric_name: Some("cpu".into()),
+            start: 0,
+            end: 100_000,
+            app: None,
+            per_series: None,
+        }
+    }
+
+    /// #2451: a member that answered "narrow the time range" was reported
+    /// as unresponsive, because the error body was thrown away. Its reason
+    /// now reaches the caller.
+    #[tokio::test]
+    async fn a_member_that_refuses_the_query_is_not_reported_as_unresponsive() {
+        use axum::http::StatusCode;
+        let (url, server) = serve_owned(axum::routing::get(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "query rejected: narrow the time range"})),
+            )
+        }))
+        .await;
+        let result = fan_out_cluster_query(
+            &cpu_query(),
+            std::slice::from_ref(&url),
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            result.warnings,
+            [QueryWarning::QueryRefused {
+                node_id: url,
+                reason: "query rejected: narrow the time range".into(),
+            }]
+        );
+    }
+
+    /// #2451: a member answers a long range in pages, naming where the next
+    /// one starts; the entry node reads them all.
+    #[tokio::test]
+    async fn a_member_answer_in_pages_is_read_to_the_end() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        let (url, server) = serve_owned(axum::routing::get(
+            |Query(params): Query<HashMap<String, String>>| async move {
+                let start: u64 = params["start"].parse().unwrap();
+                let owned = |timestamp: u64| {
+                    serde_json::json!({"node_id": "w1", "timestamp": timestamp,
+                        "metric_name": "cpu", "labels": "{}", "value": 1.0})
+                };
+                if start < 120 {
+                    ([(NEXT_START_HEADER, "120")], axum::Json(vec![owned(60)])).into_response()
+                } else {
+                    axum::Json(vec![owned(120), owned(180)]).into_response()
+                }
+            },
+        ))
+        .await;
+        let result = fan_out_cluster_query(
+            &cpu_query(),
+            &[url],
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        server.abort();
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let stamps: Vec<u64> = result.data.iter().map(|row| row.timestamp).collect();
+        assert_eq!(stamps, [60, 120, 180]);
     }
 
     // --- merge_cluster_results tests ---

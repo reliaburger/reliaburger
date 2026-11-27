@@ -340,6 +340,44 @@ async fn status_answers_while_logs_reads_a_large_capture() {
     running.assert_responsive("logs read a large capture").await;
 }
 
+/// `?tail=N` on an app with several instances on one node used to cut the
+/// joined captures, so it answered with the last instance's lines alone,
+/// headerless (#2472). Each instance is tailed on its own, under its header.
+#[tokio::test]
+async fn a_logs_tail_takes_the_last_lines_of_each_instance() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 2)).await);
+    grill.set_logs(&InstanceId("default__web-0".into()), "a1\na2\na3\n");
+    grill.set_logs(&InstanceId("default__web-1".into()), "b1\nb2\nb3\n");
+    let _running = RunningAgent::start(agent, tx.clone(), shutdown);
+
+    let (response, logs) = oneshot::channel();
+    tx.send(AgentCommand::Logs {
+        app_name: "web".into(),
+        namespace: "default".into(),
+        tail: Some(1),
+        response,
+    })
+    .await
+    .unwrap();
+    let by_app = logs.await.unwrap().unwrap();
+
+    let (response, logs) = oneshot::channel();
+    tx.send(AgentCommand::LogCaptures {
+        // The HTTP route's path, in the order it might list them.
+        instances: vec!["default__web-1".into(), "default__web-0".into()],
+        tail: Some(1),
+        response,
+    })
+    .await
+    .unwrap();
+    let by_instances = logs.await.unwrap().unwrap();
+
+    let expected = "==> default__web-0 <==\na3\n==> default__web-1 <==\nb3\n";
+    assert_eq!(by_app, expected);
+    assert_eq!(by_instances, expected);
+}
+
 /// A status answer reads every instance's pid under one shared 500 ms
 /// deadline, so even a hung runtime costs a status turn half the budget.
 #[tokio::test]

@@ -59,7 +59,10 @@ async fn five_node_cluster_hierarchical_aggregation() {
 
         // Generate rollup
         let generator = RollupGenerator::new(worker_id.clone());
-        let rollup = generator.generate(&store, now).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), now)
+            .await
+            .unwrap();
 
         // Determine which council member this worker is assigned to
         let parent_id = assign_parent(worker_id, &council_ids).unwrap();
@@ -172,7 +175,10 @@ async fn partial_results_when_aggregator_down() {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(worker_id.clone());
-        let rollup = generator.generate(&store, now).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), now)
+            .await
+            .unwrap();
 
         let parent_id = assign_parent(worker_id, &council_ids).unwrap();
         let parent_idx = council_ids.iter().position(|id| *id == parent_id).unwrap();
@@ -263,11 +269,17 @@ async fn backfill_after_reassignment_neither_drops_nor_double_counts() {
     let dir_a = tempfile::tempdir().unwrap();
     let mut store_a = RollupStore::new(dir_a.path().to_path_buf());
     for now in [5760u64, 5820] {
-        let rollup = generator.generate(&store, now).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), now)
+            .await
+            .unwrap();
         assert!(store_a.ingest(&rollup));
     }
 
-    let backfill = generator.generate_backfill(&store, 6000).await.unwrap();
+    let backfill = generator
+        .generate_backfill(&store.snapshot().await.unwrap(), 6000)
+        .await
+        .unwrap();
     assert_eq!(backfill.len(), 5);
 
     // --- Reassignment back to A: dedup keeps exactly the missing minutes ---
@@ -311,7 +323,10 @@ async fn backfill_after_reassignment_neither_drops_nor_double_counts() {
     let dir_a2 = tempfile::tempdir().unwrap();
     let mut store_a2 = RollupStore::new(dir_a2.path().to_path_buf());
     for now in [5760u64, 5820] {
-        let rollup = generator.generate(&store, now).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), now)
+            .await
+            .unwrap();
         store_a2.ingest(&rollup);
     }
     store_a2.flush().await.unwrap();
@@ -360,7 +375,10 @@ async fn multi_metric_aggregation_with_labels() {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new(node_name));
-        let rollup = generator.generate(&store, now).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), now)
+            .await
+            .unwrap();
         assert_eq!(rollup.entries.len(), 2, "should have cpu and mem entries");
     }
 }

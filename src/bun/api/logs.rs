@@ -176,7 +176,7 @@ async fn owned_follow_node(
 
 /// Get logs for an app.
 ///
-/// Supports `?tail=N` to return only the last N lines, and
+/// Supports `?tail=N` to return only the last N lines of each instance, and
 /// `?follow=true` to stream new lines as an SSE stream.
 pub(super) async fn logs_handler(
     watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
@@ -941,7 +941,12 @@ pub(super) async fn logs_entries_handler(
         return Json(Vec::<LogEntry>::new()).into_response();
     };
 
-    let store = log_store.read().await;
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let store = match log_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return log_query_error(error),
+    };
     let filter = match log_filter(&query) {
         Ok(filter) => filter,
         Err(e) => return log_query_error(e),
@@ -1093,20 +1098,27 @@ pub(super) async fn logs_cross_node_handler(
         json_field: None,
         // The newest N cluster-wide are among each node's newest N, so every
         // node sends only its own tail; the merge below trims to N again.
-        tail: query.tail,
+        // Without a tail every node still sends at most its newest
+        // DEFAULT_LOG_QUERY_ROWS (#2382), so ask for exactly that.
+        tail: Some(crate::ketchup::log_store::query_row_limit(query.tail)),
     };
 
     // If we have council + membership, do cross-node fan-out
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
-        let desired = council.desired_state().await;
         let app_id = AppId::new(&app, &namespace);
 
         // Where the app runs now; its history may be on any live member.
-        let placed: Vec<String> = desired
-            .scheduling
-            .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
-            .unwrap_or_default();
+        // Read under the lock, copying out only the node ids, not the whole
+        // desired state (#2453).
+        let placed: Vec<String> = council
+            .read_desired(|desired| {
+                desired
+                    .scheduling
+                    .get(&app_id)
+                    .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
         let live: Vec<(String, String)> = membership
             .read()
             .await
@@ -1147,11 +1159,7 @@ pub(super) async fn logs_cross_node_handler(
                 // 10s", not a silent empty or a bare "did not respond" (#282).
                 warnings.extend(result.failures.into_iter().map(LogQueryWarning::from));
                 // Apply tail after merge (fan_out already merge-sorted)
-                if let Some(tail) = query.tail
-                    && entries.len() > tail
-                {
-                    entries = entries.split_off(entries.len() - tail);
-                }
+                warnings.extend(cap_entries(&mut entries, query.tail));
                 Json(LogQueryResult {
                     entries,
                     node_count,
@@ -1180,17 +1188,39 @@ pub(super) async fn logs_cross_node_handler(
             Ok(filter) => filter,
             Err(e) => return log_query_error(e),
         };
-        let store = log_store.read().await;
+        // One statement: the read guard is dropped before the query runs
+        // (#2449).
+        let store = match log_store.read().await.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return log_query_error(error),
+        };
         match store.query_with(&app, &namespace, &filter).await {
-            Ok(entries) => Json(LogQueryResult {
-                entries,
-                node_count: 1,
-                warnings: vec![],
-            })
-            .into_response(),
+            Ok(mut entries) => {
+                let warnings = cap_entries(&mut entries, query.tail).into_iter().collect();
+                Json(LogQueryResult {
+                    entries,
+                    node_count: 1,
+                    warnings,
+                })
+                .into_response()
+            }
             Err(e) => log_query_error(e),
         }
     }
+}
+
+/// Keep the newest lines the query's limit allows (`tail`, or the default
+/// cap without one) from merged, oldest-first `entries`, and warn when the
+/// answer met a limit the caller didn't choose (#2382): no tail, or one
+/// above the maximum.
+fn cap_entries(entries: &mut Vec<LogEntry>, tail: Option<usize>) -> Option<LogQueryWarning> {
+    let limit = crate::ketchup::log_store::query_row_limit(tail);
+    let reached = entries.len() >= limit;
+    if entries.len() > limit {
+        entries.drain(..entries.len() - limit);
+    }
+    let chosen = tail.is_some_and(|tail| tail <= limit);
+    (reached && !chosen).then_some(LogQueryWarning::Truncated { limit })
 }
 
 /// `GET /v1/logs/sql?q=SELECT...` — query logs via DataFusion SQL.
@@ -1226,7 +1256,12 @@ pub(super) async fn logs_sql_handler(
             .into_response();
     };
 
-    let store = log_store.read().await;
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let store = match log_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return log_query_error(error),
+    };
     // OBS5: bounded access — read-only, `logs`-table only, row- and
     // memory-capped. A rejected query is a 400, not a 500.
     match store.query_sql_json_bounded(sql).await {
