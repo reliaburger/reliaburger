@@ -1259,6 +1259,13 @@ impl TaskArrayNode {
             }
         }
         if changed {
+            // A chunk the leader no longer lists here is retired or taken
+            // back: its result is forgotten below, and only a stale leader
+            // could name its old attempt again, which the control fence
+            // has already refused. So the fence keeps the chunks in play,
+            // not every chunk ever granted, and a write costs what's held
+            // (#2429). Retired chunks leave with the next new grant.
+            run.highest.retain(|chunk, _| held.contains_key(chunk));
             run.pool.counters().unknown.store(false, Ordering::Relaxed);
             let path = self
                 .array_dir(assignment.batch_id)
@@ -2784,6 +2791,50 @@ mod tests {
         let stale = request(vec![assignment(1, 400, &[(29, 1)])]);
         let progress = sync_until_finished(&restarted, &stale, 1).await;
         assert_eq!(progress.finished[0].attempt, 30);
+    }
+
+    /// Eight one-task chunks with `held` held.
+    fn one_task_chunks(held: &[(u32, u64)]) -> NodeSyncRequest {
+        let mut array = assignment(1, 8, held);
+        array.spec.chunk_size = 1;
+        request(vec![array])
+    }
+
+    fn fenced_chunks(node: &TaskArrayNode) -> Vec<(u32, u64)> {
+        let fence = node.array_dir(1).join(super::super::grant_fence::FILE_NAME);
+        let (highest, _) = super::super::grant_fence::read(&fence).unwrap().unwrap();
+        highest.into_iter().collect()
+    }
+
+    /// #2429: a chunk the leader has retired leaves the grant fence when
+    /// it's next written, so the fence holds the chunks in play, not every
+    /// chunk the node was ever granted.
+    #[tokio::test]
+    async fn a_retired_chunk_leaves_the_grant_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let first: Vec<(u32, u64)> = (0..4).map(|chunk| (chunk, 1)).collect();
+        sync_until_finished(&node, &one_task_chunks(&first), 4).await;
+        let next: Vec<(u32, u64)> = (4..8).map(|chunk| (chunk, 1)).collect();
+        node.sync(&one_task_chunks(&next)).await.unwrap();
+        assert_eq!(fenced_chunks(&node), next);
+    }
+
+    /// #2429: dropping retired chunks keeps the fence's promise for the
+    /// chunks still held: a restarted node never runs an older attempt.
+    #[tokio::test]
+    async fn a_restart_after_chunks_retire_still_refuses_an_older_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let first: Vec<(u32, u64)> = (0..4).map(|chunk| (chunk, 1)).collect();
+        sync_until_finished(&node, &one_task_chunks(&first), 4).await;
+        let next: Vec<(u32, u64)> = (4..8).map(|chunk| (chunk, 2)).collect();
+        node.sync(&one_task_chunks(&next)).await.unwrap();
+        drop(node);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&restarted, &one_task_chunks(&[(5, 1)]), 1).await;
+        assert_eq!(progress.finished[0].chunk, ChunkId(5));
+        assert_eq!(progress.finished[0].attempt, 2);
     }
 
     #[tokio::test]

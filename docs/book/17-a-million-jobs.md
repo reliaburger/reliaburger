@@ -1142,6 +1142,22 @@ damages both slots: the run is refused and starts nothing.
 `fence_file`'s own tests cover a payload outgrowing its slot (a new file, two
 flushes, then in place again), a fence of the wrong kind, and the FIFO.
 
+That still left the map growing (#2429). Entries were only ever added, so the
+fence held every chunk the node had been granted, and each new grant rewrote
+all of it. A 65,536-chunk array on one node ends with a 768 KiB fence, and
+summed over a run that's well over a gibibyte written to record sixteen new
+entries a tick. Now, when a sync brings a new grant, the node first drops every
+entry the leader's request no longer lists. Is that safe? A chunk leaves the
+list when the leader retires it or takes it back. Only a stale leader could
+name its old attempt again, and the control fence has refused any request older
+than the one the node last accepted before `reconcile` runs. A current leader
+never re-grants a retired chunk, and one it takes back comes back at a higher
+attempt. The file layout doesn't change, it just holds fewer entries, so this is
+no format change. `a_retired_chunk_leaves_the_grant_fence` retires four of
+eight one-task chunks and reads back a fence of four, and
+`a_restart_after_chunks_retire_still_refuses_an_older_attempt` restarts the
+node and checks a stale attempt of a held chunk still runs at the newer one.
+
 The same throwaway measurement, rewritten for grants: one node, 200 syncs,
 each granting one more chunk of one array whose tasks never finish (so the
 ledger stays quiet and the grant fence is the only flush). With the 40 busy
