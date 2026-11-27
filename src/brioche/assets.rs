@@ -136,7 +136,9 @@ mod tests {
     #[test]
     fn the_log_viewer_script_trims_old_lines() {
         let js = asset_text("brioche.js");
-        let start = js.find("function initLogStream(el)").expect("initLogStream");
+        let start = js
+            .find("function initLogStream(el)")
+            .expect("initLogStream");
         let viewer = &js[start..];
         let viewer = &viewer[..viewer.find("\n    }\n").expect("its end")];
         assert!(js.contains("var MAX_LOG_LINES = "));
