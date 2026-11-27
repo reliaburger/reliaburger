@@ -169,9 +169,32 @@ An untagged image stays pullable by digest for `gc_retain_days`, counted from
 the moment it lost its last tag. Then it expires and its layers are garbage
 collected on every node. An image that an app or job pins
 (`web:v1@sha256:…`, which is how an apply stores it) never expires, however
-long ago its tag moved. Expiry is what keeps disk use bounded: without it,
-a CI job pushing `:latest` a few times a day would fill `max_storage` until
-every push and pull got a 413.
+long ago its tag moved. Expiry is what keeps the blob store bounded: without
+it, a CI job pushing `:latest` a few times a day would fill `max_storage`
+until every push and pull got a 413.
+
+### Unpacked images
+
+Expiry covers compressed blobs only. To run an image, a node unpacks its
+layers into a directory of its own under `images/rootfs/`, usually three or
+four times the size of the layers, and keeps the image's manifest and, for an
+image pinned by digest, the metadata that lets the next pull skip the
+registry. The runtime collects these itself. Each time it creates a container
+from an image, it starts a collection if the last one began more than an hour
+ago, or at once when the image filesystem is 95% full. A collection removes
+every unpacked image that no container on the node uses, running or
+stopped-with-its-files, and the manifests and metadata only those images
+needed. It keeps anything a pull handed out in the last hour, so a container
+that's still starting doesn't lose its files, and it clears the half-written
+directory an interrupted unpack leaves once that is an hour old. The node
+logs what each collection removed:
+
+```text
+grill: image collection removed 3 generation(s), 0 partial tree(s), 3 manifest(s) and 6 metadata file(s)
+```
+
+An image that's collected and needed again later is pulled and unpacked
+again, from the blob store if its layers are still there.
 
 ### Lost images
 

@@ -640,6 +640,57 @@ but it doesn't quietly turn “rootless” into “every local workload shares o
 writable filesystem”. We can add an unprivileged snapshotter later and keep the
 same ownership contract.
 
+### Generations nobody runs any more
+
+Content-addressing fixed the clobbering, and it also meant nothing ever
+went away. Every new build of `web` unpacked into a new `gen-…` directory,
+three or four times the size of its compressed layers, and no code removed
+the old one. Pickle's garbage collection expires blobs; it never looked at
+`rootfs/`, the cached manifests or the pin metadata beside them. The November
+2026 audit worked it through: a 300 MB image, deployed three times a day on a
+16 GB data disk, fills the disk in about two weeks (#2423). Then pulls, log
+capture and the Raft log all fail with `ENOSPC` on that node.
+
+So who decides that a generation is garbage? Not the image store: it doesn't
+know which containers exist. The runtime does. Every bundle that uses an image
+names its generation in one of two places. A writable container's
+`rootfs-lower` marker holds the canonical lower directory, and a read-only
+container's `config.json` points runc straight at the generation.
+`live_image_generations` in `src/grill/runc.rs` reads both for every bundle
+and hands the set to `ImageStore::collect_rootfs_garbage`, which removes every
+`gen-*` directory not in it. That covers the reusable job executors too,
+since their bundles sit in the same directory. Note the error policy: if one
+`config.json` can't be read, the whole set is refused. A set that's missing
+a running container's root would delete that container's files.
+
+There's a gap between a pull and a bundle, though. `pull_and_unpack` returns
+a generation, and only some time later does `mount_private` write the marker
+that names it. A collection in that window would see an unused generation and
+delete it under a container that is about to start. The store closes the gap
+itself: it records each generation it hands out, and the collector spares
+anything handed out within the last hour. The marker check and the record
+happen under one lock, and so do the collector's own check and its removal of
+the marker. A pull either claims a generation before the collector gets
+there, and the generation stays, or it finds no marker and unpacks afresh.
+
+Removal order matters as much as it did for publication. The collector deletes
+the `.complete` marker first and the tree second. A crash between the two
+leaves a tree with no marker, which the next unpack or the next pass clears.
+The other order could leave a marker over nothing, and the next pull would hand
+out an empty directory. A tree that never got its marker (an unpack that died)
+goes once it's older than an hour. After the generations, the pass removes
+emptied directories, the cached manifests of images with no tree left, and the
+pin metadata that no remaining pinned image's chain (pin, platform manifest,
+config) refers to.
+
+The trigger is the thing that grows the store. Each create from an image
+starts a pass on its own task if the last one began more than an hour ago, or
+at once when the image filesystem is 95% full. `start_collection` returns a
+`tokio::sync::OwnedMutexGuard` (a lock guard that owns its `Arc` instead of
+borrowing it, so it can move into a spawned task) and holds it for the whole
+pass, so two creates never run two passes. A node that stops deploying stops
+collecting, which is fine: it also stops growing.
+
 ### One authoritative catalogue
 
 Pickle has two catalogues: the council's Raft-replicated `manifest_catalog`, and each node's local `PickleState::catalog`. The push path proposes to Raft; the read path — `manifest_get` and `tags_list` — read the *local* one. So a manifest a peer committed to Raft was invisible on a node that hadn't received the original PUT, until a heal tick happened to reconcile it. Push on node A, `docker pull` from node B, get a 404.

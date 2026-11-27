@@ -184,6 +184,27 @@ Every node maintains a local content-addressed store on disk under a configurabl
 
 The blob store shares its on-disk layout with the local image store (`grill::image::ImageStore`), so cached and pushed blobs interoperate. There is no separate `manifests/` symlink tree and no embedded key-value database in the Pickle store itself; the local catalogue is the single JSON file above, and Raft is authoritative.
 
+#### Unpacked generations and their collection
+
+The runtime's `ImageStore` keeps three more trees beside `blobs/`, which Pickle's garbage collection never touches:
+
+```
+<images root>/
+  rootfs/<registry>/<repo>/<tag>/gen-<hash>/    # unpacked layers, one per layer set
+  rootfs/<registry>/<repo>/<tag>/gen-<hash>.complete
+  manifests/<registry>/<repo>/<tag>.json        # last pull's manifest, never read back
+  metadata/sha256/<hex>                         # verified pin, platform manifest, config
+```
+
+A generation is published once: the tree is unpacked, the filesystem is synced, then the `.complete` marker is written atomically. Only a marked generation is reused or handed out.
+
+The runc runtime collects what no container uses (#2423). After each create from an image it starts `ImageStore::collect_rootfs_garbage` on its own task when the last pass began over an hour ago, or at once when the image filesystem is at least 95% full (`FilesystemUsage::is_pressured`). The live set is every bundle's `rootfs-lower` marker (writable overlays) and `config.json` `root.path` (read-only roots), read by `grill::runc::live_image_generations`; an unreadable bundle spec aborts the pass. A pass:
+
+1. Holds the unpack lock, so nothing is published or cleared meanwhile.
+2. For each `gen-*` directory outside the live set and not handed out by a pull within the grace period (one hour): removes the marker, then the tree. The hand-out record and the marker removal share one lock with a pull's own marker check, so a generation is either claimed by a pull or retired, never both.
+3. Removes marker-less trees (interrupted unpacks) older than the grace period, markers whose tree is gone, and emptied directories.
+4. Removes cached manifests whose `rootfs/<registry>/<repo>/<tag>` directory is gone, and metadata files that no remaining pinned tag directory (`sha256%3A<hex>`) reaches through its pin, index entries and configs. Both spare files younger than the grace period, which a pull in flight may have just written.
+
 ### 3.2 Push Flow
 
 Push is a local, synchronous commit followed by asynchronous replication. The

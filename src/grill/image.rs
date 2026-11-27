@@ -4,7 +4,9 @@
 /// GHCR, etc.) using the OCI Distribution API. Layers are cached as
 /// content-addressed blobs and unpacked into a rootfs directory that
 /// runc can use directly.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +16,9 @@ use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
 use super::whiteout::{self, LayerEntries, LayerEntry};
+
+mod gc;
+pub use gc::RootfsGcReport;
 
 /// A parsed OCI image reference.
 ///
@@ -334,6 +339,13 @@ pub struct ImageStore {
     owner_shift: Option<u32>,
     /// Registries tried before the origin for digest-pinned images.
     mirrors: ImageMirrors,
+    /// When each generation was last handed to a caller. A caller names
+    /// the generation in its bundle only after `pull_and_unpack` returns, so
+    /// until then this record is what keeps the collector off it (#2423).
+    handed_out: std::sync::Arc<tokio::sync::Mutex<HashMap<PathBuf, std::time::Instant>>>,
+    /// When the last collection pass started. Held for the whole pass, so
+    /// at most one runs at a time.
+    last_collection: std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// The path of a blob in the storage shared by the registry and the runtime.
@@ -351,6 +363,8 @@ impl ImageStore {
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
+            handed_out: std::sync::Arc::default(),
+            last_collection: std::sync::Arc::default(),
         }
     }
 
@@ -414,7 +428,7 @@ impl ImageStore {
         let _guard = self.unpack_lock.lock().await;
         let generation = self.rootfs_generation_path(&rootfs, &layer_paths);
         let complete = generation.with_extension("complete");
-        if complete.is_file() {
+        if self.claim_published(&generation).await {
             return Ok(generation);
         }
         let target = generation.clone();
@@ -434,7 +448,97 @@ impl ImageStore {
             digest: "join".to_string(),
             reason: e.to_string(),
         })??;
+        // The marker was written under the unpack lock, which the collector
+        // also needs: nothing can have retired it since.
+        self.claim_published(&generation).await;
         Ok(generation)
+    }
+
+    /// Hand `generation` to a caller if it is published, recording when.
+    /// The marker check and the record share one lock with the collector's
+    /// own check-and-retire, so a generation this returns `true` for is never
+    /// retired under the caller.
+    async fn claim_published(&self, generation: &Path) -> bool {
+        let mut handed_out = self.handed_out.lock().await;
+        if !generation.with_extension("complete").is_file() {
+            return false;
+        }
+        handed_out.insert(generation.to_path_buf(), std::time::Instant::now());
+        true
+    }
+
+    /// Start a collection pass unless one is running or the last one started
+    /// less than `interval` ago. A full image filesystem collects at once.
+    /// The pass lasts as long as the returned guard.
+    pub async fn start_collection(
+        &self,
+        interval: Duration,
+    ) -> Option<tokio::sync::OwnedMutexGuard<Option<std::time::Instant>>> {
+        let mut pass = self.last_collection.clone().try_lock_owned().ok()?;
+        let due = pass.is_none_or(|started| started.elapsed() >= interval)
+            || crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root)
+                .await
+                .is_ok_and(|usage| usage.is_pressured());
+        if !due {
+            return None;
+        }
+        *pass = Some(std::time::Instant::now());
+        Some(pass)
+    }
+
+    /// Remove every rootfs generation whose canonical path is not in `live`,
+    /// then the cached manifests and pin metadata only those generations
+    /// needed (#2423).
+    ///
+    /// A generation handed out by a pull less than `grace` ago is kept, as
+    /// is a marker-less tree (an unpack that never finished) younger than
+    /// `grace`. The pass holds the unpack lock, so no generation is
+    /// published or cleared while it runs.
+    pub async fn collect_rootfs_garbage(
+        &self,
+        live: &HashSet<PathBuf>,
+        grace: Duration,
+    ) -> std::io::Result<RootfsGcReport> {
+        let _guard = self.unpack_lock.lock().await;
+        let live = live.clone();
+        let store_root = self.store_root.clone();
+        let handed_out = self.handed_out.clone();
+        tokio::task::spawn_blocking(move || {
+            // Compare canonical paths: the live set comes from bundle
+            // markers, which hold the canonical lower directory.
+            let live: HashSet<PathBuf> = live
+                .into_iter()
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                .collect();
+            let mut report = RootfsGcReport::default();
+            for generation in gc::generations(&store_root.join("rootfs"))? {
+                let canonical = std::fs::canonicalize(&generation).unwrap_or(generation.clone());
+                if live.contains(&canonical) {
+                    continue;
+                }
+                // Checked and retired under one lock: a pull either claims
+                // the generation first, and it stays, or finds no marker.
+                let published = {
+                    let mut handed_out = handed_out.blocking_lock();
+                    handed_out.retain(|_, at| at.elapsed() < grace);
+                    if handed_out.contains_key(&generation) {
+                        continue;
+                    }
+                    gc::retire_marker(&generation)?
+                };
+                if gc::remove_tree_after(&generation, published, grace)? {
+                    if published {
+                        report.generations_removed += 1;
+                    } else {
+                        report.partials_removed += 1;
+                    }
+                }
+            }
+            gc::tidy_store(&store_root, grace, &mut report)?;
+            Ok(report)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     /// The content-addressed rootfs generation directory for a set of
@@ -844,13 +948,13 @@ impl ImageStore {
         // marker is written only after the unpacked tree is flushed: the
         // same proof a registry pull relies on before reusing it.
         let generation = self.rootfs_generation_path(rootfs, &layer_paths);
-        generation
-            .with_extension("complete")
-            .is_file()
-            .then_some(PulledImage {
-                rootfs: generation,
-                config,
-            })
+        if !self.claim_published(&generation).await {
+            return None;
+        }
+        Some(PulledImage {
+            rootfs: generation,
+            config,
+        })
     }
 
     /// Unpack blobs the cluster already holds, re-checking the config
@@ -1406,6 +1510,163 @@ mod tests {
             generation.join("live-sentinel").exists(),
             "a repeated pull must not clear a generation used by a running container"
         );
+    }
+
+    /// A layer blob at `{root}/{digest}/data`, the shape the store gives
+    /// every blob: the generation id hashes the parent directory's name.
+    fn blob_layer(root: &Path, digest: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let layer = root.join("blobs").join(digest).join("data");
+        std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+        create_test_layer(&layer, files);
+        layer
+    }
+
+    #[tokio::test]
+    async fn a_generation_no_instance_uses_is_removed_and_a_live_one_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_a = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let layer_b = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"b")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+
+        let a = store
+            .unpack_to(vec![layer_a], tag_root.clone())
+            .await
+            .unwrap();
+        let b = store.unpack_to(vec![layer_b], tag_root).await.unwrap();
+        assert_ne!(a, b);
+
+        let live = HashSet::from([std::fs::canonicalize(&a).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(a.exists());
+        assert!(a.with_extension("complete").is_file());
+        assert!(!b.exists());
+        assert!(!b.with_extension("complete").exists());
+        assert_eq!(report.generations_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_generation_older_than_the_grace_period_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        // An unpack that died before its marker: a tree, no `.complete`.
+        let partial = tag.join("gen-0123456789abcdef");
+        std::fs::create_dir_all(partial.join("bin")).unwrap();
+        std::fs::write(partial.join("bin/half"), b"half").unwrap();
+
+        let kept = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            partial.exists(),
+            "a young partial tree may still be filling"
+        );
+        assert_eq!(kept.partials_removed, 0);
+
+        let removed = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!partial.exists());
+        assert_eq!(removed.partials_removed, 1);
+        assert!(
+            !tag.exists(),
+            "directories the collection empties are removed too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_handed_out_within_the_grace_period_is_kept() {
+        // Between `unpack_to` returning and the bundle's `rootfs-lower`
+        // marker (or config.json) naming it, no live set holds the
+        // generation: the store's own record of what it handed out does.
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.unpack_to(vec![layer], tag_root).await.unwrap();
+
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(generation.with_extension("complete").is_file());
+        assert_eq!(report.generations_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_removes_manifests_and_pin_metadata_of_removed_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let root = tmp.path().join("store");
+        let hex = |c: char| std::iter::repeat_n(c, 64).collect::<String>();
+        let (kept_pin, gone_pin, config) = (hex('a'), hex('b'), hex('c'));
+        // A pinned image whose generation is live, and one whose is gone.
+        let kept_tag = root.join(format!(
+            "rootfs/docker.io/acme/web/sha256%3A{kept_pin}/gen-0123456789abcdef"
+        ));
+        std::fs::create_dir_all(&kept_tag).unwrap();
+        std::fs::write(kept_tag.with_extension("complete"), b"complete\n").unwrap();
+        let manifests = root.join("manifests/docker.io/acme/web");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let kept_manifest = manifests.join(format!("sha256:{kept_pin}.json"));
+        let gone_manifest = manifests.join(format!("sha256:{gone_pin}.json"));
+        std::fs::write(&kept_manifest, b"{}").unwrap();
+        std::fs::write(&gone_manifest, b"{}").unwrap();
+        let metadata = root.join("metadata/sha256");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": 2
+            },
+            "layers": []
+        });
+        std::fs::write(metadata.join(&kept_pin), manifest.to_string()).unwrap();
+        std::fs::write(metadata.join(&config), b"{}").unwrap();
+        std::fs::write(metadata.join(&gone_pin), manifest.to_string()).unwrap();
+
+        let live = HashSet::from([std::fs::canonicalize(&kept_tag).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(kept_manifest.is_file());
+        assert!(!gone_manifest.exists());
+        assert!(metadata.join(&kept_pin).is_file());
+        assert!(metadata.join(&config).is_file(), "the kept pin's config");
+        assert!(!metadata.join(&gone_pin).exists());
+        assert_eq!(report.manifests_removed, 1);
+        assert_eq!(report.metadata_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_collection_inside_the_interval_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let interval = Duration::from_secs(3600);
+        let first = store.start_collection(interval).await;
+        assert!(first.is_some());
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "one pass at a time"
+        );
+        drop(first);
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "the next pass waits for the interval"
+        );
+        assert!(store.start_collection(Duration::ZERO).await.is_some());
     }
 
     #[test]
