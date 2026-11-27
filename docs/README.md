@@ -105,8 +105,9 @@ it.
 Push once and nodes pull layers from each other. It also caches upstream
 registries, and `relish build` builds images from your config straight into it.
 
-**Metrics, logs and alerts, nothing to install.** Each node scrapes its own
-workloads, including anything with `prometheus.io` annotations. Alert rules
+**Metrics, logs and alerts, nothing to install.** Each node scrapes the apps
+that ask for it with `metrics = {}`; an imported Kubernetes manifest gets that
+from its `prometheus.io` annotations. Alert rules
 evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.

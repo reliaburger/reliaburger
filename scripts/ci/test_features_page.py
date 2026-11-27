@@ -107,6 +107,18 @@ class SchemaTests(unittest.TestCase):
         loaded = catalogue(broken('since = "0.1.0"', 'since = "0.3.0"'))
         self.assertEqual(len(features_page.check_versions(loaded)), 1)
 
+    def test_the_review_is_not_older_than_the_release(self):
+        # The page promises every row is re-read after each release (#2505).
+        loaded = catalogue(broken('reviewed = "7 November 2026"', 'reviewed = "6 November 2026"'))
+        problems = features_page.check_versions(loaded)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("6 November 2026", problems[0])
+        self.assertEqual(features_page.check_versions(catalogue()), [])
+
+    def test_a_review_date_must_be_a_date(self):
+        with self.assertRaisesRegex(features_page.SchemaError, "isn't a date"):
+            catalogue(broken('reviewed = "7 November 2026"', 'reviewed = "last week"'))
+
 
 class DocsLinkTests(unittest.TestCase):
     def setUp(self):
@@ -203,6 +215,18 @@ class IssueStateTests(unittest.TestCase):
         loaded = catalogue(broken("issues = [11]", "issues = [10]"))
         self.assertEqual(features_page.check_issues(loaded, state=state), [])
         self.assertEqual(asked, [10])
+
+    def test_an_open_issue_named_in_restrictions_must_be_listed(self):
+        # A row that cites an open issue but doesn't list it shows "None
+        # open", and nothing flags it when the issue closes (#2505).
+        loaded = catalogue(broken('restrictions = "Needs `lima`."', 'restrictions = "Waits for #12."'))
+        problems = features_page.check_issues(loaded, state={10: "OPEN", 11: "OPEN", 12: "OPEN"}.__getitem__)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("#12", problems[0])
+        self.assertIn("'Laptop cluster'", problems[0])
+        # A closed issue cited as history is fine.
+        problems = features_page.check_issues(loaded, state={10: "OPEN", 11: "OPEN", 12: "CLOSED"}.__getitem__)
+        self.assertEqual(problems, [])
 
 
 class RepositoryTests(unittest.TestCase):

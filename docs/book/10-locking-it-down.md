@@ -10,6 +10,8 @@ Every workload in Reliaburger gets its own cryptographic identity. Not a shared 
 
 The design is zero-configuration. Deploy an app, it gets an identity. No annotations, no sidecar injectors, no admission webhooks.
 
+That's the design. Today only app instances (and image builds) are issued one, and only on a cluster: a standalone node has no council to sign it. Job tasks don't get an identity yet, though the URI below already has room for them.
+
 ### SPIFFE URIs
 
 SPIFFE (Secure Production Identity Framework for Everyone) gives us a standard way to name workloads. A SPIFFE URI looks like this:
