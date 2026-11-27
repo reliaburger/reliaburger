@@ -10108,6 +10108,7 @@ mod tests {
             RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
                 operation_id: op.clone(),
                 config: Box::new(config.clone()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             })),
         )])
@@ -10214,6 +10215,7 @@ mod tests {
                 cron: None,
                 replay_unknown: false,
                 hook: false,
+                declared_image: None,
             }),
             trigger: Some(RunTrigger::Manual {
                 request_id: request_id.into(),
@@ -10421,6 +10423,7 @@ mod tests {
             RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
                 operation_id: "c".repeat(32),
                 config: Box::new(config),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             })),
         ];
@@ -13742,6 +13745,7 @@ mod tests {
         .unwrap();
         let begin = inner.apply_request(&RaftRequest::TaskArray(Box::new(
             TaskArrayWrite::DeployBegin {
+                declared_images: Default::default(),
                 operation_id: op.clone(),
                 config: Box::new(config),
                 now_epoch_secs: 10,

@@ -102,7 +102,10 @@ message = "apps in pg are managed by db-failover"
 A controller's writes go through the same apply path as everyone's, so they
 are judged by the cluster's policies and recorded in the audit log under the
 controller's token. `relish policy audit` judges an owned app as the
-controller's token too, since that's who writes it next.
+controller's token too, since that's who writes it next. It judges apps and
+jobs by the images they were given, not the digests the cluster bound them
+to: a controller that pins `postgres:17@sha256:…` is judged by that whole
+reference, and one that writes `postgres:latest` by the tag.
 
 ## The calls a controller makes
 

@@ -729,10 +729,11 @@ the definitions the cluster keeps, with their schedules put back: scheduled
 jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
 one-off job's last run is pruned its definition goes, and so does the job
 from the audit: it won't run again, and the next submission is judged when
-it arrives. The cluster keeps no declared spec for a job, so a job pinned by
-tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
-a tag the cluster bound would be. `relish wtf` shows the same
-denials and audit findings as warnings.
+it arrives. A job is judged by the image it declared, as an app is: the
+cluster keeps that beside the digest it bound the tag to. So `report:latest`
+is judged as `report:latest` though it runs a digest, and a job pinned by tag
+and digest (`report:v1@sha256:…`) is judged by both, the way you wrote it.
+`relish wtf` shows the same denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
 only those: the counts and findings leave out everything else, so a

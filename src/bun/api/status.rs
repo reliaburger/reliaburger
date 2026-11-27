@@ -90,31 +90,7 @@ pub(super) async fn current_apps_handler(
         let Some((namespace, name)) = key.split_once('/') else {
             continue;
         };
-        let mut spec = definition.definition.template.clone();
-        spec.schedule = definition
-            .definition
-            .cron
-            .as_ref()
-            .map(|policy| policy.expression.clone());
-        if let Some(original) = common
-            .deployments()
-            .filter_map(|(_, deployment)| {
-                deployment
-                    .config
-                    .job
-                    .get(name)
-                    .filter(|original| {
-                        original.namespace.as_deref().unwrap_or("default") == namespace
-                            && crate::meat::job::JobDefinition::from_spec((*original).clone())
-                                == definition.definition
-                    })
-                    .map(|original| (deployment.submitted_at_epoch_secs, original))
-            })
-            .max_by_key(|(submitted, _)| *submitted)
-            .map(|(_, spec)| spec)
-        {
-            spec = original.clone();
-        }
+        let spec = deployed_job_spec(&common, namespace, name, &definition.definition);
         let resource = crate::config::fingerprint::job_resource_key(name, namespace);
         resources.insert(
             resource.clone(),
@@ -131,6 +107,84 @@ pub(super) async fn current_apps_handler(
         .filter(|row| current_resource_visible(&row.resource, auth.as_deref()))
         .collect();
     Json(rows).into_response()
+}
+
+/// The spec a job definition was deployed from, for `relish plan` to
+/// compare with the file: the newest deployment whose job admits to exactly
+/// `definition`, declared image included (#1322). A definition no
+/// deployment matches (one submitted through the job API) is read back from
+/// its template and schedule.
+fn deployed_job_spec(
+    common: &crate::meat::task_array_store::TaskArrays,
+    namespace: &str,
+    name: &str,
+    definition: &crate::meat::job::JobDefinition,
+) -> crate::config::job::JobSpec {
+    let deployed = common
+        .deployments()
+        .filter_map(|(_, deployment)| {
+            let original = deployment.config.job.get(name)?;
+            let mut admitted = crate::meat::job::JobDefinition::from_spec(original.clone());
+            admitted.declared_image = deployment.declared_images.get(name).cloned();
+            (original.namespace.as_deref().unwrap_or("default") == namespace
+                && admitted == *definition)
+                .then_some((deployment.submitted_at_epoch_secs, original))
+        })
+        .max_by_key(|(submitted, _)| *submitted);
+    if let Some((_, original)) = deployed {
+        return original.clone();
+    }
+    let mut spec = definition.template.clone();
+    spec.schedule = definition
+        .cron
+        .as_ref()
+        .map(|policy| policy.expression.clone());
+    spec
+}
+
+#[cfg(test)]
+mod deployed_job_tests {
+    use super::deployed_job_spec;
+    use crate::meat::task_array_store::{TaskArrayWrite, TaskArrays};
+
+    /// #1322: a job deployed with a bound image still reads back as the
+    /// deployment's spec, its declared image kept beside the definition.
+    #[test]
+    fn a_bound_job_reads_back_as_the_spec_it_was_deployed_from() {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let mut config = crate::config::Config::parse(&format!(
+            "[job.tick]\nimage = 'test:v1@{digest}'\ncommand = ['true']\nschedule = '* * * * *'\nmax_attempts = 2\n"
+        ))
+        .unwrap();
+        config.job.get_mut("tick").unwrap().namespace = Some("default".into());
+        let mut arrays = TaskArrays::default();
+        let mut next = 0;
+        let mut ids = move || {
+            next += 1;
+            next
+        };
+        let operation_id = "f".repeat(32);
+        for write in [
+            TaskArrayWrite::DeployBegin {
+                operation_id: operation_id.clone(),
+                config: Box::new(config.clone()),
+                declared_images: [("tick".to_string(), "test:v1".to_string())].into(),
+                now_epoch_secs: 60,
+            },
+            TaskArrayWrite::DeployCommitted {
+                operation_id,
+                now_epoch_secs: 61,
+            },
+        ] {
+            arrays.apply(&write, &mut ids).unwrap();
+        }
+        let record = arrays.jobs().definition("default", "tick").unwrap();
+        assert_eq!(record.definition.declared_image.as_deref(), Some("test:v1"));
+        assert_eq!(
+            deployed_job_spec(&arrays, "default", "tick", &record.definition),
+            config.job["tick"]
+        );
+    }
 }
 
 /// The preview endpoint must retain the caller's resource scope as status does.

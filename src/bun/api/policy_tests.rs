@@ -740,11 +740,11 @@ async fn the_audit_judges_a_scheduled_job_from_its_definition() {
     );
 }
 
-/// #1322: the cluster keeps no declared spec for a job, so a job pinned by
-/// tag and digest is judged by its tag, as a bound tag would be. This pins
-/// that limitation until the cluster keeps a declared job spec.
+/// #1322: a job pinned by tag and digest is judged by its declared spec,
+/// the tag and digest it was given, not by its tag alone: it runs exactly
+/// that digest, so a rule against `:latest` has nothing to say about it.
 #[tokio::test]
-async fn the_audit_judges_a_job_pinned_by_tag_and_digest_by_its_tag() {
+async fn the_audit_judges_a_job_pinned_by_tag_and_digest_by_its_declared_spec() {
     let cluster = cluster("policy-audit-job-digest").await;
     let digest = format!("sha256:{}", "a".repeat(64));
     submit_nightly(
@@ -755,6 +755,37 @@ async fn the_audit_judges_a_job_pinned_by_tag_and_digest_by_its_tag() {
         None,
     )
     .await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("deny"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!(audit.jobs, 1, "{body}");
+    assert_eq!(denials(&audit), Vec::<String>::new(), "{body}");
+}
+
+/// #1322: the declared image is what admission saw before it bound the
+/// job, never what the request claims. A request that names one can't
+/// make the audit judge a `:latest` job as something else.
+#[tokio::test]
+async fn a_request_cannot_choose_the_image_the_audit_judges() {
+    let cluster = cluster("policy-audit-job-claim").await;
+    submit_nightly(
+        &cluster,
+        r#"{"template":{"image":"report:latest","command":["true"]},"cron":{"expression":"0 3 * * *"},"declared_image":"report:v1"}"#,
+        None,
+    )
+    .await;
+    let desired = cluster.council.desired_state().await;
+    let record = desired
+        .task_arrays
+        .jobs()
+        .definition("default", "nightly")
+        .unwrap();
+    assert_eq!(record.definition.declared_image, None);
     let (status, body) = cluster
         .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("deny"))
         .await;
