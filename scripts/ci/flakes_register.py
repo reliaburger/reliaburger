@@ -139,8 +139,8 @@ def main(argv=None):
     if problems:
         print(f"{len(problems)} problem(s) in the flakes register", file=sys.stderr)
         return 1
-    checked = "an issue" if arguments.offline else "an open issue"
-    print(f"{open_rows} unresolved row(s) of {len(rows)}, each linking {checked}")
+    checked = "" if arguments.offline else "; every Open row's issues are open"
+    print(f"{open_rows} unresolved row(s) of {len(rows)}, each linking an issue{checked}")
     return 0
 
 
