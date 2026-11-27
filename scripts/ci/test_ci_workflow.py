@@ -76,6 +76,13 @@ class LocalGateTests(unittest.TestCase):
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
 
+    def test_the_ci_scripts_target_runs_the_image_script_tests(self):
+        # The appliance's Python tests ran only in appliance.yml, which the
+        # merge queue never waits for; they skip cleanly off Linux (#2484).
+        recipe = re.search(r"^test-ci-scripts:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text(), re.M)
+        self.assertIsNotNone(recipe)
+        self.assertIn("discover -s image/tests", recipe.group(1))
+
     def test_make_ci_runs_the_quick_checks_before_any_build(self):
         # A format slip or an unowned #[ignore] fails in seconds, not after
         # Clippy and the suite have compiled (#1724).
