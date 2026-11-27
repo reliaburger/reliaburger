@@ -228,6 +228,7 @@ means, the numbers that decide it and the line of code that does (see
 | `council-fenced` | critical | Nodes belong to a council `relish council recover` replaced |
 | `council-epoch-split` | critical | Nodes serve different recovery epochs |
 | `council-voter-lagging` | warning | A voter answers but has applied more than 100 fewer log entries |
+| `council-retired-identities-nearly-full` | warning | 90% of the 65,536 retired node identities are used |
 | `council-multiple-leaders` | critical | More than one node is named leader |
 | `no-leader` | critical | The council has no leader |
 | `quorum-loss` | critical | Fewer than a majority of council members answer |

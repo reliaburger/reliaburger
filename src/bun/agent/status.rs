@@ -296,6 +296,10 @@ pub struct CouncilStatus {
     /// with a size (`DesiredState::council_size`).
     #[serde(default)]
     pub council_size: Option<crate::council::CouncilSize>,
+    /// How many permanent identity tombstones the replicated CRL holds,
+    /// against their limit (#2375).
+    #[serde(default)]
+    pub retired_identities: Option<crate::cluster::retirement::RetiredIdentities>,
 }
 
 /// Work out a node's council role from its Raft metrics and recovery fence.
@@ -330,7 +334,15 @@ pub async fn council_status(
     council: &crate::council::node::CouncilNode,
     metrics: &openraft::RaftMetrics<u64, crate::council::types::CouncilNodeInfo>,
 ) -> CouncilStatus {
-    let desired = council.desired_state().await;
+    let (app_count, council_size, retired) = council
+        .read_desired(|desired| {
+            (
+                desired.apps.len(),
+                desired.council_size,
+                desired.security_state.crl.retired_nodes.len(),
+            )
+        })
+        .await;
     let membership = metrics.membership_config.membership();
     let leader_name = metrics
         .current_leader
@@ -355,7 +367,7 @@ pub async fn council_status(
         leader: leader_name,
         term: metrics.current_term,
         last_applied_log: metrics.last_applied.map(|l| l.index),
-        app_count: desired.apps.len(),
+        app_count,
         role: council_role(metrics, fence),
         recovery_epoch: fence.and_then(|fence| fence.claimed_epoch()),
         fenced_by: fence.and_then(|fence| fence.fenced_by()),
@@ -365,7 +377,8 @@ pub async fn council_status(
         split_with: fence.and_then(|fence| fence.split_with()),
         fence_persist_error,
         last_log_index: metrics.last_log_index,
-        council_size: desired.council_size,
+        council_size,
+        retired_identities: Some(crate::cluster::retirement::RetiredIdentities::of(retired)),
     }
 }
 

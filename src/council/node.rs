@@ -1338,6 +1338,41 @@ mod tests {
         assert_eq!(leader.state_machine.full_clones(), before);
     }
 
+    /// #2375: `relish council status` says how many permanent identity
+    /// tombstones the council holds, against the limit.
+    #[tokio::test]
+    async fn council_status_reports_how_full_the_retired_identity_list_is() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        for (at, name) in ["gone-1", "gone-2", "gone-3"].into_iter().enumerate() {
+            let membership_log_id = *nodes[0].metrics().borrow().membership_config.log_id();
+            let response = nodes[0]
+                .write(RaftRequest::DecommissionNode {
+                    node_id: name.into(),
+                    retired_by: "operator".into(),
+                    reason: "scale-in".into(),
+                    retired_at_unix_ms: at as u64 + 1,
+                    membership_log_id,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, CouncilResponse::NodeDecommissioned { .. }),
+                "{response:?}"
+            );
+        }
+        let metrics = nodes[0].metrics().borrow().clone();
+        let status = crate::bun::agent::council_status(&nodes[0], &metrics).await;
+        assert_eq!(
+            status.retired_identities,
+            Some(crate::cluster::retirement::RetiredIdentities {
+                count: 3,
+                limit: 65_536,
+            })
+        );
+    }
+
     /// Wait for a leader to be elected (up to timeout).
     async fn wait_for_leader(nodes: &[CouncilNode], timeout: Duration) -> Option<u64> {
         let start = tokio::time::Instant::now();

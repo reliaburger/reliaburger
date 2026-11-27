@@ -2025,6 +2025,10 @@ pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
 
 CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
 
+The CRL carries one more list: retired node identities. `relish decommission-node` adds a permanent tombstone for the node's name, so the name, its Raft id and its old certificates are never accepted again. Permanent means nothing removes one, and the list is capped at 65,536 (`MAX_RETIRED_NODES`) so it can't grow without bound. At the cap every further decommission is refused with "retired identity limit reached". That's the right answer, since forgetting a tombstone silently would let an old disk rejoin as an old node, but for a long time nothing told the operator the wall was coming ([#2375](https://github.com/reliaburger/reliaburger/issues/2375)). A cluster that autoscales workers and decommissions each one on scale-in walks towards it at fifty a day for three and a half years, then stops being able to retire nodes at all.
+
+Now `relish council status` prints `Retired: 3 of 65536 node identities`, from a `retired_identities` field each node's council status carries, and `relish wtf` raises `council-retired-identities-nearly-full` from 90%. We kept the tombstones permanent and didn't add expiry: a retired certificate stops mattering once it expires, but the name-reuse half of the rule never does. If a real cluster gets near the cap, raising it is the simpler answer. The apply paths that check a registry report or a join against the list still scan it; at a few hashes per name that's cheap until there are thousands of retirements, so we left it.
+
 ### Wiring the CRL into TLS handshakes
 
 For a long time `check_crl()` had exactly one caller: its own tests. Making revocation real meant getting it into the TLS handshake path, and that surfaced three problems worth walking through.

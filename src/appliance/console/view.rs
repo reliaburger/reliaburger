@@ -1050,6 +1050,7 @@ mod tests {
             fence_persist_error: None,
             last_log_index: Some(1_350),
             council_size: None,
+            retired_identities: None,
         };
         CouncilNodeObservation::answered(node, &status)
     }
