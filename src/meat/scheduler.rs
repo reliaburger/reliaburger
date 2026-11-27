@@ -218,8 +218,10 @@ impl Scheduler {
         preferred_labels: &BTreeMap<String, String>,
         image: Option<&str>,
     ) -> Placed {
-        let mut placements = Vec::with_capacity(replica_count as usize);
-        let mut choices = Vec::with_capacity(replica_count as usize);
+        // The count is user input, so nothing is sized from it: the vectors
+        // grow with what's placed, never with what was asked for (#2368).
+        let mut placements = Vec::new();
+        let mut choices = Vec::new();
         let mut unplaced = None;
 
         for ordinal in 0..replica_count {
@@ -775,6 +777,29 @@ mod tests {
         let decision = scheduler.schedule_app(&app, &spec).unwrap();
 
         assert_eq!(decision.placements.len(), 3, "daemon on all 3 nodes");
+    }
+
+    /// A replica count is user input. The scheduler sizes nothing from it:
+    /// a million-replica app on three nodes that fit two allocates for the
+    /// two it places, not the million it asked for (#2368).
+    #[test]
+    fn a_fixed_app_reserves_no_memory_for_replicas_it_cannot_place() {
+        let mut scheduler = Scheduler::new(cluster_3_nodes());
+        let mut spec = default_spec();
+        spec.cpu = Some(ResourceRange {
+            request: 1500,
+            limit: 1500,
+        });
+        spec.replicas = Replicas::Fixed(1_000_000);
+
+        let placed = scheduler.place_app(&AppId::new("huge", "prod"), &spec);
+
+        assert!(
+            placed.decision.placements.capacity() < 1_000,
+            "capacity {}",
+            placed.decision.placements.capacity()
+        );
+        assert!(placed.unplaced.is_some());
     }
 
     /// A node whose committed copy of the daemon set fills it is still a
