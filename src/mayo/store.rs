@@ -1594,8 +1594,13 @@ impl MetricsSnapshot {
         let name_filter = name
             .map(|name| format!("metric_name = '{}' AND ", escape_sql_literal(name)))
             .unwrap_or_default();
+        // Labels are stored as serde_json of a `BTreeMap`, with no spaces,
+        // so this matches the `app` label's value and nothing else: an app
+        // that writes another app's name into a label of its own doesn't
+        // land in that app's results (#2387). A quote inside a value is
+        // escaped as `\"`, so no value can contain this text either.
         let filter = format!(
-            "{name_filter}labels LIKE '%\"{app_filter}\"%' \
+            "{name_filter}labels LIKE '%\"app\":\"{app_filter}\"%' \
              AND timestamp >= {start} AND timestamp <= {end}"
         );
         let sql = match per_series {
@@ -2176,6 +2181,32 @@ mod tests {
             rows.iter()
                 .all(|(_, _, labels, _)| !labels.contains("other"))
         );
+    }
+
+    /// An app reads only the series whose `app` label is its own. One that
+    /// puts another app's `namespace/app` in a label of its own mustn't show
+    /// up in that app's results (#2387).
+    #[tokio::test]
+    async fn app_query_matches_only_the_app_label() {
+        let (mut store, _dir) = test_store();
+        store.insert(
+            &app_key("m", "default/victim", "victim-0"),
+            Sample::at(1, 1.0),
+        );
+        let forged = MetricKey::with_labels(
+            "m",
+            std::collections::BTreeMap::from([
+                ("app".to_string(), "default/intruder".to_string()),
+                ("x".to_string(), "default/victim".to_string()),
+            ]),
+        );
+        store.insert(&forged, Sample::at(1, 666.0));
+        let rows = store
+            .query_app("default/victim", None, 0, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].3, 1.0);
     }
 
     #[tokio::test]

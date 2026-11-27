@@ -548,6 +548,15 @@ pub(super) async fn app_metric_rows(
         .query_app(&format!("{namespace}/{app}"), name, start, end, per_series)
         .await
         .map_err(|error| error.to_string())?;
+    // A full answer may have lost older rows; say so, as the fan-out does
+    // for each node (#2477).
+    let warnings = if rows.len() >= crate::mayo::store::APP_QUERY_ROW_LIMIT {
+        crate::mayo::query_fanout::truncation_warning(&super::local_node_name(state), rows.len())
+            .into_iter()
+            .collect()
+    } else {
+        vec![]
+    };
     Ok(MetricsQueryResult {
         data: rows
             .into_iter()
@@ -558,7 +567,7 @@ pub(super) async fn app_metric_rows(
                 value,
             })
             .collect(),
-        warnings: vec![],
+        warnings,
     })
 }
 

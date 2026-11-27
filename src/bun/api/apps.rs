@@ -244,7 +244,11 @@ pub(super) struct ScaleRequest {
 /// that isn't the count now. A follower forwards the whole request to the
 /// leader, which reads the spec from its own state. A standalone node has
 /// no desired state to change.
+// An axum handler takes one argument per extractor; the credential watch
+// made it eight.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn scale_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     State(state): State<ApiState>,
@@ -272,6 +276,9 @@ pub(super) async fn scale_handler(
     {
         return resp;
     }
+    // Like `apply --wait`: a token revoked mid-scale ends the progress
+    // stream, not the scale (#2399, #2526).
+    let watch = watch.map(|extension| extension.0);
     // Parsed after the checks above, so a caller who may not scale the app
     // learns that, not what's wrong with their body.
     let request: ScaleRequest = match serde_json::from_str(&body) {
@@ -294,7 +301,7 @@ pub(super) async fn scale_handler(
         );
     };
     if !crate::bun::leadership::leads(&council).await {
-        return super::deploys::forward_streamed_to_leader(
+        let response = super::deploys::forward_streamed_to_leader(
             &state,
             &council,
             super::deploys::StreamedChange {
@@ -307,6 +314,11 @@ pub(super) async fn scale_handler(
             &headers,
         )
         .await;
+        return crate::sesame::auth::end_with_credential(
+            response,
+            watch,
+            super::apply::credential_ended_apply_event(),
+        );
     }
     let app_id = crate::meat::AppId::new(&app, &namespace);
     if let Some(refusal) =
@@ -329,7 +341,7 @@ pub(super) async fn scale_handler(
         Err((status, message)) => return scale_refused(status, message),
     };
     let raw = toml::to_string(&config).unwrap_or_default();
-    cluster_apply(
+    let response = cluster_apply(
         state.clone(),
         council,
         config,
@@ -340,7 +352,12 @@ pub(super) async fn scale_handler(
         binder.map(|extension| extension.0),
         auth.map(|extension| extension.0),
     )
-    .await
+    .await;
+    crate::sesame::auth::end_with_credential(
+        response,
+        watch,
+        super::apply::credential_ended_apply_event(),
+    )
 }
 
 /// The one-app config a scale applies: the app's stored spec with

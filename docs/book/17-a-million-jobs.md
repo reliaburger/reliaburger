@@ -135,6 +135,23 @@ because forgiving any bad final region would also hide real damage in the
 middle of a file. `a_zero_filled_tail_is_a_torn_tail` appends 4,096 zero bytes
 to a one-record ledger and expects that record back and the file trimmed.
 
+The failure-output segments in `task_output.rs` had the same gap, with a
+quieter symptom (#2525). Their entries carry no checksum, so a zero-filled
+tail parsed cleanly as a run of entries for task 0 with no output: `relish
+batch logs` showed an empty output for a task that may never have failed. The
+scan now stops where everything to the end of the file is zeros, and the next
+append cuts that off, as it already did for a short entry. The rule is
+narrower than the ledger's, because here an all-zero header is a real entry:
+task 0 failing with no output writes eight zero bytes. So one all-zero header
+at the end stays an entry, zeros followed by data stay entries, and only a
+zero tail longer than one header is torn. The price is a corner case: a lost
+batch that was exactly one empty output reads as task 0's. Telling them apart
+would take a checksum or a marker byte in every entry, a format change we
+didn't think was worth it for output that's kept on a best-effort basis
+anyway. `a_zero_filled_tail_is_a_torn_tail_not_task_zero_output` and
+`an_empty_output_for_task_zero_followed_by_more_entries_is_kept` pin both
+sides.
+
 #### A stopping node starts no new attempts
 
 The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.

@@ -5,6 +5,7 @@
 //! cover the most common failure modes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 
 use super::types::MetricKey;
 use std::time::{Duration, SystemTime};
@@ -62,8 +63,14 @@ pub enum AlertState {
     /// Condition met, waiting for `for_duration` to elapse.
     Pending { since: SystemTime },
     /// Condition held for the required duration. Alert is active.
-    Firing { since: SystemTime },
+    /// `missed` counts the evaluations in a row with no reading for it.
+    Firing { since: SystemTime, missed: u32 },
 }
+
+/// Evaluations in a row a firing alert may go without a reading before it
+/// resolves. A series that stops for good (its app was deleted) would
+/// otherwise stay firing until Bun restarts (#2387).
+pub const MAX_MISSED_EVALUATIONS: u32 = 10;
 
 /// A state transition detected during evaluation.
 ///
@@ -137,6 +144,53 @@ struct AlertInstance {
     labels: BTreeMap<String, String>,
 }
 
+/// The alerts that were firing, as Bun keeps them across a restart in
+/// `<data dir>/alerts-firing.json` (#2478). Node-local state, not Raft
+/// state or a wire format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FiringAlerts {
+    alerts: Vec<FiringRecord>,
+}
+
+/// One firing alert instance in [`FiringAlerts`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FiringRecord {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+    since_unix_secs: u64,
+}
+
+impl FiringAlerts {
+    /// Write to `path` atomically (temporary file, then rename).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        crate::sesame::identity::atomic_write(path, &json)
+    }
+
+    /// Read `path`; a missing file is empty, and so is an unreadable one,
+    /// with a line on stderr, so a bad file can't stop Bun starting.
+    pub fn load(path: &Path) -> Self {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(error) => {
+                eprintln!(
+                    "mayo: reading {}: {error}; no alert restored",
+                    path.display()
+                );
+                return Self::default();
+            }
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            eprintln!(
+                "mayo: {} is not valid: {error}; no alert restored",
+                path.display()
+            );
+            Self::default()
+        })
+    }
+}
+
 /// Evaluates alert rules independently for each labelled metric series.
 pub struct AlertEvaluator {
     rules: Vec<AlertRule>,
@@ -158,15 +212,16 @@ impl AlertEvaluator {
     }
 
     /// Evaluate fresh readings without combining different label sets.
-    /// Missing readings retain firing alerts and cancel inconclusive pending
-    /// alerts. A recovery requires an in-range reading from that same series.
+    /// Missing readings cancel inconclusive pending alerts. A firing alert
+    /// recovers on an in-range reading from that same series, or after
+    /// [`MAX_MISSED_EVALUATIONS`] evaluations in a row without one.
     pub fn evaluate(&mut self, latest_values: &HashMap<MetricKey, f64>) -> Vec<AlertTransition> {
         let now = SystemTime::now();
         let mut transitions = Vec::new();
         for rule in &self.rules {
             let observed: BTreeMap<_, _> = latest_values
                 .iter()
-                .filter(|(key, _)| key.name.0 == rule.metric_name)
+                .filter(|(key, _)| counts_for(rule, key))
                 .map(|(key, value)| (key.labels.clone(), *value))
                 .collect();
             let labels: BTreeSet<_> = observed
@@ -209,13 +264,14 @@ impl AlertEvaluator {
                         },
                         value,
                         fired_at: match next {
-                            AlertState::Firing { since } => Some(since),
+                            AlertState::Firing { since, .. } => Some(since),
                             _ => None,
                         },
                     });
                 }
                 // Retired inactive series do not grow the state map indefinitely.
-                // Firing series remain until their own telemetry proves recovery.
+                // A firing series stays until its telemetry proves recovery
+                // or it has been missing for MAX_MISSED_EVALUATIONS.
                 if value.is_none() && next == AlertState::Inactive {
                     self.states.remove(&instance);
                 } else {
@@ -224,6 +280,55 @@ impl AlertEvaluator {
             }
         }
         transitions
+    }
+
+    /// The firing alerts, for [`FiringAlerts::save`]. Pending ones aren't
+    /// kept: after a restart their timer starts again, which can only delay
+    /// a firing, never lose a resolve.
+    pub fn firing_records(&self) -> FiringAlerts {
+        FiringAlerts {
+            alerts: self
+                .states
+                .iter()
+                .filter_map(|(instance, state)| match state {
+                    AlertState::Firing { since, .. } => Some(FiringRecord {
+                        rule_name: instance.rule_name.clone(),
+                        labels: instance.labels.clone(),
+                        since_unix_secs: since
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Save the firing alerts to `path` (#2478). Blocking file I/O.
+    pub fn save_firing(&self, path: &Path) -> std::io::Result<()> {
+        self.firing_records().save(path)
+    }
+
+    /// Mark the alerts saved at `path` as firing again, skipping any whose
+    /// rule no longer exists. Returns how many were restored. A missing or
+    /// unreadable file restores nothing. Blocking file I/O.
+    pub fn restore_firing(&mut self, path: &Path) -> usize {
+        let mut restored = 0;
+        for record in FiringAlerts::load(path).alerts {
+            if !self.rules.iter().any(|rule| rule.name == record.rule_name) {
+                continue;
+            }
+            let instance = AlertInstance {
+                rule_name: record.rule_name,
+                labels: record.labels,
+            };
+            let since = SystemTime::UNIX_EPOCH + Duration::from_secs(record.since_unix_secs);
+            self.states
+                .insert(instance, AlertState::Firing { since, missed: 0 });
+            restored += 1;
+        }
+        restored
     }
 
     /// Get all firing labelled alert instances.
@@ -255,6 +360,15 @@ impl AlertEvaluator {
     }
 }
 
+/// Whether `key` is a series `rule` judges: one with the rule's metric
+/// name, and, for a rule on a node metric (`node_*`), only the node's own
+/// series. Anything with an `app` label is an app's, and an app must not
+/// raise the node's alerts (#2387).
+fn counts_for(rule: &AlertRule, key: &MetricKey) -> bool {
+    key.name.0 == rule.metric_name
+        && !(rule.metric_name.starts_with("node_") && key.labels.contains_key("app"))
+}
+
 fn next_state(
     rule: &AlertRule,
     previous: &AlertState,
@@ -262,7 +376,16 @@ fn next_state(
     now: SystemTime,
 ) -> AlertState {
     match (previous, value) {
-        (AlertState::Firing { .. }, None) => previous.clone(),
+        (AlertState::Firing { since, missed }, None) => {
+            if missed + 1 >= MAX_MISSED_EVALUATIONS {
+                AlertState::Inactive
+            } else {
+                AlertState::Firing {
+                    since: *since,
+                    missed: missed + 1,
+                }
+            }
+        }
         (_, None) => AlertState::Inactive,
         (AlertState::Inactive, Some(value)) if rule.operator.eval(value, rule.threshold) => {
             AlertState::Pending { since: now }
@@ -271,13 +394,21 @@ fn next_state(
             if rule.operator.eval(value, rule.threshold) =>
         {
             if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
-                AlertState::Firing { since: *since }
+                AlertState::Firing {
+                    since: *since,
+                    missed: 0,
+                }
             } else {
                 previous.clone()
             }
         }
-        (AlertState::Firing { .. }, Some(value)) if rule.operator.eval(value, rule.threshold) => {
-            previous.clone()
+        (AlertState::Firing { since, .. }, Some(value))
+            if rule.operator.eval(value, rule.threshold) =>
+        {
+            AlertState::Firing {
+                since: *since,
+                missed: 0,
+            }
         }
         (_, Some(_)) => AlertState::Inactive,
     }
@@ -291,7 +422,7 @@ fn status_for(
     let (phase, since) = match state {
         AlertState::Inactive => (AlertPhase::Inactive, None),
         AlertState::Pending { since } => (AlertPhase::Pending, Some(since)),
-        AlertState::Firing { since } => (AlertPhase::Firing, Some(since)),
+        AlertState::Firing { since, .. } => (AlertPhase::Firing, Some(since)),
     };
     AlertStatus {
         rule_name: rule.name.clone(),
@@ -371,6 +502,141 @@ mod tests {
             severity: AlertSeverity::Warning,
             description: "test rule".to_string(),
         }
+    }
+
+    /// The built-in rules describe the node. A series with an `app` label is
+    /// an app's, whatever it is called (#2387).
+    #[test]
+    fn a_default_rule_ignores_series_that_carry_an_app_label() {
+        let mut evaluator = AlertEvaluator::with_defaults();
+        let forged = HashMap::from([(
+            MetricKey::with_labels(
+                "node_cpu_usage_percent",
+                BTreeMap::from([("app".into(), "default/evil".into())]),
+            ),
+            99.0,
+        )]);
+        assert!(evaluator.evaluate(&forged).is_empty());
+        // Past the rule's five minutes, as if the reading had held.
+        for state in evaluator.states.values_mut() {
+            if let AlertState::Pending { since } = state {
+                *since -= Duration::from_secs(600);
+            }
+        }
+        assert!(evaluator.evaluate(&forged).is_empty());
+        assert!(evaluator.firing_alerts().is_empty());
+
+        // The node's own reading still counts.
+        let own = make_values(&[("node_cpu_usage_percent", 99.0)]);
+        evaluator.evaluate(&own);
+        assert!(evaluator.all_statuses().iter().any(
+            |status| status.rule_name == "cpu_throttle" && status.state == AlertPhase::Pending
+        ));
+    }
+
+    /// A firing alert whose series stopped reporting (the app that exported
+    /// it was deleted) used to stay firing until Bun restarted (#2387).
+    #[test]
+    fn a_firing_alert_whose_series_is_gone_resolves_after_the_absence_limit() {
+        let mut evaluator = AlertEvaluator::new(vec![simple_rule(
+            "m-high",
+            "m",
+            50.0,
+            AlertOperator::GreaterThan,
+        )]);
+        evaluator.evaluate(&make_values(&[("m", 99.0)]));
+        let fired = evaluator.evaluate(&make_values(&[("m", 99.0)]));
+        assert_eq!(fired.len(), 1);
+        for _ in 1..MAX_MISSED_EVALUATIONS {
+            assert!(evaluator.evaluate(&HashMap::new()).is_empty());
+            assert_eq!(evaluator.firing_alerts().len(), 1);
+        }
+        let resolved = evaluator.evaluate(&HashMap::new());
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0].kind, TransitionKind::Resolved);
+        assert_eq!(resolved[0].value, None);
+        assert!(evaluator.firing_alerts().is_empty());
+        assert!(evaluator.states.is_empty(), "the state is dropped");
+    }
+
+    /// One missing reading doesn't reset the count of a later absence.
+    #[test]
+    fn a_reading_between_gaps_restarts_the_absence_count() {
+        let mut evaluator = AlertEvaluator::new(vec![simple_rule(
+            "m-high",
+            "m",
+            50.0,
+            AlertOperator::GreaterThan,
+        )]);
+        evaluator.evaluate(&make_values(&[("m", 99.0)]));
+        evaluator.evaluate(&make_values(&[("m", 99.0)]));
+        for _ in 0..3 {
+            for _ in 1..MAX_MISSED_EVALUATIONS {
+                assert!(evaluator.evaluate(&HashMap::new()).is_empty());
+            }
+            assert!(evaluator.evaluate(&make_values(&[("m", 99.0)])).is_empty());
+        }
+        assert_eq!(evaluator.firing_alerts().len(), 1);
+    }
+
+    /// Bun restarted while an alert fired; afterwards the reading was back
+    /// in range, and with nothing remembered no resolve was ever sent
+    /// (#2478).
+    #[test]
+    fn a_restored_firing_alert_sends_a_resolve_when_its_reading_is_back_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts-firing.json");
+        let rule = || simple_rule("m-high", "m", 50.0, AlertOperator::GreaterThan);
+        let mut before = AlertEvaluator::new(vec![rule()]);
+        before.evaluate(&make_values(&[("m", 99.0)]));
+        assert_eq!(before.evaluate(&make_values(&[("m", 99.0)])).len(), 1);
+        let since = before.firing_alerts()[0].since;
+        before.save_firing(&path).unwrap();
+
+        let mut after = AlertEvaluator::new(vec![rule()]);
+        assert_eq!(after.restore_firing(&path), 1);
+        assert_eq!(after.firing_alerts().len(), 1);
+        assert_eq!(after.firing_alerts()[0].since, since);
+        let transitions = after.evaluate(&make_values(&[("m", 1.0)]));
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].rule_name, "m-high");
+        assert_eq!(transitions[0].kind, TransitionKind::Resolved);
+    }
+
+    /// Only firing alerts are kept, and only for rules that still exist.
+    #[test]
+    fn only_firing_alerts_of_known_rules_are_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts-firing.json");
+        let mut before = AlertEvaluator::new(vec![
+            simple_rule("gone", "g", 50.0, AlertOperator::GreaterThan),
+            AlertRule {
+                for_duration: Duration::from_secs(3600),
+                ..simple_rule("slow", "s", 50.0, AlertOperator::GreaterThan)
+            },
+        ]);
+        before.evaluate(&make_values(&[("g", 99.0), ("s", 99.0)]));
+        before.evaluate(&make_values(&[("g", 99.0), ("s", 99.0)]));
+        before.save_firing(&path).unwrap();
+
+        let mut after = AlertEvaluator::new(vec![AlertRule {
+            for_duration: Duration::from_secs(3600),
+            ..simple_rule("slow", "s", 50.0, AlertOperator::GreaterThan)
+        }]);
+        assert_eq!(after.restore_firing(&path), 0);
+        assert!(after.firing_alerts().is_empty());
+    }
+
+    /// A bad file mustn't stop Bun starting.
+    #[test]
+    fn a_missing_or_corrupt_alert_state_file_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut evaluator = AlertEvaluator::with_defaults();
+        assert_eq!(evaluator.restore_firing(&dir.path().join("absent.json")), 0);
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert_eq!(evaluator.restore_firing(&corrupt), 0);
+        assert!(evaluator.firing_alerts().is_empty());
     }
 
     #[test]
