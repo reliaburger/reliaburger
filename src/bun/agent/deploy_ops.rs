@@ -1883,7 +1883,7 @@ mod history_tests {
         let kept: Vec<usize> = (0..DEPLOY_HISTORY_APPS + 10)
             .filter(|n| {
                 history
-                    .of_app(&AppId::new(&format!("app-{n}"), "default"))
+                    .of_app(&AppId::new(format!("app-{n}"), "default"))
                     .next()
                     .is_some()
             })
