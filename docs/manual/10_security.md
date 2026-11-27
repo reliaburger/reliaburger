@@ -756,7 +756,13 @@ with no configuration:
 
 - **Its own user namespace.** Container ids 0 to 65,535 map onto host ids
   from 2,000,000,000, so root in the container is an unprivileged user on
-  the node (see `images-and-volumes`).
+  the node (see `images-and-volumes`). Every container on a node shares
+  that range, so its files, set-uid binaries included, are what a local
+  user must not reach: the unpacked image store, the bundle directory and
+  the volumes directory are `0710`, root's with group 2,000,000,000, so
+  only root and container root pass through, and sized volumes are mounted
+  `nosuid,nodev`. That only matters on a node with unprivileged local
+  accounts; the appliance has none.
 - **Docker's default capability set**, which acts only on what the
   container's own namespaces own. The next section has the details.
 - **Docker's default seccomp filter.** About 370 system calls are allowed

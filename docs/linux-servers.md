@@ -166,6 +166,24 @@ sudo install -d -m 0700 /etc/reliaburger /etc/reliaburger/identity
 sudo install -d -m 0755 /var/lib/reliaburger
 ```
 
+`/var/lib/reliaburger` stays world-traversable on purpose; the directories
+inside it that hold container files don't. Every container on a node maps its
+ids onto one host range starting at uid 2,000,000,000, and unpacked images,
+container writable layers and managed volumes are owned by that range, set-uid
+binaries included. A local user who could reach one of those binaries could
+run it as the range's root, the owner of every container's files. So Bun
+makes the unpacked image store (`images/rootfs`), the bundle directory and
+the volumes directory mode `0710`, owned by root with group 2,000,000,000:
+container root, which is how runc gets through, and nobody else. A loop-mounted
+volume (one with a `size`) is mounted `nosuid,nodev`. Bun tightens these
+directories when it next uses them, so a node upgraded from 0.3.3, where they
+were `0755` and `0711`, needs nothing done by hand.
+
+This only matters on a node with unprivileged local accounts: a jump host, a
+CI runner's user, a shared lab machine. The appliance image has none. If yours
+does, also keep that group out of your directory service: no real user should
+have gid 2,000,000,000.
+
 ---
 
 ## 3. Bootstrap the cluster on the first node (`node-01`)

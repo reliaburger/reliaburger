@@ -249,14 +249,19 @@ impl RuncGrill {
         let bundle_dir = self.bundle_base.join(&instance.0);
         // The bundle will hold the decrypted environment: root-only.
         let private = bundle_dir.clone();
-        tokio::task::spawn_blocking(move || super::bundle::create_private_directory(&private))
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|result| result)
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to create bundle dir: {e}"),
-            })?;
+        // Container root's host group passes through a rootful bundle; a
+        // rootless container's root is the bundle's owner (#2412).
+        let group = (!self.rootless).then_some(super::userns::HOST_ID_BASE);
+        tokio::task::spawn_blocking(move || {
+            super::bundle::create_private_directory(&private, group)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result)
+        .map_err(|e| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("failed to create bundle dir: {e}"),
+        })?;
 
         let mut spec = spec.clone();
         let mut rootfs_mount = None;
@@ -2502,6 +2507,94 @@ mod tests {
         assert_eq!(bomb_limit.trim(), "32");
         assert!(refused > 0, "the bomb never reached its limit");
         assert_eq!(after_state, Some(ContainerState::Running));
+    }
+
+    /// #2412: a set-uid file a container writes, and the unpacked image it
+    /// runs from, are out of reach of an unprivileged local user, while the
+    /// container itself still starts from both a writable and a read-only
+    /// root.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, setpriv, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_local_user_cannot_reach_a_containers_set_id_files() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        // Like /var/lib/reliaburger: any user may pass through the top.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writable = InstanceId("default__setid-0".to_string());
+        let read_only = InstanceId("default__setid-ro-0".to_string());
+        for id in [&writable, &read_only] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![writable.clone(), read_only.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &writable,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\n\
+                 command = [\"/bin/sh\", \"-c\", \"cp /bin/busybox /pwn && chmod 4755 /pwn && sleep 3611\"]\n"
+            ),
+        );
+        grill.create(&writable, &spec).await.unwrap();
+        grill.start(&writable).await.unwrap();
+        let (_, mut read_only_spec) = image_app(
+            tmp.path(),
+            &read_only,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3612\"]\n"),
+        );
+        read_only_spec.root.readonly = true;
+        grill.create(&read_only, &read_only_spec).await.unwrap();
+        grill.start(&read_only).await.unwrap();
+
+        let planted = tmp
+            .path()
+            .join("bundles")
+            .join(&writable.0)
+            .join("rootfs-upper/pwn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !planted.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the container never wrote /pwn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mode = std::fs::metadata(&planted).unwrap().permissions().mode();
+        let as_nobody = |path: &std::path::Path| {
+            std::process::Command::new("setpriv")
+                .args([
+                    "--reuid",
+                    "65534",
+                    "--regid",
+                    "65534",
+                    "--clear-groups",
+                    "stat",
+                ])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let upper = as_nobody(&planted);
+        let images = as_nobody(&tmp.path().join("images/rootfs"));
+        let writable_state = grill.state(&writable).await.ok();
+        let read_only_state = grill.state(&read_only).await.ok();
+        for id in [&writable, &read_only] {
+            grill.kill(id).await.unwrap();
+        }
+
+        assert_eq!(
+            mode & 0o4000,
+            0o4000,
+            "the container's file is set-uid: {mode:o}"
+        );
+        for output in [&upper, &images] {
+            let said = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "a local user reached it: {said}");
+            assert!(said.contains("Permission denied"), "{said}");
+        }
+        assert_eq!(writable_state, Some(ContainerState::Running));
+        assert_eq!(read_only_state, Some(ContainerState::Running));
     }
 
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their

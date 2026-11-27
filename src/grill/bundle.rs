@@ -16,22 +16,65 @@ pub const SPEC_FILE: &str = "config.json";
 // Only the Linux runc runtime writes bundles. The helpers stay portable so
 // their tests run on every development machine.
 
-/// Create the instance's bundle directory: 0711, traversable but not listable.
+/// Create the instance's bundle directory, and close it and the bundle base
+/// above it to every local user but root and `container_group` (#2412).
 ///
-/// Not 0700: a container with a user namespace runs its init as a mapped,
-/// non-host-root user, and runc remounts the rootfs under this directory from
-/// inside that namespace, which needs search permission on every directory
-/// above it (0700 fails with `remount-private …: permission denied`). The
-/// secret is the 0600 `config.json`, not the directory. An existing directory,
-/// perhaps left by an older release with the default 0755, is tightened too.
+/// A container with a user namespace runs its init as a mapped, non-host-root
+/// user, and runc remounts the rootfs under this directory from inside that
+/// namespace, which needs search permission on every directory above it. So
+/// with a `container_group` (rootful runc passes the host gid container
+/// root maps to) both are 0710 and that group's: container root passes
+/// through, nobody else does. Without one (rootless runc, whose container
+/// root is the directory's owner) they're 0700.
+///
+/// Releases before 0.3.4 made them 0711, so any local user who knew an
+/// instance id could reach its writable layer, and run a set-uid file a
+/// container left there as the container's host uid. An existing directory
+/// is tightened too.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn create_private_directory(bundle: &Path) -> io::Result<()> {
+pub(crate) fn create_private_directory(
+    bundle: &Path,
+    container_group: Option<u32>,
+) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(bundle)?;
+    if let Some(base) = bundle.parent() {
+        close_to_other_users(base, container_group)?;
+    }
+    close_to_other_users(bundle, container_group)
+}
+
+/// Create `directory` if it's missing and close it to every local user but
+/// its owner and `container_group`: 0710 and that group's, or 0700 with
+/// none.
+///
+/// Container files live on the host owned by the node's shared container id
+/// range, set-uid bits included (#2412). A local user who can reach one can
+/// run it as that range's root, the owner of every container's files. Docker
+/// protects its `userns-remap` range the same way: `/var/lib/docker` is 0710
+/// root and the remapped root's group.
+pub(crate) fn close_to_other_users(
+    directory: &Path,
+    container_group: Option<u32>,
+) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o711)
-        .create(bundle)?;
-    std::fs::set_permissions(bundle, std::fs::Permissions::from_mode(0o711))
+        .mode(0o700)
+        .create(directory)?;
+    // Group first, then mode: the directory is never open to a group it
+    // doesn't belong to yet.
+    let mode = match container_group {
+        Some(group) => {
+            std::os::unix::fs::lchown(directory, None, Some(group))?;
+            0o710
+        }
+        None => 0o700,
+    };
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
 }
 
 /// Atomically replace the bundle's `config.json` with an owner-only (0600) file.
@@ -76,11 +119,28 @@ mod tests {
     }
 
     #[test]
-    fn bundle_directory_is_owner_only() {
+    fn bundle_directory_is_closed_to_everyone_but_root_and_container_root() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("bundles");
+        let bundle = base.join("default__web-0");
+        // The test's own group stands in for container root's: changing a
+        // directory's group to another needs root.
+        let group = nix::unistd::getgid().as_raw();
+        create_private_directory(&bundle, Some(group)).unwrap();
+        for path in [&base, &bundle] {
+            assert_eq!(mode(path), 0o710, "{}", path.display());
+            assert_eq!(std::fs::metadata(path).unwrap().gid(), group);
+        }
+    }
+
+    #[test]
+    fn without_a_container_group_the_bundle_is_owner_only() {
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("bundles").join("default__web-0");
-        create_private_directory(&bundle).unwrap();
-        assert_eq!(mode(&bundle), 0o711);
+        create_private_directory(&bundle, None).unwrap();
+        assert_eq!(mode(&bundle), 0o700);
+        assert_eq!(mode(&root.path().join("bundles")), 0o700);
     }
 
     #[test]
@@ -88,9 +148,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("default__web-0");
         std::fs::create_dir(&bundle).unwrap();
-        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).unwrap();
-        create_private_directory(&bundle).unwrap();
-        assert_eq!(mode(&bundle), 0o711);
+        // 0711 is what releases before 0.3.4 left.
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o711)).unwrap();
+        create_private_directory(&bundle, None).unwrap();
+        assert_eq!(mode(&bundle), 0o700);
     }
 
     #[test]
