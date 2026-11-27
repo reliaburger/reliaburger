@@ -1,4 +1,5 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
+import datetime
 import os
 from pathlib import Path
 import re
@@ -82,6 +83,13 @@ class LocalGateTests(unittest.TestCase):
         recipe = re.search(r"^test-ci-scripts:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text(), re.M)
         self.assertIsNotNone(recipe)
         self.assertIn("discover -s image/tests", recipe.group(1))
+
+    def test_the_audit_expiry_in_the_design_doc_is_the_makefiles(self):
+        # The doc said 18 August 2026 long after the Makefile moved on (#2494).
+        expiry = re.search(r"expiry=(\d{8})", (REPO / "Makefile").read_text()).group(1)
+        when = datetime.date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:]))
+        doc = " ".join((REPO / "docs" / "design" / "test-harness.md").read_text().split())
+        self.assertIn(f"{when.day} {when:%B} {when.year}", doc)
 
     def test_make_ci_runs_the_quick_checks_before_any_build(self):
         # A format slip or an unowned #[ignore] fails in seconds, not after
@@ -508,6 +516,28 @@ class TrainAndQueueTests(unittest.TestCase):
         # ci.yml's macOS job still follows select jobs, which never picks it
         # for a merge group.
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
+
+    def test_the_harness_design_doc_agrees_about_fuzz_and_macos(self):
+        # The design doc kept saying decoder PRs were fuzzed and the queue ran
+        # portable macOS after 24 November moved both to nightlies (#2494).
+        doc = (REPO / "docs" / "design" / "test-harness.md").read_text()
+        fuzz_triggers = (WORKFLOWS / "fuzz.yml").read_text().split("\njobs:")[0]
+        self.assertNotIn("pull_request", fuzz_triggers)
+        self.assertNotIn("on PRs touching a decoder", doc)
+        self.assertIn("never on pull requests", doc)
+        # select-jobs.sh never picks macOS for a merge group (the test above).
+        self.assertNotIn("portable macOS included", doc)
+        self.assertIn("macos-nightly.yml", doc)
+        # macOS runs its own lint and test targets, not make lint and make test.
+        rows = {row.split("|")[1].strip(): row for row in doc.splitlines() if row.startswith("| `make ")}
+        for command in ("`make lint`", "`make test`", "`make test-doc`"):
+            with self.subTest(command=command):
+                self.assertNotIn("Linux and hosted macOS", rows[command])
+        self.assertIn("`make lint-macos`", doc)
+        self.assertIn("`make test-macos`", doc)
+        # The S3 job starts scripts/test-s3.sh's pinned binary, not a service.
+        self.assertNotIn("services:", (WORKFLOWS / "ci.yml").read_text())
+        self.assertNotIn("service container", doc)
 
     def test_every_nightly_that_replaced_a_pull_request_job_tests_the_newest_train(self):
         # macOS left the queue, and fuzzing and mutants left pull requests,

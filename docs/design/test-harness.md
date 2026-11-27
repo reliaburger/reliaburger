@@ -52,20 +52,20 @@ be visible until we remove its race.
 
 | Command | Contract | Automation |
 |---|---|---|
-| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux and hosted macOS |
-| `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
-| `make test-doc` | Rust documentation examples | Linux and hosted macOS |
-| `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
-| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux; hosted macOS runs `make lint-macos` instead |
+| `make test` | Portable unit, component and integration correctness via nextest | Linux; hosted macOS runs `make test-macos`, relish's tests and the tests only macOS compiles |
+| `make test-doc` | Rust documentation examples | Linux; hosted macOS runs relish's doctests |
+| `make test-slow` | Required wall-clock health and retry acceptance | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; the train's merge queue, PRs into `main`, `main` and nightly |
 | `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401), then a hundred running 1,000 apps against the cluster summary's 1 s budget; the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual: the maintainer, before a release that changes the summary, reporting or the harness (`docs/testing.md`'s manual gates, #2489) |
-| `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
-| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
-| `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
+| `make test-upgrade-node` | Real single-node binary replacement | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; the train's merge queue, PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu` | Real NVIDIA hardware | Manual |
-| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, SeaweedFS as a service container; `main`, nightly, and PRs touching the S3 client, log export or council backups |
+| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, a pinned SeaweedFS binary that `scripts/test-s3.sh` downloads and starts; `main`, nightly, and PRs touching the S3 client, log export or council backups |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
 | `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
 | `make ci-bench` | `make ci`, then `make bench` | Local |
@@ -90,11 +90,15 @@ Pull requests into a release's merge-train branch (`release-*`) run the light se
 lint, minimum Rust, portable Linux with coverage, CI policy (with the demo app)
 and the optimised contract boundaries. Labelled `full-ci`, they run every heavy
 owner but not portable macOS (the `train-full` selection), which is also what a
-code PR into `main` runs. The merge queue on the train, pushes to `main`,
-the nightly and the gate PR into `main` labelled `release-gate` run
-everything, portable macOS included; a push to the train reuses the queue's
-run on the same commit when it passed every job (#1723); any other PR runs it only
-when it touches macOS-specific code or carries a `macos` label
+code PR into `main` runs. The merge queue on the train runs everything but
+portable macOS, which took 50 minutes to over 2 hours there and rebuilt the
+queue each time it failed (maintainer decision, 24 November 2026);
+[`macos-nightly.yml`](../../.github/workflows/macos-nightly.yml) runs it on
+the newest train every night instead. Pushes to `main`, the nightly and the
+gate PR into `main` labelled `release-gate` run everything, portable macOS
+included. A push to the train reuses the queue's run on the same commit when
+it passed every job (#1723); any other PR runs portable macOS only when it
+touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
 macOS runs `make test-macos`, relish's tests and the tests only macOS
 compiles, and compile-checks `bun`; every other portable test runs on Linux
@@ -169,8 +173,9 @@ The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
 The repository-local exception list names only reviewed findings whose affected
 API is unreachable or whose upstream has no compatible fix. Those exceptions
-aren't permanent configuration: `make audit` rejects all of them after 18
-August 2026, forcing a new reachability and upgrade review. GitHub Dependabot
+aren't permanent configuration: `make audit` rejects all of them after the
+date in its recipe, 10 December 2026 today, forcing a new reachability and
+upgrade review. GitHub Dependabot
 continues to track ecosystem advisories that RustSec doesn't carry.
 
 ## Gating rules
