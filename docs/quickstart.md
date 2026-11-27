@@ -27,12 +27,16 @@ relish dashboard             # Ctrl-C stops the browser connection
 
 `--laptop` picks the laptop cluster. Run the installer with no flag and it
 only explains the choices, then exits with status 2 having downloaded nothing:
-`--laptop` for this computer, `--install-only` for the CLI alone when the
-cluster runs on Linux machines you already have (the
+`--laptop` for this computer, `--ssh MACHINES` to put a node on each Linux
+machine you already have over SSH, and `--install-only` for the CLI alone
+when you set those machines up by hand (the
 [Linux servers guide](linux-servers.md) walks through `relish init` and
-`relish join`), and netbooting machines into a cluster, which is planned but
-not built. An unknown option gets the usage and status 2. Options after
-`--laptop` that aren't the installer's own go to `relish setup --quickstart`.
+`relish join`). To install Reliaburger's own OS on spare machines over the
+network, install the CLI with `--install-only`, then follow the
+[appliance chapter](manual/17_appliance.md) (`relish manual appliance`):
+`relish image download --dir os`, then `sudo relish netboot os`. An unknown
+option gets the usage and status 2. Options after `--laptop` that aren't the
+installer's own go to `relish setup --quickstart`.
 
 The installer says what it's fetching before each download (for example
 `Downloading relish v0.2.6 for macos-aarch64 (95.1 MiB)...`), draws curl's
