@@ -3,11 +3,16 @@
 The command below installs the published, signed 0.3.3 release
 (27 November 2026) and builds a laptop cluster from it. A laptop cluster is a
 development cluster: until 1.0.0, Reliaburger is for developers and
-enthusiasts trying it out, not for production. The two cold installs of the
-0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
-to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
-Linux hosts haven't been measured yet, and your connection and what's already
-cached decide most of the time.
+enthusiasts trying it out, not for production. From the first `curl` to a
+ready three-node cluster, with empty caches, 0.3.3's two staged installs on
+Apple silicon took 87 s
+([record](qualification/2026-11-27-v0.3.3-staged-install-apple-silicon.md))
+and 70 s
+([record](qualification/2026-11-27-v0.3.3-staged-install-apple-silicon-2.md)).
+On clean Linux hosts the published 0.2.8 took a median of 84.8 s on x86_64
+and 83.2 s on arm64, over three installs each
+([record](qualification/2026-11-12-v04-cold-installs-linux.md)). Your
+connection and what's already cached decide most of the time.
 
 It runs on macOS on Apple silicon, or on Linux (x86_64 or arm64) with QEMU and
 KVM. Intel Macs aren't supported from 0.2.2: the installer refuses one and
