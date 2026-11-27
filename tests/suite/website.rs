@@ -1440,7 +1440,7 @@ fn release_cards_use_roadmap_release_names() {
     }
     // The installed release's card, wherever the installer's default points.
     let installed = installer_default();
-    for release in [installed.trim_start_matches('v'), "0.4.0", "0.4.1"] {
+    for release in [installed.trim_start_matches('v'), "0.3.4", "0.4.0"] {
         assert!(
             cards.iter().any(|card| card == release),
             "no {release} card"
