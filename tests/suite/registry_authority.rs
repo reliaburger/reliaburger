@@ -777,7 +777,7 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
             upstream: None,
             pull_through: false,
             cache_recheck_secs: 300,
-            fill_lock: tokio::sync::Mutex::new(()),
+            fill_locks: Default::default(),
         };
         assert!(
             source

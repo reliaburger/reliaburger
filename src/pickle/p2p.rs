@@ -221,11 +221,37 @@ pub struct ClusterSource {
     pub pull_through: bool,
     /// `[images] cache_recheck_secs`.
     pub cache_recheck_secs: u64,
-    /// Serialises cache fills so two instances of the same new image
-    /// landing at once don't both download it from upstream. One lock
-    /// for all images — the simplest correct thing; per-image locks
-    /// are an optimisation nobody has needed yet.
-    pub fill_lock: tokio::sync::Mutex<()>,
+    /// Serialises cache fills of one image, so two instances of the same
+    /// new image landing at once don't both download it from upstream.
+    /// Fills of different images run side by side: one slow layer used to
+    /// hold every other new image on the node for minutes (#2424).
+    pub fill_locks: FillLocks,
+}
+
+/// One lock per pull-through fill in flight, keyed by the cached repository
+/// and the tag or digest being filled.
+#[derive(Debug, Default)]
+pub struct FillLocks(tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl FillLocks {
+    /// Wait for, then hold, the fill lock of `repository` at `reference`.
+    /// Entries nobody holds or waits for are dropped as new ones are made.
+    pub async fn lock(
+        &self,
+        repository: &str,
+        reference: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().await;
+            // A guard or a waiter holds a second reference to its lock.
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(format!("{repository}@{reference}"))
+                .or_default()
+                .clone()
+        };
+        lock.lock_owned().await
+    }
 }
 
 impl ClusterSource {
@@ -666,9 +692,10 @@ impl ClusterSource {
     ) -> Result<(), PickleError> {
         use super::upstream::{CacheState, UpstreamRoot, decide};
 
-        // Serialised so concurrent misses don't double-download. Re-check
-        // after acquiring: another task may have filled while we waited.
-        let _guard = self.fill_lock.lock().await;
+        // Serialised per image so concurrent misses don't double-download.
+        // Re-check after acquiring: another task may have filled while we
+        // waited.
+        let _guard = self.fill_locks.lock(cached_repo, &image.tag).await;
         let catalog = self.state.catalog_snapshot(cached_repo).await?;
         if matches!(
             decide(
@@ -703,7 +730,7 @@ impl ClusterSource {
         cached_repo: &str,
         platform: &Digest,
     ) -> Result<(), PickleError> {
-        let _guard = self.fill_lock.lock().await;
+        let _guard = self.fill_locks.lock(cached_repo, platform.as_str()).await;
         let catalog = self.state.catalog_snapshot(cached_repo).await?;
         if catalog
             .get_repository_manifest(cached_repo, platform.as_str())
@@ -749,16 +776,26 @@ impl ClusterSource {
             .store
             .write_blob_async(manifest.config_bytes, manifest.config.digest.clone())
             .await?;
-        for layer in &manifest.layers {
-            if self.state.store.has_blob(&layer.digest) {
-                continue;
-            }
-            let bytes = upstream.fetch_blob(image, layer).await?;
-            // write_blob verifies the digest — a lying upstream fails here.
-            self.state
-                .store
-                .write_blob_async(bytes, layer.digest.clone())
-                .await?;
+        let missing: Vec<&LayerDescriptor> = manifest
+            .layers
+            .iter()
+            .filter(|layer| !self.state.store.has_blob(&layer.digest))
+            .collect();
+        // Refuse an image that can't fit before asking upstream for any of
+        // its layers (#2424).
+        let needed = missing
+            .iter()
+            .try_fold(0u64, |total, layer| total.checked_add(layer.size))
+            .ok_or_else(|| {
+                PickleError::ReplicationFailed("upstream layer sizes overflow".to_string())
+            })?;
+        crate::grill::oci_pull::check_room(&self.state.store, &image.full_reference(), needed)
+            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
+        for layer in missing {
+            // Streamed to disk and published only once its digest and size
+            // match: a lying upstream fails here, without the layer ever
+            // sitting in memory.
+            upstream.store_blob(image, layer, &self.state.store).await?;
         }
 
         let total_size = manifest.layers.iter().map(|l| l.size).sum();

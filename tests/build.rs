@@ -1296,7 +1296,7 @@ async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
         upstream: None,
         pull_through: false,
         cache_recheck_secs: 0,
-        fill_lock: tokio::sync::Mutex::new(()),
+        fill_locks: Default::default(),
     }));
     let runtime = RuncGrill::new(
         runtime_root.path().join("bundles"),

@@ -1007,9 +1007,10 @@ A `const` is evaluated at compile time and inlined wherever it's used, which is
 why `Duration::from_secs` has to be a `const fn` to appear here. The retry loop
 gives each attempt `min(now + attempt, deadline)` through
 `tokio::time::timeout_at`, and treats an expired attempt like any other
-transient failure. A single attempt keeps the old ceiling (30 seconds for
-metadata, 120 per layer); the totals (two and six minutes) leave room for the
-retries. Server errors (500, 408) and refused connections joined the transient
+transient failure. A single metadata attempt keeps the old ceiling (30
+seconds); the two-minute total leaves room for the retries. Layers had the
+same shape, 120 seconds an attempt and six minutes in all, until we noticed
+what that meant for a big layer on a slow link (below). Server errors (500, 408) and refused connections joined the transient
 list too. The unit tests drive it with `#[tokio::test(start_paused = true)]` and
 `std::future::pending()`, a future that never completes, so "the registry hung
 for 30 seconds" takes no real time at all.
@@ -1055,6 +1056,108 @@ conversion. There's no way to build an `ImageMirrors` holding `https://…` or a
 path, so the pull code never has to check again. Loopback mirrors use plain
 HTTP, like the loopback registries the tests already use; everything else stays
 on HTTPS.
+
+### A layer is a stream, not a buffer
+
+The November 2026 audit (#2424) read both pull paths, Bun's direct pull and
+the pull-through cache, and found the push-side lesson above unlearned on the
+way in. Each read a layer into a `Vec<u8>`, then hashed it, then wrote it.
+On a 2 GB Wyse a 1.5 GB layer is more than the node has: a `Vec` doubles its
+capacity as it grows, and Bun's `OOMScoreAdjust=-900` means the kernel kills
+the node's workloads first. The deadline was wrong too. 120 seconds an
+attempt, restarting from byte 0, means a 400 MB layer over a 20 Mbit/s link
+(160 seconds) could never arrive. And the pull-through cache held one
+node-wide lock for each fill, so every other new image waited behind it.
+
+Both paths now call one function, `grill::oci_pull::pull_layer_to_store`. It
+opens an upload in the blob store (the same temporary file a `docker push`
+writes), reads the response with `oci_client`'s `pull_blob_stream`, feeds
+each chunk to a SHA-256 hasher and gathers it into a one-megabyte batch, and
+appends each batch to the upload file. When the stream ends it checks the
+size and the digest, and only then renames the file into
+`blobs/sha256/<digest>/data`. On any error the upload is removed. Memory
+holds one batch, whatever the layer's size.
+
+The function keeps its progress in a small struct and its attempts in a
+`loop`, rather than in a closure handed to `retry_registry_read` as before:
+
+```rust
+struct LayerTransfer<'a> {
+    client: &'a Client,
+    reference: &'a Reference,
+    layer: &'a OciDescriptor,
+    store: &'a BlobStore,
+    size: u64,
+    upload: String,
+    hasher: Sha256,
+    received: u64,
+    resumed: bool,
+}
+```
+
+The `'a` is a *lifetime parameter*. A struct that holds references has to
+say how long they live, and `'a` says "all of these borrow from something
+that outlives this struct". The compiler then refuses any use of a
+`LayerTransfer` after the client or the store it borrows has gone. It's the
+same promise a Go programmer makes silently when stashing a pointer in a
+struct; Rust makes you write it down. `impl LayerTransfer<'_>` in the
+methods below means "for whatever lifetime it has"; they don't need to name
+it.
+
+Owning the state is what makes resuming possible. The retry closure built a
+fresh future for each attempt so that a broken response couldn't leak a
+prefix into the next one. Now the bytes already written and hashed are
+exactly the prefix we want to keep. A retry calls `pull_blob_stream_partial`
+with `received` as the offset, which sends `Range: bytes=N-`. A registry that
+honours it answers `206 Partial Content` and the transfer carries on. One
+that ignores it answers `200` with the whole blob, and we start the upload
+again. If the digest of a resumed transfer is wrong, the registry may have
+served a range of different bytes, so that earns one clean retry from byte 0
+instead of a terminal error.
+
+The deadline changed shape. An attempt fails when nothing arrives for 60
+seconds (`LAYER_IDLE`), each `stream.next()` wrapped in its own
+`tokio::time::timeout`, not when the whole layer is slow. That alone would
+let a registry trickle a byte a minute forever, so all attempts together get
+six minutes, or the layer's size at 64 KiB/s if that's longer. The error says
+which: `layer sha256:… of N bytes did not arrive within T s (M bytes
+received)`. It used to be `registry read deadline exceeded on attempt 3 of
+4`, which blamed the registry for a layer that was simply big.
+
+Before any of that, a pull adds up the sizes of the layers it doesn't hold
+and compares the sum with the room left under `[images] max_storage`. The
+manifest is already verified, and the upload file would refuse the first
+byte past the ceiling anyway, but refusing early means a node never downloads
+most of a layer it can't keep. `BlobStore::remaining_capacity` reads the
+budget the registry and the runtime share. The test that pinned the old
+behaviour set the ceiling to one byte and expected the layer to be fetched
+anyway; its new sibling expects zero layer requests.
+
+The slow-layer test needed a registry that keeps sending. The hermetic
+fixture gained a `trickle` fault that sends the layer in five pieces 40
+seconds apart. The test pauses Tokio's clock, advances 40 seconds, resumes
+for a moment so the piece can cross the socket, and repeats. Five gaps make
+200 simulated seconds, past the old 120-second attempt, each inside the 60-
+second idle deadline. Under the old code the attempt was abandoned and the
+layer requested twice; now it arrives once. A `resumable` fault sends a true
+prefix, breaks the connection, and honours the range on the retry, and its
+test counts exactly one ranged request.
+
+The cache's lock went per image. `FillLocks` maps
+`"<cached repository>@<tag or digest>"` to an `Arc<Mutex<()>>`, and a fill
+holds an `OwnedMutexGuard`: a guard that owns an `Arc` of its mutex rather
+than borrowing it, so it can outlive the map lookup that produced it. The
+map drops an entry once its `Arc::strong_count` is one, meaning nobody holds
+or waits for it. A suite test stalls one image's upstream forever and checks
+that another image still fills within ten seconds; with one shared key it
+times out.
+
+`UpstreamRegistry::fetch_blob` still returns a `Vec<u8>`, for the few blobs
+that really are small: cosign signatures and test fixtures. It now refuses
+anything over 64 MiB before asking. Layers go through the new
+`store_blob`, whose default implementation (for the test doubles) still
+reads into memory, and which `OciUpstream` overrides with the streaming
+function.
 
 ## Who owns these bytes?
 

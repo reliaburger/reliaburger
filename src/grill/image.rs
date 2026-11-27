@@ -886,94 +886,64 @@ impl ImageStore {
             })?;
         tokio::fs::write(&manifest_path, &manifest_json).await?;
 
-        // Download each layer blob (skip if cached)
+        let store = self.blob_store.get().cloned().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::pickle::store::BlobStore::new(
+                self.store_root.clone(),
+            ))
+        });
+        let layer_error = |digest: &str, reason: String| ImageError::LayerPull {
+            digest: digest.to_string(),
+            reason,
+        };
+        // Layers already held, re-verified: a corrupt one is removed and
+        // returns its bytes to the budget before the room check below.
+        let mut missing = Vec::new();
         for layer in &manifest.layers {
             let digest = &layer.digest;
-            let blob_path = self.blob_path(digest);
-            let expected_size = u64::try_from(layer.size).map_err(|_| ImageError::LayerPull {
-                digest: digest.clone(),
-                reason: "negative layer size".into(),
-            })?;
-            let verify_size = |actual: u64| -> Result<(), ImageError> {
-                if actual != expected_size {
-                    return Err(ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: format!(
-                            "layer size mismatch: expected {expected_size}, received {actual}"
-                        ),
-                    });
-                }
-                Ok(())
-            };
-            let store = self.blob_store.get().cloned().unwrap_or_else(|| {
-                std::sync::Arc::new(crate::pickle::store::BlobStore::new(
-                    self.store_root.clone(),
-                ))
-            });
-            let expected = crate::pickle::types::Digest::new(digest).map_err(|error| {
-                ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
+            let expected = crate::pickle::types::Digest::new(digest)
+                .map_err(|error| layer_error(digest, error.to_string()))?;
             let cached_store = store.clone();
-            let cached_digest = expected.clone();
             let cached =
-                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&cached_digest))
+                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&expected))
                     .await
-                    .map_err(|error| ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: error.to_string(),
-                    })?
-                    .map_err(|error| ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: error.to_string(),
-                    })?;
+                    .map_err(|error| layer_error(digest, error.to_string()))?
+                    .map_err(|error| layer_error(digest, error.to_string()))?;
             if cached {
-                verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
-                continue;
+                let actual = tokio::fs::metadata(self.blob_path(digest)).await?.len();
+                if u64::try_from(layer.size).ok() != Some(actual) {
+                    return Err(layer_error(
+                        digest,
+                        format!(
+                            "layer size mismatch: expected {}, received {actual}",
+                            layer.size
+                        ),
+                    ));
+                }
+            } else {
+                missing.push(layer);
             }
+        }
 
-            let blob_data = retry_registry_read(super::oci_pull::LAYER_READ, || async {
-                // A failed transfer may have written a prefix. Each attempt
-                // owns a fresh buffer; no partial bytes reach the cache.
-                let mut blob_data = Vec::new();
-                client.pull_blob(&oci_ref, layer, &mut blob_data).await?;
-                Ok(blob_data)
-            })
-            .await
-            .map_err(|e| ImageError::LayerPull {
-                digest: digest.clone(),
-                reason: e.to_string(),
-            })?;
+        // The manifest says how much the missing layers need. Refuse an image
+        // that can't fit before asking for a single byte of it (#2424).
+        // check_layer_sizes already refused negative sizes and overflow.
+        let needed = missing
+            .iter()
+            .map(|layer| layer.size.max(0) as u64)
+            .sum::<u64>();
+        super::oci_pull::check_room(&store, &image_ref.full_reference(), needed).map_err(
+            |error| ImageError::LayerPull {
+                digest: image_ref.full_reference(),
+                reason: error.to_string(),
+            },
+        )?;
 
-            // Verify the SHA-256 digest
-            let computed = format!("sha256:{}", sha256_hex(&blob_data));
-            if computed != *digest {
-                return Err(ImageError::DigestMismatch {
-                    digest: digest.clone(),
-                    expected: digest.clone(),
-                    actual: computed,
-                });
-            }
-
-            verify_size(blob_data.len() as u64)?;
-
-            // Write atomically (temp + rename) so a crash mid-write can't leave
-            // a truncated blob at the final path that a later pull treats as a
-            // valid cache hit (M3). Warm and cold paths both verify the
-            // digest through the shared store before use. Publication syncs
-            // the payload and each required ancestor directory entry.
-            tokio::task::spawn_blocking(move || store.write_blob(&blob_data, &expected))
+        // Each layer streams to an upload file while it is hashed, and is
+        // published only once its digest and size match the manifest.
+        for layer in missing {
+            super::oci_pull::pull_layer_to_store(&client, &oci_ref, layer, &store)
                 .await
-                .map_err(|e| ImageError::UnpackFailed {
-                    digest: digest.clone(),
-                    reason: e.to_string(),
-                })?
-                .map_err(|error| ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: error.to_string(),
-                })?;
+                .map_err(|error| layer_error(&layer.digest, error.to_string()))?;
         }
         Ok((manifest.layers, config))
     }
@@ -2561,7 +2531,16 @@ mod tests {
         remaining: Arc<AtomicUsize>,
         delay: std::time::Duration,
         received: Arc<tokio::sync::Notify>,
+        /// Send the body in [`TRICKLE_PIECES`] pieces this far apart,
+        /// instead of the fault's status.
+        trickle: Option<std::time::Duration>,
+        /// A disconnect sends a true prefix of the body, and the layer
+        /// honours `Range: bytes=N-` requests, as a CDN-backed registry does.
+        resumable: bool,
     }
+
+    /// How many pieces a trickled body arrives in.
+    const TRICKLE_PIECES: usize = 5;
 
     fn registry_fault(
         layer: bool,
@@ -2581,6 +2560,8 @@ mod tests {
             remaining: Arc::new(AtomicUsize::new(count)),
             delay: std::time::Duration::ZERO,
             received: Arc::new(tokio::sync::Notify::new()),
+            trickle: None,
+            resumable: false,
         }
     }
 
@@ -2609,6 +2590,8 @@ mod tests {
         layer_path: String,
         layer: Vec<u8>,
         layer_requests: Arc<AtomicUsize>,
+        /// Layer requests answered with part of the layer.
+        ranged_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
         /// Every request the registry answers, the version check included.
         requests: Arc<AtomicUsize>,
@@ -2618,6 +2601,7 @@ mod tests {
     struct RegistryFixture {
         reference: String,
         layer_requests: Arc<AtomicUsize>,
+        ranged_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
         /// The manifest fault's remaining count, when there is one.
@@ -2675,11 +2659,42 @@ mod tests {
         {
             fault.received.notify_one();
             tokio::time::sleep(fault.delay).await;
+            if let Some(gap) = fault.trickle {
+                use futures_util::StreamExt;
+                let body = match fault.target {
+                    RegistryFaultTarget::Layer => state.layer.clone(),
+                    RegistryFaultTarget::Manifest => state.manifest.clone(),
+                    RegistryFaultTarget::Configuration => state.config.clone(),
+                };
+                let length = body.len();
+                let piece = length.div_ceil(TRICKLE_PIECES);
+                let pieces: Vec<axum::body::Bytes> = body
+                    .chunks(piece)
+                    .map(axum::body::Bytes::copy_from_slice)
+                    .collect();
+                let stream = futures_util::stream::iter(pieces.into_iter().enumerate()).then(
+                    move |(index, piece)| async move {
+                        if index > 0 {
+                            tokio::time::sleep(gap).await;
+                        }
+                        Ok::<_, std::io::Error>(piece)
+                    },
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, length)
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+            }
             if fault.disconnect {
                 use futures_util::StreamExt;
-                let prefix = futures_util::stream::once(async {
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial response"))
-                });
+                let prefix = if fault.resumable {
+                    axum::body::Bytes::copy_from_slice(&state.layer[..16])
+                } else {
+                    axum::body::Bytes::from_static(b"partial response")
+                };
+                let prefix =
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(prefix) });
                 let failure = futures_util::stream::once(async {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     Err::<axum::body::Bytes, _>(std::io::Error::new(
@@ -2697,6 +2712,35 @@ mod tests {
                 .status(fault.status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::json!({"errors": [{"code": fault.code, "message": "injected registry failure"}]}).to_string()))
+                .unwrap();
+        }
+
+        let resumable = state.fault.as_ref().is_some_and(|fault| fault.resumable);
+        let range_start = request
+            .headers()
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.strip_suffix('-'))
+            .and_then(|value| value.parse::<usize>().ok());
+        if path == state.layer_path
+            && resumable
+            && let Some(start) = range_start
+        {
+            state.ranged_requests.fetch_add(1, Ordering::SeqCst);
+            let rest = state.layer[start..].to_vec();
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!(
+                        "bytes {start}-{}/{}",
+                        state.layer.len() - 1,
+                        state.layer.len()
+                    ),
+                )
+                .header(header::CONTENT_LENGTH, rest.len())
+                .body(Body::from(rest))
                 .unwrap();
         }
 
@@ -2817,6 +2861,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
+        let ranged_requests = Arc::new(AtomicUsize::new(0));
         let manifest_requests = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
         let fault_remaining = fault.as_ref().map(|fault| Arc::clone(&fault.remaining));
@@ -2829,6 +2874,7 @@ mod tests {
             layer_path: format!("/v2/fixture/blobs/{layer_digest}"),
             layer,
             layer_requests: Arc::clone(&layer_requests),
+            ranged_requests: Arc::clone(&ranged_requests),
             manifest_requests: Arc::clone(&manifest_requests),
             requests: Arc::clone(&requests),
             fault,
@@ -2898,6 +2944,7 @@ mod tests {
         RegistryFixture {
             reference: format!("{address}/fixture@{root_digest}"),
             layer_requests,
+            ranged_requests,
             manifest_requests,
             requests,
             fault_remaining,
@@ -3192,25 +3239,66 @@ mod tests {
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
     }
 
+    /// #2424: a layer that breaks off part way is resumed from the bytes
+    /// already received when the registry honours a range request.
+    #[tokio::test]
+    async fn an_interrupted_layer_resumes_from_the_bytes_it_has() {
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        fault.resumable = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.ranged_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A layer streamed into the cache that breaks off is asked for again.
+    /// The fixture ignores the range request and sends the whole blob, so
+    /// the partial upload starts over: the junk prefix the broken response
+    /// carried never reaches the published blob.
+    #[tokio::test]
+    async fn pull_through_registry_restarts_an_interrupted_layer_the_registry_will_not_resume() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let layer = upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        upstream
+            .store_blob(&reference, &layer, &store)
+            .await
+            .unwrap();
+        assert!(store.revalidate_blob(&layer.digest).unwrap());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        let uploads = std::fs::read_dir(directory.path().join("uploads")).unwrap();
+        assert_eq!(uploads.count(), 0, "no partial upload is left behind");
+    }
+
     /// Let one stalled request hit its per-attempt ceiling in simulated time,
     /// then return to real time so the retry reaches the real HTTP fixture.
-    async fn expire_stalled_attempt(
-        received: &tokio::sync::Notify,
-        budget: super::super::oci_pull::RegistryReadBudget,
-    ) {
+    async fn expire_stalled_attempt(received: &tokio::sync::Notify, ceiling: std::time::Duration) {
         tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
             .await
             .unwrap();
         // Pause only after the real HTTP server receives the request, so
         // simulated time cannot race socket readiness during setup.
         tokio::time::pause();
-        tokio::time::advance(budget.attempt + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(ceiling + std::time::Duration::from_secs(1)).await;
         tokio::time::resume();
     }
 
     #[tokio::test]
     async fn pull_through_registry_retries_a_stalled_read() {
-        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        use super::super::oci_pull::{LAYER_IDLE, METADATA_READ};
         use crate::pickle::upstream::UpstreamRegistry;
         for mode in ["head", "manifest", "layer"] {
             let mut fault = registry_fault(
@@ -3229,22 +3317,27 @@ mod tests {
             } else {
                 None
             };
+            let directory = tempfile::tempdir().unwrap();
+            let store = crate::pickle::store::BlobStore::new(directory.path());
             let read = tokio::spawn(async move {
                 match mode {
                     "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
                     "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
-                    _ => upstream
-                        .fetch_blob(&reference, &layer.unwrap())
-                        .await
-                        .map(|_| ()),
+                    _ => {
+                        upstream
+                            .store_blob(&reference, &layer.unwrap(), &store)
+                            .await
+                    }
                 }
             });
-            let budget = if mode == "layer" {
-                LAYER_READ
+            // A layer attempt ends when no bytes arrive for the idle
+            // deadline; a metadata attempt has a ceiling of its own.
+            let ceiling = if mode == "layer" {
+                LAYER_IDLE
             } else {
-                METADATA_READ
+                METADATA_READ.attempt
             };
-            expire_stalled_attempt(&received, budget).await;
+            expire_stalled_attempt(&received, ceiling).await;
             tokio::time::timeout(std::time::Duration::from_secs(10), read)
                 .await
                 .expect("the retry never completed")
@@ -3436,7 +3529,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_stalled_manifest_and_layer_reads_are_retried() {
-        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        use super::super::oci_pull::{LAYER_IDLE, METADATA_READ};
         for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
             let layer = matches!(target, RegistryFaultTarget::Layer);
             let mut fault =
@@ -3448,7 +3541,15 @@ mod tests {
             let store = ImageStore::new(tmp.path().to_path_buf());
             let reference = fixture.reference.clone();
             let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
-            expire_stalled_attempt(&received, if layer { LAYER_READ } else { METADATA_READ }).await;
+            expire_stalled_attempt(
+                &received,
+                if layer {
+                    LAYER_IDLE
+                } else {
+                    METADATA_READ.attempt
+                },
+            )
+            .await;
             // The retry backs off for 1 to 1.25 s, reconnects, reads again
             // and unpacks with fsyncs. Beside F_FULLFSYNC writers and CPU
             // spinners that took 3 to 6 s, and once on a loaded host past
@@ -3529,6 +3630,121 @@ mod tests {
         assert!(!registry.base_dir().join("blobs/sha256").exists());
         let reference = ImageReference::parse(&fixture.reference).unwrap();
         assert!(!image.rootfs_path(&reference).exists());
+    }
+
+    /// #2424: the manifest says how big the layers are, so a pull that can't
+    /// fit under the storage ceiling is refused before any layer request.
+    #[tokio::test]
+    async fn a_layer_larger_than_the_storage_ceiling_is_refused_before_it_is_downloaded() {
+        let fixture = start_registry_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let registry = std::sync::Arc::new(crate::pickle::store::BlobStore::new(directory.path()));
+        registry.configure_storage_limit(1).await.unwrap();
+        let image = ImageStore::new(directory.path().to_path_buf());
+        image.set_blob_store(registry.clone()).unwrap();
+        let error = image.pull_and_unpack(&fixture.reference).await.unwrap_err();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0, "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("physical image storage quota exceeded"),
+            "{message}"
+        );
+        assert!(message.contains("1 byte"), "{message}");
+    }
+
+    /// The same refusal on the pull-through path: the layer is not requested.
+    #[tokio::test]
+    async fn a_pull_through_layer_larger_than_the_storage_ceiling_is_refused_before_it_is_downloaded()
+     {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture().await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        store.configure_storage_limit(1).await.unwrap();
+        let error = upstream
+            .store_blob(&reference, &manifest.layers[0], &store)
+            .await
+            .unwrap_err();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0, "{error}");
+        assert!(store.list_blobs().unwrap().is_empty());
+    }
+
+    /// Let a trickled layer arrive one piece at a time, each gap inside the
+    /// idle deadline but all of them past the old 120 s ceiling on a whole
+    /// attempt, then return to real time.
+    async fn trickle_past_the_old_attempt_ceiling(received: &tokio::sync::Notify) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // One advance per piece, the first included: hyper may hold the
+        // first piece until the stream is polled again.
+        for _ in 0..TRICKLE_PIECES {
+            tokio::time::pause();
+            tokio::time::advance(TRICKLE_GAP).await;
+            tokio::time::resume();
+            // Real time for the piece to cross the socket before the next gap.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 40 s between pieces: inside the 60 s idle deadline, and the five
+    /// advances take 200 s, past the 120 s a whole attempt used to get.
+    const TRICKLE_GAP: std::time::Duration = std::time::Duration::from_secs(40);
+
+    /// #2424: a slow layer that keeps arriving is not abandoned and
+    /// requested again from byte 0.
+    #[tokio::test]
+    async fn a_layer_that_keeps_arriving_past_the_attempt_deadline_is_not_abandoned() {
+        let mut fault = registry_fault(true, StatusCode::OK, "UNUSED", 1);
+        fault.trickle = Some(TRICKLE_GAP);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let reference = fixture.reference.clone();
+        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+        trickle_past_the_old_attempt_ceiling(&received).await;
+        let pulled = tokio::time::timeout(std::time::Duration::from_secs(30), pull)
+            .await
+            .expect("the pull never completed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// The same on the pull-through path.
+    #[tokio::test]
+    async fn a_pull_through_layer_that_keeps_arriving_past_the_attempt_deadline_is_not_abandoned() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNUSED", 1);
+        fault.trickle = Some(TRICKLE_GAP);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let layer = upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        let read = {
+            let store = store.clone();
+            let layer = layer.clone();
+            tokio::spawn(async move { upstream.store_blob(&reference, &layer, &store).await })
+        };
+        trickle_past_the_old_attempt_ceiling(&received).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), read)
+            .await
+            .expect("the read never completed")
+            .unwrap()
+            .unwrap();
+        assert!(store.revalidate_blob(&layer.digest).unwrap());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

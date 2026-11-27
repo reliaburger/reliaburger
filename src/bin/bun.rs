@@ -3706,7 +3706,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             )),
             pull_through: config.images.pull_through,
             cache_recheck_secs: config.images.cache_recheck_secs,
-            fill_lock: tokio::sync::Mutex::new(()),
+            fill_locks: Default::default(),
         });
         if let Some(source) = &signature_source {
             source.use_cache(cluster_source.clone());

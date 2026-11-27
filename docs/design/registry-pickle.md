@@ -793,7 +793,18 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
 
 1. **First request.** Bun checks the local store and the cluster peer location map. On a cluster-wide miss:
    - Authenticate to the external registry using credentials from `[images] external_registries` (the `password_secret` names an environment variable resolved once at startup — see §8.3).
-   - Pull the manifest and layers from the upstream registry.
+   - Pull the manifest and layers from the upstream registry. Each layer
+     streams into an upload file while it's hashed and is published only once
+     its digest and size match, so no layer is ever held in memory. The
+     manifest's layer sizes are checked against `max_storage` first, and an
+     image that can't fit is refused before any layer is requested. A layer
+     attempt fails only when no bytes arrive for 60 s; a retry asks for the
+     rest with a `Range` request (starting over when the registry sends the
+     whole blob). All attempts together get six minutes, or the time the
+     layer takes at 64 KiB/s if that's longer. Bun's direct pull does the
+     same (`grill::oci_pull::pull_layer_to_store`).
+   - Fills of one image are serialised by a lock per cached repository and
+     tag (or platform digest); fills of different images run side by side.
    - Store locally and commit the manifest to Raft (same as a regular push); the heal loop replicates to peers afterwards.
 
 2. **Subsequent requests.** Other nodes resolve the image from Raft state and pull layers from peers. The upstream registry is never contacted again until the cached manifest expires or is explicitly refreshed.
@@ -1216,7 +1227,7 @@ Everything here counts **effective holders**: the nodes recorded as holding a bl
 
 **Scenario:** A node's blob store reaches `max_storage`.
 
-**Behaviour:** Every write that would grow it (push chunks, peer copies, pull-through fills, runtime pulls) is refused before writing, with `413` from the registry. GC doesn't run "more aggressively"; it reclaims only what expiry has released.
+**Behaviour:** Every write that would grow it (push chunks, peer copies, pull-through fills, runtime pulls) is refused before writing, with `413` from the registry. Pull-through fills and runtime pulls compare the manifest's layer sizes with the room left before downloading, and fail with `physical image storage quota exceeded: <image> needs N bytes, M bytes remain under [images] max_storage`. GC doesn't run "more aggressively"; it reclaims only what expiry has released.
 
 **Recovery:** Expiry bounds growth: superseded and deleted tags leave after `gc_retain_days`, and the next GC tick frees their blobs. Lower `gc_retain_days`, delete tags you don't need, or raise `max_storage`.
 
