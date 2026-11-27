@@ -1084,6 +1084,14 @@ links a successor. Re-running those loops for the register paid for itself strai
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
 
+The check had a blind spot of its own: it only read rows marked "Open". By November the
+register had 281 rows and not one of them said "Open", so the nightly job checked nothing
+and passed in seconds. A row saying "Not reproduced; recheck if it recurs" needed no issue,
+and so had no owner. Now four words close a row out: Fixed, Not a defect, Infrastructure
+and Superseded. Any other status leaves the flake unresolved, and the row needs an issue
+(#2491). The first run found nine rows that didn't fit, and every one of them was done; they
+had just said so in their own words.
+
 Some flakes are tests that quietly share the machine. The port allocator skips any port
 something on the host already listens on, so a published port never shadows a host daemon.
 Its bookkeeping tests built the allocator the same way, over the fixed range 10000 to 10003,
