@@ -5964,6 +5964,19 @@ when it fails. The last test hands the loop two finished signatures, one for
 a live instance and one for a retired one, and checks that only the live one
 gets files.
 
+The rotation tick had a hole of its own ([#2533](https://github.com/reliaburger/reliaburger/issues/2533)).
+It renewed an identity past its rotation time, and every failed signing was
+tried again on the next tick, until the certificate's hour ran out. From then
+on the tick saw `Expired`, logged a warning and asked for nothing. A council
+outage longer than the certificate's remaining life left the workload's mTLS
+broken until the instance restarted, even after the council came back. The
+`match` on the rotation state now has one arm that skips, `Valid`; every other
+state, expired included, falls through to the same renewal request, and the
+expired one still logs its warning. The test lets a certificate expire while
+the "leader" hangs up on every CSR, checks that each tick tries again, then
+hands the loop a signature and checks the identity is valid again, with no
+restart.
+
 The third was status itself. Every `Status` command asks the runtime for each
 instance's pid and exit code, and runc answers both under the instance's
 lifecycle lock. A create that's pulling a slow image, or a stop waiting out

@@ -14232,6 +14232,90 @@ async fn identity_rotation_does_not_wait_for_the_leader() {
     assert_eq!(agent.identity_signings.len(), 1);
 }
 
+/// #2533: a workload certificate that expired while the council couldn't
+/// sign is renewed on the normal rotation tick once the signer answers,
+/// not only when the instance restarts. The tick used to log a warning
+/// for an expired identity and never try again.
+#[tokio::test]
+async fn expired_identity_is_renewed_once_the_signer_answers_again() {
+    // The leader hangs up on every CSR: the council can't sign.
+    let mut agent = follower_agent(false).await;
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+        agent.finish_identity_provision(outcome).await;
+    }
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    // The certificate's life ran out during the outage.
+    let mut expired = write_test_identity(volumes.path(), &id.0);
+    let now = SystemTime::now();
+    expired.next_rotation = now - std::time::Duration::from_secs(3600);
+    expired.expires_at = now - std::time::Duration::from_secs(1);
+    agent.supervisor.get_instance_mut(&id).unwrap().identity = Some(expired);
+
+    // While the outage lasts, every tick tries again and fails.
+    for _ in 0..2 {
+        agent.check_identity_rotation();
+        assert_eq!(
+            agent.identity_signings.len(),
+            1,
+            "the rotation tick didn't try to renew an expired identity"
+        );
+        while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+            agent.finish_identity_provision(outcome).await;
+        }
+        let identity = agent.supervisor.get_instance(&id).unwrap().identity.clone();
+        assert_eq!(
+            crate::sesame::identity::rotation_state(&identity.unwrap(), SystemTime::now()),
+            crate::sesame::identity::RotationState::Expired
+        );
+    }
+
+    // The signer is back: the next tick's signing comes back signed.
+    agent.check_identity_rotation();
+    assert_eq!(agent.identity_signings.len(), 1);
+    agent.abandon_identity_signings();
+    let issued = write_test_identity(volumes.path(), "scratch");
+    let result = super::identity_signing::SignedIdentity::for_test(
+        issued.spiffe_uri.clone(),
+        issued.private_key_der.clone(),
+        Ok(crate::cluster::workload_identity::SignedWorkload {
+            cert_der: issued.certificate_der.clone(),
+            workload_ca_cert_der: vec![1],
+            root_ca_cert_der: vec![2],
+            ca_bundle_der: vec![vec![1], vec![2]],
+            jwt_token: Some("renewed-jwt".into()),
+            api_jwt_token: Some("renewed-api-jwt".into()),
+        }),
+    );
+    let task = agent
+        .identity_signing_tasks
+        .spawn(async move { result })
+        .id();
+    agent.identity_signings.insert(
+        task,
+        super::identity_signing::IdentitySigning::for_test(id.clone()),
+    );
+    while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+        agent.finish_identity_provision(outcome).await;
+    }
+
+    let renewed = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .identity
+        .clone()
+        .unwrap();
+    assert_eq!(renewed.jwt_token, "renewed-jwt");
+    assert_eq!(
+        crate::sesame::identity::rotation_state(&renewed, SystemTime::now()),
+        crate::sesame::identity::RotationState::Valid
+    );
+}
+
 /// A deploy and the rotation tick asking for the same instance share one
 /// CSR, and both are answered when it finishes, even when it fails.
 #[tokio::test]

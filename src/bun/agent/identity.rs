@@ -128,29 +128,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 continue;
             };
-            let state = crate::sesame::identity::rotation_state(identity, now);
-            match state {
-                crate::sesame::identity::RotationState::NeedsRotation => {
-                    needs_rotation.push((
-                        inst.id.clone(),
-                        inst.app_name.clone(),
-                        inst.namespace.clone(),
-                    ));
-                }
+            // An expired or grace-period identity is renewed like any
+            // other that is due: a certificate that ran out while the
+            // council couldn't sign comes back on the first tick after the
+            // signer answers, not only when the instance restarts (#2533).
+            match crate::sesame::identity::rotation_state(identity, now) {
+                crate::sesame::identity::RotationState::Valid => continue,
+                crate::sesame::identity::RotationState::NeedsRotation => {}
                 crate::sesame::identity::RotationState::Expired => {
                     eprintln!(
-                        "warning: identity expired for {} ({})",
+                        "warning: identity expired for {} ({}); renewing",
                         inst.id.0, inst.app_name
                     );
                 }
                 crate::sesame::identity::RotationState::GracePeriod => {
                     eprintln!(
-                        "warning: identity in grace period for {} ({})",
+                        "warning: identity in grace period for {} ({}); renewing",
                         inst.id.0, inst.app_name
                     );
                 }
-                crate::sesame::identity::RotationState::Valid => {}
             }
+            needs_rotation.push((
+                inst.id.clone(),
+                inst.app_name.clone(),
+                inst.namespace.clone(),
+            ));
         }
 
         // Only start the signings here: they finish on the loop when their

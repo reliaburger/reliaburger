@@ -962,6 +962,7 @@ Bun on each worker node maintains a rotation schedule for every running workload
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
 7. **Grace period.** If the CSR fails because the council is unreachable, Bun keeps the current certificate and extends its local validity window by up to 4 additional hours (configurable). The extension is logged as a security event, `relish wtf` warns about it, and an alert fires.
+8. **Retry until renewed.** A failed CSR is tried again on the next rotation tick (every second, one signing per instance in flight). That includes a certificate that has already expired: Bun keeps asking, so one that ran out during a council outage is renewed as soon as a leader signs again, without restarting the instance (#2533).
 
 **Host-side layout.** The mount source is a per-*instance* directory, `{volumes}/.identity/{instance_id}` — never shared between replicas of the same app, so no replica can overwrite another's private key. Bun prepares the directory before the container is created (it is the bind-mount source); on Linux, running as root, it is backed by a dedicated size-bounded tmpfs (`mode=0700`) so key material never touches persistent storage, and the key/token files are chowned to the container's runtime UID. On other platforms it is a plain `0700` directory (documented gap). The directory is removed — and the tmpfs unmounted — when the instance stops, is replaced by a rolling deploy, or is rolled back.
 
@@ -1840,6 +1841,7 @@ council_size = 3
 - Running workloads continue operating with their current certificates.
 - When a workload's certificate approaches expiry (after the normal 1-hour lifetime), Bun activates the grace period extension, extending local validity by up to 4 hours (configurable).
 - Total window before mTLS breaks: 5 hours (1-hour cert lifetime + 4-hour grace).
+- A certificate that expires during the outage stays expired until a leader signs again; Bun retries its CSR every rotation tick and installs the new certificate as soon as one comes back, with no restart.
 - New workloads that start during the outage cannot receive identity certificates. They wait for council availability.
 - Grace-extended certificates are flagged in the local event log. `relish wtf` warns about them. An alert fires.
 
