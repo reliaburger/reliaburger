@@ -630,7 +630,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 1. Wrapper validates the `Sec-WebSocket-Key` header is present.
 2. Wrapper selects a backend from the pool (same algorithm as HTTP).
 3. Wrapper forwards the upgrade request to the backend.
-4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
+4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing). Any other final status (a `401`, `403`, `429`, a redirect) is relayed to the client with its end-to-end headers and up to 64 KiB of its body, read within what is left of the 30 s handshake deadline (#2470). A connect failure, a handshake timeout, an unparsable head or another `1xx` status gets `502`.
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
 6. WebSocket connections are long-lived. At a drain deadline the splice sends the client a Close 1001 (Going Away) frame, then closes both sockets (§5.5).
 

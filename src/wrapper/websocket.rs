@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 /// Cap on the backend's handshake response head we buffer before giving up.
 const MAX_HANDSHAKE_HEAD: usize = 16 * 1024;
 
+/// Most of a refused upgrade's body we relay to the client (#2470).
+const MAX_REFUSAL_BODY: usize = 64 * 1024;
+
 /// Deadline for the backend WebSocket handshake (connect + request + response
 /// head). Bounds a backend that accepts TCP but never completes the handshake,
 /// so it can't pin the handler, its permit, and the drain guard forever (M16).
@@ -53,8 +56,10 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 /// Forwards the backend's own `101` response (including its
 /// `Sec-WebSocket-Accept` header) to the client, then splices the client's
 /// upgraded connection to the backend socket with
-/// [`tokio::io::copy_bidirectional`]. Returns `502 Bad Gateway` if the
-/// backend refuses the upgrade or the connection fails.
+/// [`tokio::io::copy_bidirectional`]. A backend that answers with a final
+/// status other than 101 has its answer relayed, body bounded (#2470).
+/// Returns `502 Bad Gateway` if the connection fails, the handshake times
+/// out, or the answer isn't a well-formed HTTP head.
 ///
 /// `permit` is the proxy's connection permit and `drain_guard` the optional
 /// drain accounting guard. Both are `Box<dyn Any>` so the WebSocket module
@@ -80,6 +85,7 @@ pub async fn handle_websocket_upgrade(
     // handler, its connection permit, and the drain guard indefinitely — the
     // 30s reqwest timeout only covers the non-WS path.
     let upgrade_request = build_upgrade_request(&req, view);
+    let started = tokio::time::Instant::now();
     let handshake = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
         let mut backend_stream = TcpStream::connect(backend).await.ok()?;
         backend_stream
@@ -105,8 +111,16 @@ pub async fn handle_websocket_upgrade(
     let Some(handshake) = parse_handshake(&head) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    if !handshake.is_switching_protocols {
-        return StatusCode::BAD_GATEWAY.into_response();
+    if handshake.status != StatusCode::SWITCHING_PROTOCOLS {
+        // A backend that refuses the upgrade (401, 403, 429, a redirect to
+        // a login page) made an application decision: relay it, so the
+        // client doesn't retry what looks like a gateway fault (#2470). An
+        // informational status other than 101 is a broken handshake.
+        if handshake.status.is_informational() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let deadline = started + WS_HANDSHAKE_TIMEOUT;
+        return relay_refusal(handshake, leftover, backend_stream, deadline).await;
     }
 
     // Rebuild the backend's 101 for the client, carrying its handshake
@@ -166,18 +180,82 @@ pub async fn handle_websocket_upgrade(
 
 /// The parsed backend handshake response.
 struct Handshake {
-    is_switching_protocols: bool,
+    status: StatusCode,
     headers: Vec<(String, String)>,
 }
 
-/// Parse a raw HTTP/1.1 response head into its status and end-to-end headers.
+/// Turn a backend's refusal of an upgrade into the client's response: its
+/// status and end-to-end headers, and its body, bounded by
+/// [`MAX_REFUSAL_BODY`] and by what is left of the handshake deadline. This
+/// path holds a request permit and a drain count, so it must not wait long.
 ///
-/// Drops hop-by-hop framing headers we regenerate (`Connection`/`Upgrade` are
-/// kept — they're part of the WebSocket handshake the client must see).
+/// The body is the `Content-Length` bytes the backend declared, or what it
+/// sends before closing. A chunked body isn't decoded: the client gets the
+/// status and headers with an empty body.
+async fn relay_refusal(
+    handshake: Handshake,
+    leftover: Vec<u8>,
+    mut backend_stream: TcpStream,
+    deadline: tokio::time::Instant,
+) -> Response {
+    let header = |name: &str| {
+        handshake
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let chunked = header("transfer-encoding").is_some();
+    let declared = header("content-length").and_then(|value| value.parse::<usize>().ok());
+    let want = declared.unwrap_or(MAX_REFUSAL_BODY).min(MAX_REFUSAL_BODY);
+    let mut body = leftover;
+    if chunked {
+        body.clear();
+    } else {
+        let mut chunk = [0u8; 4096];
+        while body.len() < want {
+            match tokio::time::timeout_at(deadline, backend_stream.read(&mut chunk)).await {
+                Ok(Ok(n)) if n > 0 => body.extend_from_slice(&chunk[..n]),
+                _ => break,
+            }
+        }
+        body.truncate(want);
+    }
+
+    let mut connection_tokens = std::collections::HashSet::new();
+    if let Some(value) = header("connection") {
+        for token in value.split(',') {
+            connection_tokens.insert(token.trim().to_ascii_lowercase());
+        }
+    }
+    let mut builder = Response::builder().status(handshake.status);
+    for (name, value) in &handshake.headers {
+        let lower = name.to_ascii_lowercase();
+        if super::proxy::is_hop_by_hop(&lower)
+            || connection_tokens.contains(&lower)
+            || lower == "content-length"
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Parse a raw HTTP/1.1 response head into its status and headers.
+///
+/// `None` when the status line has no three-digit status code.
 fn parse_handshake(head: &str) -> Option<Handshake> {
     let mut lines = head.split("\r\n");
     let status_line = lines.next()?;
-    let is_switching_protocols = status_line.starts_with("HTTP/1.1 101");
+    let code = status_line
+        .strip_prefix("HTTP/1.")?
+        .split(' ')
+        .nth(1)
+        .filter(|code| code.len() == 3)?;
+    let status = StatusCode::from_u16(code.parse().ok()?).ok()?;
 
     let mut headers = Vec::new();
     for line in lines {
@@ -187,10 +265,7 @@ fn parse_handshake(head: &str) -> Option<Handshake> {
         let (name, value) = line.split_once(':')?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    Some(Handshake {
-        is_switching_protocols,
-        headers,
-    })
+    Some(Handshake { status, headers })
 }
 
 /// Read from `stream` until the end of the HTTP head (`\r\n\r\n`).
@@ -383,6 +458,22 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(is_websocket_upgrade(&req));
+    }
+
+    /// #2470: the parsed handshake keeps the backend's status, so a refusal
+    /// can be relayed rather than turned into 502.
+    #[test]
+    fn parse_handshake_reports_the_backends_status() {
+        let refused = parse_handshake("HTTP/1.1 403 Forbidden\r\nX-Reason: no\r\n\r\n").unwrap();
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused.headers,
+            vec![("X-Reason".to_string(), "no".to_string())]
+        );
+        let switching = parse_handshake("HTTP/1.1 101 Switching Protocols\r\n\r\n").unwrap();
+        assert_eq!(switching.status, StatusCode::SWITCHING_PROTOCOLS);
+        assert!(parse_handshake("HTTP/1.1 abc Nope\r\n\r\n").is_none());
+        assert!(parse_handshake("garbage\r\n\r\n").is_none());
     }
 
     #[test]
