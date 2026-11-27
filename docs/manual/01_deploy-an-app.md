@@ -92,7 +92,9 @@ initial_delay = 0         # seconds before the first probe (default 0)
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
 interval, timeout or threshold, an `interval` or `initial_delay` over a day
-(86400 seconds), and a `timeout` longer than the `interval`. Leave `timeout` out and it's 5 seconds or the interval,
+(86400 seconds), a `timeout` longer than the `interval`, and a `path` that
+doesn't start with a single `/` or that holds whitespace or a control
+character. A query string is fine: `path = "/healthz?full=1"`. Leave `timeout` out and it's 5 seconds or the interval,
 whichever is shorter, so `interval = 2` on its own is fine.
 
 A new instance that crashes before its first passing probe is restarted at

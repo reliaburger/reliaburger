@@ -534,11 +534,8 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             Some(0) => return Err(metrics_error("port must not be 0".to_string())),
             Some(_) => {}
         }
-        if !metrics.path.starts_with('/') || metrics.path.contains(char::is_whitespace) {
-            return Err(metrics_error(format!(
-                "path {:?} must start with '/' and contain no whitespace",
-                metrics.path
-            )));
+        if let Err(reason) = check_http_path(&metrics.path) {
+            return Err(metrics_error(reason));
         }
     }
 
@@ -843,6 +840,12 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
             "no port to probe: set health.port or the app's port".to_string(),
         ));
     }
+    // The probe URL is the instance's address followed by this path, so a
+    // path starting with `@` or `//` would move the probe to another host
+    // (#2401).
+    if let Err(reason) = check_http_path(&health.path) {
+        return Err(refuse("health.path", reason));
+    }
     let zero = [
         ("health.interval", health.interval == Some(0)),
         ("health.timeout", health.timeout == Some(0)),
@@ -882,6 +885,23 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
         return Err(refuse(
             "health.timeout",
             format!("timeout ({timeout}s) must not be longer than interval ({interval}s)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check a path Bun appends to an instance's `host:port` to build a probe
+/// or scrape URL: it starts with one `/` and holds no whitespace or control
+/// character, so it can't end the URL's authority early or name another
+/// host. A query string after it is fine.
+pub(crate) fn check_http_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "path {path:?} must start with '/' (not '//') and contain no whitespace or \
+             control characters"
         ));
     }
     Ok(())
@@ -3278,6 +3298,32 @@ exec = "/usr/bin/python3""#,
             "threshold_healthy",
         ] {
             assert_app_refused(&format!("{health}\n{field} = 0"), field);
+        }
+    }
+
+    #[test]
+    fn health_path_must_be_absolute_without_whitespace() {
+        // A path that starts with `@` turns the probe URL's host into one
+        // the app's author chose (#2401).
+        for path in [
+            "@169.254.169.254/latest/",
+            "healthz",
+            "/health z",
+            "/a\nb",
+            "//169.254.169.254/latest/",
+            "/a\u{7f}b",
+        ] {
+            let quoted = toml::Value::String(path.to_string()).to_string();
+            assert_app_refused(
+                &format!("image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = {quoted}"),
+                "health.path",
+            );
+        }
+        for path in ["/", "/healthz", "/healthz?full=1", "/a@b"] {
+            validate_app_toml(&format!(
+                "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = {path:?}"
+            ))
+            .unwrap();
         }
     }
 
