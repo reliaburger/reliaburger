@@ -6,6 +6,48 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use super::UpgradeError;
+use super::version::BinaryVersion;
+
+/// What `bun --compatibility` prints: the formats it speaks and, from 0.3.4,
+/// the version it is (#2403).
+///
+/// The signatures cover a binary's bytes, not its version label, so the
+/// label a directive carries (a file name, a metadata key) proves nothing
+/// about what the bytes are. The bytes say it themselves. A release from
+/// before this field prints no `version`.
+///
+/// It's a separate struct rather than a field on
+/// [`crate::compatibility::Compatibility`], which release metadata stores too.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityAnswer {
+    /// Cluster protocol generation.
+    pub protocol: u32,
+    /// Durable state generation.
+    pub state: u32,
+    /// The version the binary reports, `None` from a release before 0.3.4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<BinaryVersion>,
+}
+
+impl CompatibilityAnswer {
+    /// This binary's answer, as version `version`.
+    pub fn this_binary(version: BinaryVersion) -> Self {
+        Self {
+            protocol: crate::compatibility::CURRENT.protocol,
+            state: crate::compatibility::CURRENT.state,
+            version: Some(version),
+        }
+    }
+
+    /// Just the formats.
+    pub fn formats(&self) -> crate::compatibility::Compatibility {
+        crate::compatibility::Compatibility {
+            protocol: self.protocol,
+            state: self.state,
+        }
+    }
+}
 
 /// How long a candidate has, from launch, to answer `--compatibility`.
 ///
@@ -69,8 +111,9 @@ impl Probe {
 }
 
 /// Run a probe whose bytes were signature-checked before it was handed
-/// over, and check that it reads and writes this build's formats.
-pub(super) async fn query_probe(probe: &Probe) -> Result<(), UpgradeError> {
+/// over, and check that it reads and writes this build's formats. Returns
+/// the version the candidate says it is, if it says.
+pub(super) async fn query_probe(probe: &Probe) -> Result<Option<BinaryVersion>, UpgradeError> {
     query(&probe.0).await
 }
 
@@ -84,7 +127,7 @@ pub(super) async fn discard_probe(probe: Probe) {
 }
 
 /// Ask the executable at `executable` which formats it uses.
-async fn query(executable: &Path) -> Result<(), UpgradeError> {
+async fn query(executable: &Path) -> Result<Option<BinaryVersion>, UpgradeError> {
     let mut command = tokio::process::Command::new(executable);
     command
         .arg("--compatibility")
@@ -123,7 +166,9 @@ async fn launch(mut command: tokio::process::Command) -> Result<Launched, Upgrad
 }
 
 /// Run a prepared compatibility query and check the answer.
-async fn query_with(mut command: tokio::process::Command) -> Result<(), UpgradeError> {
+async fn query_with(
+    mut command: tokio::process::Command,
+) -> Result<Option<BinaryVersion>, UpgradeError> {
     let started = tokio::time::Instant::now();
     let deadline = started + QUERY_DEADLINE;
     let mut progress = QueryProgress::default();
@@ -212,12 +257,12 @@ async fn query_with(mut command: tokio::process::Command) -> Result<(), UpgradeE
             "compatibility query exited {status} ({progress})"
         )));
     }
-    let formats: crate::compatibility::Compatibility =
-        serde_json::from_slice(&output).map_err(|e| {
-            UpgradeError::IncompatibleBinary(format!("invalid compatibility response: {e}"))
-        })?;
+    let answer: CompatibilityAnswer = serde_json::from_slice(&output).map_err(|e| {
+        UpgradeError::IncompatibleBinary(format!("invalid compatibility response: {e}"))
+    })?;
+    let formats = answer.formats();
     if formats == crate::compatibility::CURRENT {
-        Ok(())
+        Ok(answer.version)
     } else {
         Err(UpgradeError::IncompatibleFormats {
             found: formats,

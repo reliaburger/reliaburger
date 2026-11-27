@@ -11,6 +11,10 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
+## [Unreleased] - 0.3.4
+
+Not released yet: this is what the train carries, and it can change before the tag.
+
 ## [0.3.3] - 2026-11-27
 
 Loose ends before outside testers: the bugs they would see first, Buildah on the appliance, the appliance console, and fixes from the Wyse lab. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.3), [release log](docs/release-log.md#033-loose-ends-before-outside-testers).
@@ -670,7 +674,7 @@ The first release: signed binaries, and a managed three-node laptop cluster from
 - Multi-platform images don't run from Pickle.
 - Rootless runc is standalone only.
 
-[Unreleased]: https://github.com/reliaburger/reliaburger/pull/490
+[Unreleased]: https://github.com/reliaburger/reliaburger/pull/2522
 [0.2.8]: https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8
 [0.2.7]: https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7
 [0.2.6]: https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6

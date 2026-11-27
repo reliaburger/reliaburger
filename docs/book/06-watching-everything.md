@@ -457,7 +457,7 @@ if !self.seen_windows.insert(key) {
 }
 ```
 
-`HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
+`HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call. (The key has since grown a third part, the rollup's part number, for minutes too big for one message; [Eyes Everywhere](11-eyes-everywhere.md#the-rollupworker) has that story.)
 
 **Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. That alone left a second bug, which review caught: the renamed file stayed in place while the rows waited, so queries counted them twice until the retry. So the writer removes the file before it reports the failure. A filesystem that can't sync a directory at all answers `EINVAL`, `ENOTSUP` or `ENOSYS`, and that isn't a failed flush: the bytes are synced and there's nothing to retry. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
 
@@ -553,7 +553,57 @@ That property test later timed out at nextest's 60-second limit on a busy Mac (#
 
 The syncs are what make a flush durable, so they stay. The test changed instead. A file layout is the expensive part of a case and a query is the cheap part, so each case now builds its files once and runs all ten query shapes against them, each with its own bounds and names. Thirty-two cases cover every shape against every layout with about an eighth of the flushes. Eight copies at once now take 13 to 15 seconds. Both planted bugs (the `a + 2` one above, and pruning a file whose last sample equals the lower bound) still fail on every run. If a test's time goes to waiting for the disk, ask whether each case needs its own files before reaching for a seam that skips the syncs.
 
-What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, still needs room for that answer. Everything else is flat.
+What still grows with history? The list of file names a query starts from, a couple of hundred bytes a file, which is a couple of MiB for a week of one-minute flushes. And a query whose *answer* grows with history, like `/v1/metrics?name=X` with no start, needed room for that answer, until the next section gave every answer a ceiling. Everything else is flat.
+
+### Ten thousand footers
+
+Streaming fixed memory, but not time. Each flush writes one file, a flush runs every minute, and retention keeps seven days, so a node settles at about 10,080 `metrics_NNNNNN.parquet` files. The scan decides whether a file can match from its footer statistics, and to read the footer it has to open the file. So the alert check, asking every 30 seconds for the last two minutes, opened ten thousand files to read rows from two of them. The rollup worker did the same every minute. On a Wyse 3040's eMMC that's seconds of I/O per query, for ever; on the object-store backend, two ranged GETs per object per query ([#2425](https://github.com/reliaburger/reliaburger/issues/2425)).
+
+The file name doesn't help (it's a counter, not a time), but the file never changes once it's written. That's the property that makes a cache trivially correct: whatever a footer said, it will always say. So each store keeps a `SourceIndex`, a map from file to its `(min, max)` timestamp, behind an `Arc<Mutex<…>>` that the store, every snapshot of it, and the scan's blocking threads share. A flush records the range of the batch it's about to write, so a new file is never opened just to learn its range. Any other file, after a restart say, gets its entry the first time a query reads its footer. Before opening a source, the scan asks the index:
+
+```rust
+if let Some(range) = index.range(&described)
+    && !plan.bounds.admits_times(Some(range.min), Some(range.max))
+{
+    return Ok(Vec::new());
+}
+```
+
+That `if let ... && ...` is the let chain from Chapter 1. Prune deletes a file and forgets its entry, and reads a known file's newest timestamp from the index instead of its footer.
+
+The mutex is `std::sync::Mutex`, not tokio's. The project's rule is that a std mutex is for short synchronous critical sections only, and these are: one `HashMap` lookup or insert, never held across an `.await`, and taken from blocking threads too, where tokio's async lock would be awkward. The test `a_recent_window_query_reads_only_files_that_overlap_it` writes 50 one-minute files and counts footer reads for a one-minute query: at most two, where it used to be fifty. `a_reopened_store_reads_each_footer_once` pins the restart case, `a_recent_window_remote_query_skips_old_objects` the bucket, and `a_pruned_file_leaves_the_index` the cleanup.
+
+What it doesn't fix is the file count. Listing the directory still grows with history, and a query that *wants* a week still opens a week of files. Compacting minute files into hourly ones would bound both, but it changes what's on disk, so it's its own piece of work.
+
+### Every read gets a ceiling
+
+Streaming bounded the memory a query *works* in. It didn't bound what a query *returns*, or how long it runs, and the November 2026 audit found seven read routes where the caller chose both ([#2382](https://github.com/reliaburger/reliaburger/issues/2382)). The commonest was the most innocent: `relish logs web` with no `--tail`. Every node built `SELECT ... FROM logs WHERE app = 'web' ... ORDER BY sequence`, sorted the app's whole history, collected it into a `Vec<LogEntry>` and serialised it. A chatty app with a 2 GiB log store could get Bun killed for memory by anyone allowed to read its logs, and Bun supervises every workload on the node.
+
+The fix is one rule, applied to logs and metrics alike. Every query has a row cap, a maximum, and a deadline, and an answer that hits a cap the caller didn't choose says so.
+
+- A log query with no tail now returns the newest `DEFAULT_LOG_QUERY_ROWS` (10,000) lines; a tail above `MAX_LOG_QUERY_ROWS` (100,000) is clamped. The SQL always carries the `ORDER BY sequence DESC LIMIT n` that `--tail` used to add, which DataFusion runs as a top-k: it keeps n rows and drops the rest as they stream past. The query also runs under the 256 MiB memory pool that `/v1/logs/sql` already had.
+- `/v1/metrics?name=X` and `/v1/metrics/rollup?name=X` keep the newest 10,000 rows, the same newest-first-then-flip trick the per-app query uses.
+- `/v1/metrics/summary` and `/v1/metrics/keys` list the names seen in the last hour (`METRIC_NAMES_WINDOW_SECS`) instead of every name in seven days of files.
+- Every user-driven query runs inside `tokio::time::timeout` with an 8-second deadline, under the fan-out's 10-second wait, so a node says "narrow the query" before the caller gives up on it.
+
+The deadline is a small function, and it's the first place this chapter drops a future on purpose:
+
+```rust
+async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    query: impl std::future::Future<Output = Result<T, KetchupError>>,
+) -> Result<T, KetchupError> {
+    tokio::time::timeout(deadline, query)
+        .await
+        .unwrap_or_else(|_| Err(KetchupError::QueryRejected { /* ... */ }))
+}
+```
+
+`timeout` returns `Err(Elapsed)` if the inner future hasn't finished in time, and then drops it. In Rust, dropping a future *is* cancelling it: a future only makes progress while someone polls it, so once nobody holds it, the DataFusion stream inside stops pulling files. No cancellation token, no flag to check. (A file already being decoded on the blocking pool finishes that one file, and its batches are thrown away.) `impl Future<Output = ...>` in argument position means "any type that is a future yielding this", the same shorthand as `impl Trait` anywhere else, so the function takes an `async` block directly.
+
+A refused query is `KetchupError::QueryRejected` or the new `MayoError::QueryRejected`, which the handlers turn into a 400 with the reason. The caller asked for too much; retrying won't help, narrowing will.
+
+And the cut is visible. When a cross-node log answer reaches the default cap, or a tail was clamped, the result carries `LogQueryWarning::Truncated { limit }`. `relish logs` already prints every warning, so the operator sees "showing the newest 10000 lines; use --since or --tail to choose others" without the CLI changing at all. An explicit `--tail 50` that the answer fills is not a cut: you asked for fifty. The tests pin each piece: `a_query_without_a_tail_returns_at_most_the_default_row_cap`, `a_named_query_returns_at_most_the_row_limit`, `a_named_rollup_query_returns_at_most_the_row_limit`, `a_tail_above_the_maximum_is_refused_or_clamped`, `a_log_query_cut_at_the_default_cap_says_so`, and two deadline tests that hand `within_deadline` a future that never finishes (`std::future::pending()`) and check the refusal arrives in time.
 
 ## Hardening the log path
 
@@ -1413,7 +1463,12 @@ So a drop is now an honest, counted loss. The checkpoint moves on as usual.
 Each log that lost lines gets one marker line, on stderr, where the gap is:
 
 ```rust
-for entry in self.buffer.drain(0..overflow) {
+while self.buffer.len() > row_limit || self.buffer_bytes > byte_limit {
+    let Some(entry) = self.buffer.pop_front() else {
+        break;
+    };
+    overflow += 1;
+    self.buffer_bytes -= entry.size();
     let owner = (entry.app, entry.namespace, entry.instance);
     let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
         count: 0,
@@ -1426,9 +1481,24 @@ for entry in self.buffer.drain(0..overflow) {
 }
 ```
 
-`drain(0..overflow)` removes that range from the vector and hands each
-element over by value, so the loop can move the strings into the map key
-instead of copying them. The marker takes the last dropped line's sequence,
+`pop_front` hands the oldest element over by value, so the loop can move the
+strings into the map key instead of copying them. The first version of this
+loop used `self.buffer.drain(0..overflow)` on a `Vec`, which reads the same
+and hides a cost the audit caught ([#2450](https://github.com/reliaburger/reliaburger/issues/2450)):
+removing from the front of a `Vec` shifts every remaining element down to
+close the gap. At the cap that's one shed line per ingested line, and each
+shed moved a million `BufferedLogEntry`s, about 100 MB of memmove, under the
+write lock, exactly when the node was already struggling to keep up. The
+metrics buffer did the same per sample (64 MB each), and the rollup buffer
+per ingested rollup. All three buffers are now a
+`std::collections::VecDeque`, a ring buffer: it keeps its elements in a
+circular array with a head and a tail index, so pushing at the back and
+popping at the front are both O(1), where a `Vec` is O(n) at the front. The
+caps and what they drop didn't change, only what dropping costs.
+`the_newest_samples_survive_shedding` and its log and rollup twins fill past
+a small cap and check the newest rows are the ones left.
+
+The marker takes the last dropped line's sequence,
 so a query sorts it into the gap. Markers live beside the buffer, not in it,
 so they're never dropped themselves; the next flush writes them as ordinary
 rows reading "3 log lines dropped: the log store fell behind". The store also
@@ -1807,6 +1877,20 @@ let snapshot = store.read().await.snapshot_since(window_start).await;
 ```
 
 The guard that `store.read().await` returns is a temporary, and Rust drops temporaries at the end of the statement that made them. So the lock is released at that semicolon, before the query starts. Taking the lock rather than a `&MayoStore` puts that rule in the function, where a caller can't get it wrong. The snapshot is safe to read without the lock because a published Parquet file never changes; the one thing that can happen meanwhile, retention deleting an old file, could already happen during a locked query, because pruning takes only the read lock too.
+
+That fixed one caller. The audit found nine more doing the same thing: every metrics and log API handler, and the rollup worker, which held the guard through five window queries when backfilling ([#2449](https://github.com/reliaburger/reliaburger/issues/2449)). The log store's writer is the drain, which asks for the write lock once per line, so a slow `relish logs` stalled ingestion too. So the snapshot became the only way to query. `MayoStore::snapshot()` captures the file listing and a copy of the unflushed buffer and returns a `MetricsSnapshot`, and every read (`query`, `query_app`, `query_all`, `metric_names_since`, `query_window_aggregates` and the rest) is a method on the snapshot. `RollupStore::snapshot()` and `LogStore::snapshot()` do the same for rollups and logs. Each handler now starts with the same shape:
+
+```rust
+// One statement: the read guard is dropped before any query runs.
+let store = match mayo.read().await.snapshot().await {
+    Ok(snapshot) => snapshot,
+    Err(error) => return metrics_store_error(error),
+};
+```
+
+Watch out for the version that looks equivalent: `mayo.read().await.query(...).await` in a `match` scrutinee. Temporaries in a `match` scrutinee live until the end of the whole `match`, so that form holds the guard through the query *and* the arms. Splitting the snapshot into its own `let` is what makes the drop happen where you can see it. The store keeps its old query methods as one-line wrappers (`self.snapshot().await?.query(...)`) for callers that own the store outright, like tests and the startup code.
+
+How do you test "doesn't hold a lock"? You make the query wait, and try to write. A test-only `QueryGate` on the store parks every query until the test releases it, after telling the test it has started. `a_metrics_write_is_not_blocked_while_a_rollup_is_generated` starts the rollup worker, waits for its query to reach the gate, and then asks for the write lock with a 200 ms timeout; `the_metrics_query_handler_releases_the_store_before_it_queries` does the same through the HTTP router. Before the change both timed out, because the guard was still held while the query sat at the gate.
 
 Dropping the labels was worse. Node A reports 95% CPU; a second later node B reports 10%. Keep one reading per name and B's healthy number hides A's problem. So an alert is keyed on the rule *and* the series:
 

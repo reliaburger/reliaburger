@@ -1,9 +1,13 @@
 //! Release metadata: what versions exist and where their binaries live.
 //!
 //! Served as a static JSON file from any HTTPS host, selected with the CLI
-//! `relish upgrade check --url` option. Metadata is NOT signed — it travels over TLS and can at
-//! worst lie about what exists; it cannot make a node run anything, because
-//! the per-binary dual signatures gate execution.
+//! `relish upgrade check --url` option. Metadata is NOT signed: it travels
+//! over TLS, and whoever controls the host can list any genuine, signed
+//! binary under any version. The signatures prove the bytes are a release,
+//! not which one. So before a binary is staged, the node asks it which
+//! version it is and refuses one that differs from the label (#2403).
+//! Without that check, a mirror could relabel an old, vulnerable release as
+//! a new one and roll a cluster back.
 
 use std::collections::BTreeMap;
 

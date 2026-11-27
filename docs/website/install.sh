@@ -91,7 +91,10 @@ Reliaburger installs in one of three ways. Pick one and run the installer again:
                   https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md
                     curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
-Netbooting a set of machines into a cluster is planned, but not built yet.
+Netboot installs Reliaburger's own OS on spare machines over the network and
+erases their disks: install the CLI with --install-only, then run
+`relish image download --dir os` and `sudo relish netboot os`. The walkthrough is
+https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md
 
 Until 1.0.0, Reliaburger is good enough for home labs and dev clusters,
 not for production.
@@ -130,7 +133,7 @@ main() {
     exit 2
   fi
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  version=${RELIABURGER_VERSION:-v0.3.2}
+  version=${RELIABURGER_VERSION:-v0.3.3}
   # The character gate rejects newlines, so the grep below sees exactly one line.
   case $version in
     ''|*[!A-Za-z0-9.-]*) fail 'invalid RELIABURGER_VERSION' ;;

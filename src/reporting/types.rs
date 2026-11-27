@@ -480,6 +480,7 @@ mod tests {
         let rollup = NodeRollup {
             node_id: NodeId::new("w1"),
             timestamp: 1000,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: "cpu_usage".to_string(),
                 labels: BTreeMap::new(),

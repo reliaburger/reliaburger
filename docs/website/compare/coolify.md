@@ -8,7 +8,7 @@ Deploy and diagnose a cluster through one command line. Reliaburger brings sched
 
 Basis: [Coolify deployment workflow](https://coolify.io/docs/applications/deployments/overview) and [Reliaburger architecture](https://github.com/reliaburger/reliaburger/blob/v0.2.2/README.md#whats-in-the-binary).
 
-**Which Reliaburger.** The public installer installs [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), and the feature analysis below describes that release, re-checked on 21 October 2026. Coolify is pinned to [4.4.6](https://github.com/coollabsio/coolify/releases/tag/v4.4.6), with current official documentation for workflows.
+**Which Reliaburger.** The feature analysis below describes Reliaburger [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), re-checked on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Coolify is pinned to [4.4.6](https://github.com/coollabsio/coolify/releases/tag/v4.4.6), with current official documentation for workflows.
 
 ## Where each wins
 

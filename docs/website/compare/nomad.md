@@ -8,7 +8,7 @@ Reliaburger brings deployment, a registry, ingress and incident diagnosis into o
 
 ## The verdict
 
-**Which Reliaburger.** Installation examples and capability comparisons both describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. Its node-by-node rollouts and `RolloutFailed` handling arrived in 0.2.1. [Deployment contract](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/01_deploy-an-app.md#rolling-deploys) · [Compatibility policy](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/releasing.md#compatibility-before-100).
+**Which Reliaburger.** Installation examples and capability comparisons both describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), re-checked on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Its node-by-node rollouts and `RolloutFailed` handling arrived in 0.2.1. [Deployment contract](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/01_deploy-an-app.md#rolling-deploys) · [Compatibility policy](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/releasing.md#compatibility-before-100).
 
 ### Where Reliaburger leads
 
@@ -115,7 +115,7 @@ Licensing also differs: Reliaburger uses Apache-2.0; Nomad 2.0.7’s source carr
 
 ## Evidence and limits
 
-Baseline: [Nomad 2.0.7 release](https://github.com/hashicorp/nomad/releases/tag/v2.0.7), its official 2.0.x documentation, and the [Reliaburger 0.2.2 source](https://github.com/reliaburger/reliaburger/tree/v0.2.2/), the release the installer installs. Citations beside claims identify the supporting contract or implementation. Documentation URLs may advance; the Reliaburger and licence links are pinned.
+Baseline: [Nomad 2.0.7 release](https://github.com/hashicorp/nomad/releases/tag/v2.0.7), its official 2.0.x documentation, and the [Reliaburger 0.2.2 source](https://github.com/reliaburger/reliaburger/tree/v0.2.2/). Citations beside claims identify the supporting contract or implementation. Documentation URLs may advance; the Reliaburger and licence links are pinned.
 
 We reviewed documentation and source, and re-checked the Reliaburger side for 0.2.2 on 21 October 2026. We did not install both systems on identical machines or measure failure recovery, memory, cost or learning time. Verdicts concern the supported workflows described here. See the [shared review method](https://reliaburger.com/compare/methodology#method) for the wider comparison.
 

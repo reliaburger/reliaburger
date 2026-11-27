@@ -11,6 +11,11 @@ use super::rollup::{
     MetricsQuery, MetricsQueryResult, MetricsQueryRow, OwnedRollupRow, QueryWarning,
 };
 
+/// The response header a council member's `/v1/metrics/rollup/owned` sets
+/// when its answer continues in another page: the `start` to ask for next
+/// (#2451).
+pub const NEXT_START_HEADER: &str = "x-reliaburger-next-start";
+
 /// Merge metrics results from multiple sources, sorted by timestamp.
 ///
 /// Deduplicates entries with the same (timestamp, metric_name, labels).
@@ -170,7 +175,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
         let token = service_token.map(str::to_string);
 
         handles.push(tokio::spawn(async move {
-            let mut params = vec![("start", start.to_string()), ("end", end.to_string())];
+            let mut params = vec![("end", end.to_string())];
             if let Some(name) = metric_name {
                 params.push(("name", name));
             }
@@ -180,21 +185,18 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
             if let Some(per_series) = per_series {
                 params.push(("per_series", per_series.to_string()));
             }
-            let request = crate::sesame::auth::bearer_get(&client, &endpoint, token.as_deref())
-                .query(&params);
-            // Cover response decoding too: a peer can send headers then stall its body.
-            let response = tokio::time::timeout(timeout, async {
-                request
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<Vec<T>>()
-                    .await
-            })
-            .await;
-            match response {
+            // The whole answer, every page and its body, inside one wait: a
+            // peer can send headers then stall its body.
+            let pages = read_pages::<T>(&client, &endpoint, token.as_deref(), &params, start);
+            match tokio::time::timeout(timeout, pages).await {
                 Ok(Ok(rows)) => Ok(rows),
-                _ => Err(node_url),
+                Ok(Err(MemberFailure::Refused(reason))) => Err(QueryWarning::QueryRefused {
+                    node_id: node_url,
+                    reason,
+                }),
+                Ok(Err(MemberFailure::Unresponsive)) | Err(_) => {
+                    Err(QueryWarning::NodeUnresponsive { node_id: node_url })
+                }
             }
         }));
     }
@@ -205,9 +207,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     for handle in handles {
         match handle.await {
             Ok(Ok(rows)) => sources.push(rows),
-            Ok(Err(node_url)) => {
-                warnings.push(QueryWarning::NodeUnresponsive { node_id: node_url });
-            }
+            Ok(Err(warning)) => warnings.push(warning),
             Err(_join_err) => {
                 // Task panicked — treat as unresponsive
                 warnings.push(QueryWarning::NodeUnresponsive {
@@ -220,6 +220,80 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     (sources, warnings)
 }
 
+/// Why one member contributed nothing.
+enum MemberFailure {
+    /// No usable answer: connection, timeout or an unreadable body.
+    Unresponsive,
+    /// It answered, refusing the query, with this reason.
+    Refused(String),
+}
+
+/// Ask `endpoint` for rows from `start`, following [`NEXT_START_HEADER`]
+/// page by page until the member says there are no more (#2451). Stops
+/// with a refusal past [`MAX_OWNED_ROWS`](super::rollup_store::MAX_OWNED_ROWS)
+/// rows, which bounds what one member can make the entry node hold.
+async fn read_pages<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: Option<&str>,
+    params: &[(&str, String)],
+    start: u64,
+) -> Result<Vec<T>, MemberFailure> {
+    let mut rows = Vec::new();
+    let mut cursor = start;
+    loop {
+        let response = crate::sesame::auth::bearer_get(client, endpoint, token)
+            .query(params)
+            .query(&[("start", cursor)])
+            .send()
+            .await
+            .map_err(|_| MemberFailure::Unresponsive)?;
+        if !response.status().is_success() {
+            return Err(MemberFailure::Refused(refusal_reason(response).await));
+        }
+        let next = response
+            .headers()
+            .get(NEXT_START_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let page = response
+            .json::<Vec<T>>()
+            .await
+            .map_err(|_| MemberFailure::Unresponsive)?;
+        rows.extend(page);
+        if rows.len() > super::rollup_store::MAX_OWNED_ROWS {
+            return Err(MemberFailure::Refused(
+                super::rollup_store::too_many_contributions().to_string(),
+            ));
+        }
+        match next {
+            // A cursor that doesn't advance would ask for the same page for
+            // ever.
+            Some(next) if next > cursor => cursor = next,
+            _ => return Ok(rows),
+        }
+    }
+}
+
+/// What a member's error answer says: the `error` field of a JSON body, or
+/// the body itself, cut short, or the status when the body is empty.
+async fn refusal_reason(response: reqwest::Response) -> String {
+    const MAX_REASON: usize = 512;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let reason = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| json.get("error")?.as_str().map(str::to_string))
+        .unwrap_or(body);
+    if reason.trim().is_empty() {
+        return format!("HTTP {status}");
+    }
+    match reason.char_indices().nth(MAX_REASON) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -227,6 +301,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     fn row(ts: u64, name: &str, labels: &str, value: f64) -> MetricsQueryRow {
         MetricsQueryRow {
@@ -428,6 +503,95 @@ mod tests {
             assert!(result.data.is_empty());
             assert_eq!(result.warnings.len(), 1);
         }
+    }
+
+    /// Serve `handler` at the owned-rollup route on a local port.
+    async fn serve_owned(
+        handler: axum::routing::MethodRouter,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route("/v1/metrics/rollup/owned", handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    fn cpu_query() -> MetricsQuery {
+        MetricsQuery {
+            metric_name: Some("cpu".into()),
+            start: 0,
+            end: 100_000,
+            app: None,
+            per_series: None,
+        }
+    }
+
+    /// #2451: a member that answered "narrow the time range" was reported
+    /// as unresponsive, because the error body was thrown away. Its reason
+    /// now reaches the caller.
+    #[tokio::test]
+    async fn a_member_that_refuses_the_query_is_not_reported_as_unresponsive() {
+        use axum::http::StatusCode;
+        let (url, server) = serve_owned(axum::routing::get(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "query rejected: narrow the time range"})),
+            )
+        }))
+        .await;
+        let result = fan_out_cluster_query(
+            &cpu_query(),
+            std::slice::from_ref(&url),
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            result.warnings,
+            [QueryWarning::QueryRefused {
+                node_id: url,
+                reason: "query rejected: narrow the time range".into(),
+            }]
+        );
+    }
+
+    /// #2451: a member answers a long range in pages, naming where the next
+    /// one starts; the entry node reads them all.
+    #[tokio::test]
+    async fn a_member_answer_in_pages_is_read_to_the_end() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        let (url, server) = serve_owned(axum::routing::get(
+            |Query(params): Query<HashMap<String, String>>| async move {
+                let start: u64 = params["start"].parse().unwrap();
+                let owned = |timestamp: u64| {
+                    serde_json::json!({"node_id": "w1", "timestamp": timestamp,
+                        "metric_name": "cpu", "labels": "{}", "value": 1.0})
+                };
+                if start < 120 {
+                    ([(NEXT_START_HEADER, "120")], axum::Json(vec![owned(60)])).into_response()
+                } else {
+                    axum::Json(vec![owned(120), owned(180)]).into_response()
+                }
+            },
+        ))
+        .await;
+        let result = fan_out_cluster_query(
+            &cpu_query(),
+            &[url],
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        server.abort();
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let stamps: Vec<u64> = result.data.iter().map(|row| row.timestamp).collect();
+        assert_eq!(stamps, [60, 120, 180]);
     }
 
     // --- merge_cluster_results tests ---
