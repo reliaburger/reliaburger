@@ -1058,6 +1058,100 @@ fn cli_design_doc_names_no_missing_commands() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// --- Types in design-doc listings --------------------------------------------
+
+/// Design docs whose Rust listings must declare real types, unless the
+/// listing is labelled a sketch.
+const DESIGN_DOCS_WITH_REAL_TYPES: &[&str] = &["docs/design/cli-relish.md"];
+
+/// Put on the line before a ```` ```rust ```` fence whose types aren't in the
+/// tree, under a prose line that says so.
+const SKETCH_MARKER: &str = "<!-- sketch -->";
+
+/// Every name `src/` declares with `struct`, `enum` or `type`.
+fn declared_type_names() -> std::collections::BTreeSet<String> {
+    fn walk(directory: &std::path::Path, names: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, names);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let words: Vec<&str> = text
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|word| !word.is_empty())
+                    .collect();
+                for pair in words.windows(2) {
+                    if matches!(pair[0], "struct" | "enum" | "type") {
+                        names.insert(pair[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    walk(&super::website::repository().join("src"), &mut names);
+    names
+}
+
+/// `(location, name)` for each `pub struct`, `pub enum` or `pub type` in a
+/// Rust listing not labelled with [`SKETCH_MARKER`].
+fn unlabelled_listing_types(file: &str, text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut in_fence = false;
+    let mut checked_fence = false;
+    let mut previous = "";
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            checked_fence = !in_fence && trimmed == "```rust" && !previous.contains(SKETCH_MARKER);
+            in_fence = !in_fence;
+        } else if in_fence && checked_fence {
+            let words: Vec<&str> = trimmed
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty())
+                .collect();
+            for triple in words.windows(3) {
+                if triple[0] == "pub" && matches!(triple[1], "struct" | "enum" | "type") {
+                    found.push((format!("{file}:{}", index + 1), triple[2].to_string()));
+                }
+            }
+        }
+        if !trimmed.is_empty() {
+            previous = trimmed;
+        }
+    }
+    found
+}
+
+#[test]
+fn a_sketch_marker_exempts_only_the_listing_it_precedes() {
+    let text = "<!-- sketch -->\n```rust\npub struct Gone;\n```\n\n```rust\npub enum Real {}\n```\n";
+    assert_eq!(
+        unlabelled_listing_types("doc.md", text),
+        vec![("doc.md:7".to_string(), "Real".to_string())]
+    );
+}
+
+/// A design doc's Rust listing either declares types that exist in `src/`,
+/// or says it is a sketch, so a reader can use it as a map of the code.
+#[test]
+fn design_doc_listings_declare_real_types_or_say_they_are_sketches() {
+    let declared = declared_type_names();
+    let mut failures = Vec::new();
+    for file in DESIGN_DOCS_WITH_REAL_TYPES {
+        for (location, name) in unlabelled_listing_types(file, &read(file)) {
+            if !declared.contains(&name) {
+                failures.push(format!(
+                    "{location}: `{name}` isn't declared in src/; fix the listing or \
+                     label it with {SKETCH_MARKER}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // --- The extractor itself ----------------------------------------------------
 
 fn shell(body: &str) -> Snippet {
