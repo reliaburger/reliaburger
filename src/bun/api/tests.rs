@@ -2026,7 +2026,7 @@ async fn follower_of_a_recording_leader(
 /// own deploy records.
 async fn follower_with_history_of_a_recording_leader(
     token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
 ) -> (
     Router,
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
@@ -2095,7 +2095,7 @@ async fn three_council_nodes() -> Vec<Arc<crate::council::CouncilNode>> {
 /// shut down.
 async fn follower_of_the_leader_api_on(
     token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     leader_port: u16,
 ) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
     let nodes = three_council_nodes().await;
@@ -2249,10 +2249,11 @@ async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target
         )),
         ..sample_history_entry(image)
     };
-    let history = Arc::new(RwLock::new(vec![
-        deployed(1, "nginx:1.26"),
-        deployed(2, "nginx:1.27"),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![deployed(1, "nginx:1.26"), deployed(2, "nginx:1.27")]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (follower, seen, nodes) =
         follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
 
@@ -6694,7 +6695,7 @@ fn sample_history_entry(image: &str) -> DeployHistoryEntry {
 /// Router with a seeded deploy history and no token store, so the
 /// namespace filter can be checked without an auth layer in the way.
 async fn setup_with_deploy_history(
-    history: Arc<RwLock<Vec<DeployHistoryEntry>>>,
+    history: Arc<RwLock<crate::bun::agent::DeployHistory>>,
 ) -> (Router, CancellationToken) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
@@ -7711,10 +7712,11 @@ async fn deploy_history_is_filtered_by_namespace() {
         },
         ..sample_history_entry(image)
     };
-    let history = Arc::new(RwLock::new(vec![
-        entry("team-a", "a:1"),
-        entry("team-b", "b:1"),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![entry("team-a", "a:1"), entry("team-b", "b:1")]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (app, shutdown) = setup_with_deploy_history(history).await;
 
     let body = get_body(app, "/v1/deploys/history/web?namespace=team-a").await;

@@ -351,31 +351,90 @@ pub(super) struct RollingInstance {
 /// How many deploy history entries a node keeps per app.
 pub(crate) const DEPLOY_HISTORY_PER_APP: usize = 50;
 
-/// Append a deploy history entry, dropping the app's oldest entries beyond
-/// [`DEPLOY_HISTORY_PER_APP`].
+/// How many apps a node keeps deploy history for. A node that has served
+/// more forgets the app it last recorded a deploy for longest ago (#2428),
+/// so preview environments and CI apps, each with its own name, don't
+/// accumulate a history each for the life of the process.
+pub(crate) const DEPLOY_HISTORY_APPS: usize = 1000;
+
+/// A node's deploy history: the newest [`DEPLOY_HISTORY_PER_APP`] entries
+/// of each of up to [`DEPLOY_HISTORY_APPS`] apps, each with a full spec.
 ///
-/// Every deploy, retry and abort records one, each with a full spec, so an
-/// app the reconciler retried for a week used to hold thousands of specs in
-/// memory. Fifty is plenty to read a story from; `relish rollback` in a
-/// cluster reads the council's rollback targets, not this.
-pub(crate) fn record_deploy_history(
-    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
-    entry: crate::meat::deploy_types::DeployHistoryEntry,
-) {
-    let app_id = entry.app_id.clone();
-    history.push(entry);
-    let kept = history
-        .iter()
-        .filter(|entry| entry.app_id == app_id)
-        .count();
-    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
-    history.retain(|entry| {
-        if excess > 0 && entry.app_id == app_id {
-            excess -= 1;
-            return false;
+/// Every deploy, retry and abort records one, so an app the reconciler
+/// retried for a week used to hold thousands of specs in memory. Fifty is
+/// plenty to read a story from; `relish rollback` in a cluster reads the
+/// council's rollback targets, not this. Entries are kept per app, so a
+/// write touches only its own app's.
+#[derive(Debug, Default)]
+pub struct DeployHistory {
+    apps: std::collections::HashMap<crate::meat::types::AppId, AppHistory>,
+    /// Writes so far, to tell which app was written longest ago.
+    writes: u64,
+}
+
+#[derive(Debug, Default)]
+struct AppHistory {
+    entries: std::collections::VecDeque<crate::meat::deploy_types::DeployHistoryEntry>,
+    last_write: u64,
+}
+
+impl DeployHistory {
+    /// Append an entry, dropping its app's oldest beyond
+    /// [`DEPLOY_HISTORY_PER_APP`], and the app written longest ago when a
+    /// new app takes the count past [`DEPLOY_HISTORY_APPS`].
+    pub(crate) fn record(&mut self, entry: crate::meat::deploy_types::DeployHistoryEntry) {
+        self.writes += 1;
+        let app = self.apps.entry(entry.app_id.clone()).or_default();
+        app.last_write = self.writes;
+        app.entries.push_back(entry);
+        while app.entries.len() > DEPLOY_HISTORY_PER_APP {
+            app.entries.pop_front();
         }
-        true
-    });
+        // Only a new app can take the count over, so this scan of the apps
+        // (never of their entries) runs once per new app at most.
+        if self.apps.len() > DEPLOY_HISTORY_APPS
+            && let Some(oldest) = self
+                .apps
+                .iter()
+                .min_by_key(|(_, app)| app.last_write)
+                .map(|(id, _)| id.clone())
+        {
+            self.apps.remove(&oldest);
+        }
+    }
+
+    /// One app's entries, oldest first.
+    pub fn of_app(
+        &self,
+        app: &crate::meat::types::AppId,
+    ) -> impl Iterator<Item = &crate::meat::deploy_types::DeployHistoryEntry> {
+        self.apps
+            .get(app)
+            .into_iter()
+            .flat_map(|app| app.entries.iter())
+    }
+
+    /// Every app's entries, the app written longest ago first.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> Vec<crate::meat::deploy_types::DeployHistoryEntry> {
+        let mut apps: Vec<&AppHistory> = self.apps.values().collect();
+        apps.sort_by_key(|app| app.last_write);
+        apps.into_iter()
+            .flat_map(|app| app.entries.iter().cloned())
+            .collect()
+    }
+}
+
+impl FromIterator<crate::meat::deploy_types::DeployHistoryEntry> for DeployHistory {
+    fn from_iter<I: IntoIterator<Item = crate::meat::deploy_types::DeployHistoryEntry>>(
+        entries: I,
+    ) -> Self {
+        let mut history = Self::default();
+        for entry in entries {
+            history.record(entry);
+        }
+        history
+    }
 }
 
 /// The fast pre-create outputs the loop hands back for a fresh instance.
@@ -1737,7 +1796,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
-                record_deploy_history(&mut *self.deploy_history.write().await, *entry);
+                self.deploy_history.write().await.record(*entry);
                 let _ = reply.send(());
             }
             DeployOp::RebuildRoutingTable { reply } => {
@@ -1771,13 +1830,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
 #[cfg(test)]
 mod history_tests {
-    use super::{DEPLOY_HISTORY_PER_APP, record_deploy_history};
+    use super::{DEPLOY_HISTORY_APPS, DEPLOY_HISTORY_PER_APP, DeployHistory};
     use crate::meat::deploy_types::{DeployHistoryEntry, DeployId, DeployResult};
+    use crate::meat::types::AppId;
 
     fn entry(app: &str, id: u64) -> DeployHistoryEntry {
         DeployHistoryEntry {
             id: DeployId(id),
-            app_id: crate::meat::types::AppId::new(app, "default"),
+            app_id: AppId::new(app, "default"),
             image: format!("{app}:{id}"),
             result: DeployResult::Completed,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -1790,22 +1850,46 @@ mod history_tests {
 
     #[test]
     fn deploy_history_keeps_the_newest_fifty_entries_per_app() {
-        let mut history = Vec::new();
-        record_deploy_history(&mut history, entry("api", 0));
+        let mut history = DeployHistory::default();
+        history.record(entry("api", 0));
         for id in 0..120 {
-            record_deploy_history(&mut history, entry("web", id));
+            history.record(entry("web", id));
         }
         let web: Vec<u64> = history
-            .iter()
-            .filter(|entry| entry.app_id.name == "web")
+            .of_app(&AppId::new("web", "default"))
             .map(|entry| entry.id.0)
             .collect();
         assert_eq!(web.len(), DEPLOY_HISTORY_PER_APP);
         assert_eq!(web.first(), Some(&70), "the oldest entries go first");
         assert_eq!(web.last(), Some(&119));
-        assert!(
-            history.iter().any(|entry| entry.app_id.name == "api"),
+        assert_eq!(
+            history.of_app(&AppId::new("api", "default")).count(),
+            1,
             "one app's deploys never push out another app's history"
         );
+    }
+
+    /// Uniquely named apps (a preview per pull request) used to keep their
+    /// history for the life of the process (#2428).
+    #[test]
+    fn deploy_history_keeps_a_bounded_number_of_apps() {
+        let mut history = DeployHistory::default();
+        history.record(entry("app-0", 0));
+        for n in 1..DEPLOY_HISTORY_APPS + 10 {
+            history.record(entry(&format!("app-{n}"), 0));
+            // app-0 keeps deploying, so it is never the oldest.
+            history.record(entry("app-0", n as u64));
+        }
+        let kept: Vec<usize> = (0..DEPLOY_HISTORY_APPS + 10)
+            .filter(|n| {
+                history
+                    .of_app(&AppId::new(&format!("app-{n}"), "default"))
+                    .next()
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(kept.len(), DEPLOY_HISTORY_APPS);
+        assert_eq!(kept[0], 0, "an app still deploying keeps its history");
+        assert_eq!(kept[1], 11, "the ten apps written longest ago are gone");
     }
 }

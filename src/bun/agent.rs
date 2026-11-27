@@ -86,6 +86,7 @@ mod commands;
 mod consumer;
 mod council_requests;
 mod deploy_ops;
+pub use deploy_ops::DeployHistory;
 mod deploy_worker;
 mod discovery_ownership;
 mod discovery_recovery;
@@ -902,8 +903,7 @@ pub struct BunAgent<G: Grill> {
     /// Addresses let through the perimeter for a while to enrol (G2).
     join_windows: crate::firewall::rules::JoinWindows,
     /// Deploy history (shared with API for query access).
-    pub(crate) deploy_history:
-        Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
+    pub(crate) deploy_history: Arc<tokio::sync::RwLock<DeployHistory>>,
     /// Real apply-worker activity and bounded terminal outcomes for the API.
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
@@ -1228,7 +1228,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_inputs: None,
             join_windows: Default::default(),
-            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_history: Arc::new(tokio::sync::RwLock::new(DeployHistory::default())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
             sidecars: sidecars::Sidecars::default(),
@@ -1402,7 +1402,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_inputs: None,
             join_windows: Default::default(),
-            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_history: Arc::new(tokio::sync::RwLock::new(DeployHistory::default())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
             sidecars: sidecars::Sidecars::default(),
@@ -1472,9 +1472,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Get a shared handle to the deploy history for the API.
-    pub fn deploy_history_handle(
-        &self,
-    ) -> Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>> {
+    pub fn deploy_history_handle(&self) -> Arc<tokio::sync::RwLock<DeployHistory>> {
         Arc::clone(&self.deploy_history)
     }
 

@@ -33,7 +33,7 @@ fn binder(answer: Option<u64>) -> ImageBinder {
 /// and `history` when given and the binder layered on when given.
 fn router_with(
     council: Option<Arc<crate::council::CouncilNode>>,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     binder: Option<ImageBinder>,
 ) -> (Router, CancellationToken) {
     router_with_service(council, history, binder, None)
@@ -41,7 +41,7 @@ fn router_with(
 
 fn router_with_service(
     council: Option<Arc<crate::council::CouncilNode>>,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     binder: Option<ImageBinder>,
     service: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
 ) -> (Router, CancellationToken) {
@@ -348,10 +348,11 @@ async fn a_rollback_restores_the_bound_digest_without_asking_the_registry() {
         })
         .await
         .unwrap();
-    let history = Arc::new(RwLock::new(vec![
-        completed(1, 10, &old),
-        completed(2, 20, &new),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![completed(1, 10, &old), completed(2, 20, &new)]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (app, shutdown) = router_with(Some(council.clone()), Some(history), Some(binder(None)));
 
     let (status, body) = post(app, "/v1/rollback/web/default", "").await;

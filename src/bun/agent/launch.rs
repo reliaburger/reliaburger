@@ -998,7 +998,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             new_ids.len(),
             new_ids.len(),
         );
-        super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
+        self.deploy_history.write().await.record(entry);
         Ok(())
     }
 
