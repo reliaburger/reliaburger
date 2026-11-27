@@ -218,7 +218,7 @@ async fn grow_one_to_three(nodes: &[Node; 3], attempts: u32) -> bool {
     false
 }
 
-async fn shutdown_all(shutdown: &CancellationToken, nodes: [Node; 3]) {
+async fn shutdown_all<const N: usize>(shutdown: &CancellationToken, nodes: [Node; N]) {
     shutdown.cancel();
     for (council, _) in nodes {
         council.shutdown().await.ok();
@@ -1477,4 +1477,73 @@ async fn a_lagging_voter_restarted_while_behind_still_votes_for_the_new_voter() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lagging_voter_that_lost_every_voter_it_knows_waits_for_one_to_return() {
     lagging_voter_after_a_swap(AfterTheSwap::EvictedVoterDies).await;
+}
+
+/// #2370: openraft sends up to 300 entries per AppendEntries, and nothing
+/// bounded their bytes. A learner 80 entries of 1 MiB behind was sent one
+/// frame over the receiver's 64 MiB limit, which it dropped; the leader saw
+/// an unreachable peer and sent the same batch again for ever. Bounded log
+/// reads carry it across a few MiB at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learner_far_behind_on_large_entries_catches_up_over_tcp() {
+    let shutdown = CancellationToken::new();
+    let leader = make_node(1, &shutdown).await;
+    let learner = make_node(2, &shutdown).await;
+    leader
+        .0
+        .initialize(BTreeMap::from([(1, info_at(1, leader.1))]))
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if leader.0.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(leader.0.is_leader().await, "node 1 never led");
+
+    let mib = 1024 * 1024;
+    for index in 0..80 {
+        leader
+            .0
+            .write(reliaburger::council::types::RaftRequest::ConfigSet {
+                key: format!("large-{index}"),
+                value: "x".repeat(mib),
+            })
+            .await
+            .unwrap();
+    }
+    let target = leader.0.metrics().borrow().last_log_index;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        leader.0.add_learner(2, info_at(2, learner.1)),
+    )
+    .await
+    .expect("adding the learner timed out")
+    .unwrap();
+    let caught_up = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let applied = learner.0.metrics().borrow().last_applied.map(|l| l.index);
+            if applied >= target {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        caught_up.is_ok(),
+        "the learner never caught up with 80 MiB of entries"
+    );
+    assert!(
+        learner
+            .0
+            .desired_state()
+            .await
+            .config
+            .contains_key("large-79")
+    );
+
+    shutdown_all(&shutdown, [leader, learner]).await;
 }

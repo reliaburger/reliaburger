@@ -1084,6 +1084,74 @@ impl Default for CouncilConfig {
     }
 }
 
+/// How long one snapshot chunk may take to be sent, received, decoded and
+/// answered, in milliseconds (#2367).
+///
+/// openraft's default is 200 ms, and a chunk that misses it restarts the
+/// whole install from offset 0, so a member on a slow link (or a slow CPU)
+/// that needed a snapshot never caught up. The last chunk also waits for the
+/// follower to decode the whole state and fsync it. Ten seconds is the
+/// transport's own bound on any RPC.
+pub const SNAPSHOT_CHUNK_TIMEOUT_MS: u64 = 10_000;
+
+/// The most snapshot bytes one chunk carries (#2367).
+///
+/// openraft's default is 3 MiB. 256 KiB is about 342 KiB on the wire as
+/// base64: under 300 ms on a 10 Mbit/s link, so a chunk fits its deadline
+/// with a wide margin even on a poor link, and a failed chunk costs little
+/// to resend.
+pub const SNAPSHOT_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// The most log entries openraft puts in one AppendEntries (#2370).
+///
+/// openraft's own default, set here so the batch count is a decision. Bytes
+/// are bounded separately, by [`LOG_READ_BUDGET_BYTES`].
+pub const MAX_PAYLOAD_ENTRIES: u64 = 300;
+
+/// The stored bytes of log entries a bounded log read returns, unless the
+/// first entry alone is larger (#2370).
+///
+/// openraft reads each AppendEntries batch through
+/// `limited_get_log_entries`, and gives the RPC `heartbeat_interval`
+/// (150 ms) to complete. 4 MiB crosses a 1 Gbit/s link in about 35 ms, so a
+/// batch of large entries fits its deadline with room for encoding and the
+/// follower's fsync. Entries are stored as JSON, the encoding they travel
+/// in, so stored bytes are close to frame bytes.
+pub const LOG_READ_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest request, as JSON, a council write accepts (#2370).
+///
+/// An entry that can't fit an AppendEntries frame could never replicate,
+/// and every later commit would wait behind it. 32 MiB leaves room under
+/// the transport's send limit (48 MiB) and its receive limit (64 MiB), and
+/// above the largest entry the council admits on purpose: a placement pass
+/// of 131,072 placements is about 20 MB.
+pub const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The length of `value` encoded as JSON, counted without building the
+/// encoding.
+pub fn json_len<T: Serialize>(value: &T) -> usize {
+    /// A writer that keeps only the count of bytes written to it.
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    // A failure to serialise means the value can't be encoded at all; the
+    // write path then fails at the log store's own encode, with its error.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 impl CouncilConfig {
     /// Convert to an `openraft::Config`.
     pub fn to_openraft_config(&self) -> openraft::Config {
@@ -1093,6 +1161,9 @@ impl CouncilConfig {
             election_timeout_max: self.election_timeout_max_ms,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(self.snapshot_threshold),
             max_in_snapshot_log_to_keep: self.max_in_snapshot_log_to_keep,
+            install_snapshot_timeout: SNAPSHOT_CHUNK_TIMEOUT_MS,
+            snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
+            max_payload_entries: MAX_PAYLOAD_ENTRIES,
             ..Default::default()
         }
     }
@@ -1378,6 +1449,24 @@ mod tests {
         assert_eq!(cfg.election_timeout_max_ms, 2000);
         assert_eq!(cfg.snapshot_threshold, 10_000);
         assert_eq!(cfg.max_in_snapshot_log_to_keep, 1000);
+    }
+
+    /// #2367: openraft's defaults give each snapshot chunk 200 ms and make
+    /// it 3 MiB, so a chunk on a slow link never arrives in time and the
+    /// install restarts from offset 0 for ever.
+    #[test]
+    fn a_snapshot_chunk_gets_seconds_and_fits_a_slow_link() {
+        let config = CouncilConfig::default().to_openraft_config();
+        assert!(
+            config.install_snapshot_timeout >= 10_000,
+            "a snapshot chunk gets {} ms",
+            config.install_snapshot_timeout
+        );
+        assert!(
+            config.snapshot_max_chunk_size <= 256 * 1024,
+            "a snapshot chunk is {} bytes",
+            config.snapshot_max_chunk_size
+        );
     }
 
     #[test]

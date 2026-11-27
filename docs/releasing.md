@@ -93,7 +93,10 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   macOS runs on the newest train every night instead
   ([`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), maintainer
   decision of 24 November 2026). A group that changes
-  only documentation runs no code job: its code is its base's. When the
+  only documentation (plans, talks, research notes, the changelog; not the
+  book, the manual or anything else a test or relish reads,
+  [which jobs run](testing.md#which-jobs-a-pull-request-runs)) runs no code
+  job: its code is its base's. When the
   queue drops a group, `queue-sweep.yml` cancels its run
   ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
 - **The push to the train** runs nothing but CI policy when the queue's run
@@ -107,10 +110,29 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   freeze, label it `release-gate`: from then on it runs everything, and the
   evidence gate refuses it without every owner, macOS included. Merging it
   pushes to `main`, which runs everything again, and that run is the one the
-  candidate build reuses.
+  candidate build reuses. The gate PR is opened as a draft, and once it's
+  ready for review the evidence gate refuses it until it carries the
+  label, so it can't merge on the light set
+  ([#2483](https://github.com/reliaburger/reliaburger/issues/2483)).
 
 So nothing reaches a train without every Linux job having passed on that
-exact commit, and nothing reaches `main` without the full set. macOS runs on
+exact commit, and nothing reaches `main` without the full set. What enforces
+each half:
+
+- **The train**: ruleset 25015244 ("release trains merge queue") requires the
+  merge queue and the `ignored-test evidence` check on every named train.
+- **`main`**: `ignored-test evidence` is red on a ready gate PR without the
+  `release-gate` label, and on any run missing an owner its selection needs.
+  It blocks the merge only where a ruleset requires it: ruleset 13556416
+  ("protect main") must list `pull_request` and `required_status_checks`
+  for that check. Changing a ruleset is the maintainer's; until it lists
+  both, merging a red gate PR is possible and the rule above is a
+  convention, with `ci_reuse.py` as the backstop (a candidate never rests on
+  a run that skipped a job). Check what `main` enforces with:
+
+  ```
+  gh api repos/reliaburger/reliaburger/rules/branches/main --jq '[.[].type]'
+  ``` macOS runs on
 the push to `main` and on `main`'s nightly, on the newest train every night,
 on the release gate PR and on the candidate build, but not on ordinary pull
 requests or in the merge queue: the organisation's plan runs at most five
@@ -136,6 +158,18 @@ The qualification scripts install staged builds on the hosts in the matrix
 and never read a merge-queue run, so nothing there relied on the queue's
 macOS job.
 
+**A schedule-only workflow lives on `main`.** GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of
+the workflow only. `macos-nightly.yml`, `fuzz.yml` and `mutants.yml` pick
+the newest train themselves once they run, but a change to one of them takes
+effect only when it's on `main`: `macos-nightly.yml` sat on the 0.3.3 train
+for days, never ran, and couldn't be dispatched
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). So a new
+or changed schedule-only workflow goes to `main` in its own small PR, not
+with the train, and the train carries the same copy so the gate PR doesn't
+undo it. `open_train.py` refuses to open a train while the local tree has a
+schedule-only workflow `main` lacks.
+
 Drafts, and pull requests from a `0-4-0/` branch, run only select jobs, CI
 policy and lint until they're marked ready for review
 ([which jobs run](testing.md#which-jobs-a-pull-request-runs)).
@@ -158,7 +192,11 @@ python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z [--from re
 The dry run reads what it needs and prints every write it would make,
 including the ruleset's new body, and makes none. Without `--dry-run`, the
 script does the four steps in order and skips any that's already done, so
-running it again finishes what a failed run started:
+running it again finishes what a failed run started. Before step 1 it lists
+`main`'s workflows and stops if a schedule-only one in the local tree (only
+`schedule` or `workflow_dispatch` starts it) isn't there, naming it; the dry
+run names it and goes on
+([a schedule-only workflow lives on `main`](#merge-trains-and-their-ci)):
 
 1. **Create the branch** `release-X-Y-Z` from `--from`: the previous
    train's frozen tip, or `main` (the default) once the previous release is
@@ -343,6 +381,23 @@ native-build and upgrade qualification. A compiler change produces a new
 candidate and new checksums; never replace an existing release's binaries.
 The compiler pin does not promise identical bytes across different linkers or
 host operating systems.
+
+### Third-party actions are pinned to a commit
+
+Every action outside `actions/*` is referenced by a full commit SHA with its
+tag in a trailing comment, `uses: Swatinem/rust-cache@<40 hex> # v2.9.3`
+(#2405). A tag is a pointer its owner can move, and `build-binaries` runs
+`rust-cache` and the toolchain action before it compiles what `candidate`
+signs and attests: a moved tag would give a truthfully signed release that
+isn't what the source says. `ActionPinTests` in
+`scripts/ci/test_ci_workflow.py` refuses an unpinned `uses:`.
+
+Dependabot's weekly "Actions" PR moves a pin and its comment together. The one
+exception is `dtolnay/rust-toolchain`, which Dependabot ignores: its commit is
+pinned the same way, and each step names the compiler in its `toolchain:`
+input (1.97.0 for the minimum-Rust job, 1.98.0 everywhere else). Move that
+commit by hand, with the compiler, under the policy above. First-party
+`actions/*` stay on tags.
 
 ## Release profile and binary size
 
@@ -851,6 +906,22 @@ running the applied image, and says so on stderr
 If a walk fails, a fresh cluster, as [from 0.2.0](#upgrading-from-020),
 still works.
 
+### Upgrading from 0.3.3
+
+0.3.4 can't roll onto a 0.3.2 or 0.3.3 cluster, which both speak protocol 61
+and state format 76. The council's snapshot chunks travel as base64 instead
+of a JSON array of numbers
+([#2367](https://github.com/reliaburger/reliaburger/issues/2367)), so nodes
+on either side of the change can't hand each other a snapshot; the full list
+is in `src/compatibility.rs`. The release makes one bump for all its audit
+fixes, at its first wire or state change: the protocol moved from 61 to 62
+and the state format from 76 to 77. Nodes refuse 61/76 peers and data
+directories, and a 0.3.3 leader refuses `relish upgrade start v0.3.4` before
+it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -1279,7 +1350,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.3.2` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.3.3` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops

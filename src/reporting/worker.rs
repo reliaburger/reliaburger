@@ -4,6 +4,7 @@
 /// collects state from the local agent and sends a `StateReport`
 /// to the assigned council member.
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -95,6 +96,36 @@ const BUSY_LOOP_STALE_WINDOWS: u32 = 4;
 /// How long the worker waits for the agent loop to answer a snapshot request.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
 
+/// How long the worker waits for `buildah --version` before reporting no
+/// buildah.
+const BUILDAH_PROBE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Whether `program --version` succeeds within `deadline`.
+///
+/// `tokio::process` waits for the child without blocking a runtime thread,
+/// and `kill_on_drop` kills a child that is still running when the timeout
+/// drops the future, so a hanging buildah costs the deadline and leaves
+/// nothing behind (#2459).
+async fn probe_buildah(program: &Path, deadline: Duration) -> bool {
+    let output = tokio::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(deadline, output).await {
+        Ok(Ok(out)) => out.status.success(),
+        Ok(Err(_)) => false,
+        Err(_) => {
+            eprintln!(
+                "report worker: {} --version timed out after {}s; reporting has_buildah = false",
+                program.display(),
+                deadline.as_secs_f32()
+            );
+            false
+        }
+    }
+}
+
 /// The last snapshot the agent loop answered, and when.
 struct ObservedSnapshot {
     snapshot: AgentSnapshot,
@@ -124,9 +155,12 @@ pub struct ReportWorker<T: ReportingTransport> {
     /// Receives council membership updates as `(NodeId, SocketAddr)` pairs.
     council_rx: watch::Receiver<Vec<(NodeId, SocketAddr)>>,
     shutdown: CancellationToken,
-    /// Whether `buildah` is on PATH, probed once at construction and
-    /// carried in every report (build routing, Phase 12 F2).
+    /// Whether `buildah` answers `--version`, probed once when the worker
+    /// starts running and carried in every report (build routing, Phase 12
+    /// F2).
     has_buildah: bool,
+    /// The program the probe runs: `buildah`, found on `PATH`.
+    buildah_program: PathBuf,
     /// Live readiness evidence, read directly so a busy agent loop can't
     /// hold it back. `None` falls back to the snapshot's copy.
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
@@ -146,13 +180,6 @@ impl<T: ReportingTransport> ReportWorker<T> {
     ) -> Self {
         // Compute initial parent from current council membership
         let parent_address = Self::compute_parent(&node_id, &council_rx.borrow());
-        // One synchronous probe at startup; buildah appearing later
-        // needs an agent restart, which is fine for a build host.
-        let has_buildah = std::process::Command::new("buildah")
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
         Self {
             node_id,
             transport,
@@ -161,7 +188,8 @@ impl<T: ReportingTransport> ReportWorker<T> {
             snapshot_tx,
             council_rx,
             shutdown,
-            has_buildah,
+            has_buildah: false,
+            buildah_program: PathBuf::from("buildah"),
             readiness: None,
             last_observed: None,
         }
@@ -176,6 +204,9 @@ impl<T: ReportingTransport> ReportWorker<T> {
 
     /// Run the worker event loop until shutdown.
     pub async fn run(&mut self) {
+        // One probe as the worker starts; buildah appearing later needs an
+        // agent restart, which is fine for a build host.
+        self.has_buildah = probe_buildah(&self.buildah_program, BUILDAH_PROBE_DEADLINE).await;
         let interval_duration = Duration::from_secs(self.config.report_interval_secs);
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first tick (fires immediately)
@@ -465,6 +496,84 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// An executable shell script in its own temporary directory.
+    #[cfg(unix)]
+    fn script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buildah");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hanging_buildah_probe_does_not_block_the_worker() {
+        // #2459: a buildah that hangs (a stuck storage lock, a dead NFS
+        // mount on PATH) must cost the worker the probe's deadline, not a
+        // runtime thread for as long as it hangs.
+        let (_dir, hanging) = script("exec sleep 30");
+        let started = std::time::Instant::now();
+        let probed = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe_buildah(&hanging, Duration::from_millis(200)),
+        )
+        .await;
+        assert_eq!(probed, Ok(false));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the probe held the thread for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_report_carries_the_probed_buildah() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
+        spawn_fake_agent(snapshot_rx, shutdown.clone());
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            shutdown.clone(),
+        );
+        let (_dir, works) = script("exit 0");
+        worker.buildah_program = works;
+        let handle = tokio::spawn(async move { worker.run().await });
+
+        let (_, _, message) =
+            tokio::time::timeout(Duration::from_secs(4), council_transport.recv())
+                .await
+                .expect("no report arrived")
+                .unwrap();
+        let ReportingMessage::Report(report) = message else {
+            panic!("expected a report first")
+        };
+        assert!(report.has_buildah);
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_buildah_reports_what_the_program_says() {
+        let (_ok_dir, works) = script("exit 0");
+        let (_fail_dir, fails) = script("exit 1");
+        assert!(probe_buildah(&works, Duration::from_secs(5)).await);
+        assert!(!probe_buildah(&fails, Duration::from_secs(5)).await);
+        let missing = std::path::Path::new("/nonexistent/buildah");
+        assert!(!probe_buildah(missing, Duration::from_secs(5)).await);
     }
 
     fn test_config() -> ReportingTreeSection {

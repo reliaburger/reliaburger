@@ -96,10 +96,11 @@ class WorkflowAdapter(unittest.TestCase):
             return required
         return required & c.partitioned(c.read_json(Path(directory) / 'discovery.json'))[0]
 
-    def aggregate(self, event='pull_request', release_gate=False):
+    def aggregate(self, event='pull_request', release_gate=False, head_ref=None, base_ref=None, draft=False):
         with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', self.oracle):
             return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
-                                    event=event, release_gate=release_gate)
+                                    event=event, release_gate=release_gate, head_ref=head_ref,
+                                    base_ref=base_ref, draft=draft)
 
     def test_selected_portable_hosts_and_optimized_gate_all_complete(self):
         self.assertEqual(len(self.aggregate()), 3)
@@ -237,6 +238,42 @@ class WorkflowAdapter(unittest.TestCase):
         self.assertEqual(len(self.aggregate()), 2)
         with self.assertRaisesRegex(c.Invalid, 'release gate'):
             self.aggregate(release_gate=True)
+
+    def light_set_only(self):
+        self.needs['changes']['outputs']['macos'] = 'false'
+        del self.needs['macos']
+        for shard in (1, 2, 3):
+            shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+
+    def test_a_ready_gate_pr_without_the_release_gate_label_is_refused(self):
+        # The gate PR's merge button works on the light set unless something
+        # fails without the label; this check is that something (#2483).
+        self.light_set_only()
+        with self.assertRaisesRegex(c.Invalid, 'release-gate label'):
+            self.aggregate(head_ref='release-1-3-4', base_ref='main')
+
+    def test_a_draft_gate_pr_or_another_pull_request_needs_no_label(self):
+        self.light_set_only()
+        for head_ref, base_ref, draft in [('release-1-3-4', 'main', True),
+                                          ('0-3-4/ci-workflows', 'release-1-3-4', False),
+                                          ('fix/thing', 'main', False),
+                                          ('release-1-3-4', 'release-1-3-5', False)]:
+            with self.subTest(head=head_ref, base=base_ref, draft=draft):
+                self.assertEqual(len(self.aggregate(head_ref=head_ref, base_ref=base_ref, draft=draft)), 2)
+
+    def test_a_labelled_gate_pr_still_needs_every_owner(self):
+        self.light_set_only()
+        with self.assertRaisesRegex(c.Invalid, 'release gate pull request needs every owner'):
+            self.aggregate(head_ref='release-1-3-4', base_ref='main', release_gate=True)
+
+    def test_the_command_line_passes_the_pull_requests_branches_and_draft_state(self):
+        seen = {}
+        with patch.object(self.a, 'aggregate', lambda *args, **kwargs: seen.update(kwargs)), \
+                patch.object(self.a.c, 'read_json', lambda path: {}):
+            self.a.main(['aggregate', '--root', '.', '--commit', 'x', '--run-id', '1', '--attempt', '1',
+                         '--manifest', 'm', '--directory', 'd', '--needs', 'n', '--event', 'pull_request',
+                         '--head-ref', 'release-1-3-4', '--base-ref', 'main', '--draft', 'true'])
+        self.assertEqual((seen['head_ref'], seen['base_ref'], seen['draft']), ('release-1-3-4', 'main', True))
 
     def heavy_owners(self, macos):
         """Add every heavy owner, sealed and successful, to the synthetic run.

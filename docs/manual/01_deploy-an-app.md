@@ -483,7 +483,7 @@ a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish apply` on a cluster returns as soon as the council has recorded the
 change. The scheduler places the apps afterwards, and each node pulls the
 image and starts its share, so a script or a checklist that goes straight on
-to `curl` finds nothing there yet. `--wait` (0.3.3, not in 0.3.2) holds on
+to `curl` finds nothing there yet. `--wait` holds on
 until every app in the file is ready:
 
 ```text

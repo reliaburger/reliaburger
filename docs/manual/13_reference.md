@@ -16,7 +16,7 @@ A flag beats its variable. With neither, `relish` uses the saved context,
 then `http://127.0.0.1:9117`. A context that lists several nodes asks the
 one that last answered, then the rest in order, passing over any that
 don't accept a connection within 1.5 seconds ([the appliance
-chapter](17_appliance.md#claim-them) shows it) *(0.3.3, not in 0.3.2)*.
+chapter](17_appliance.md#claim-them) shows it).
 
 ## Machine output
 
@@ -33,7 +33,7 @@ Reading the cluster:
 |---|---|
 | `status` | the agent envelope (`relish.agent/v1`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and `data.summary` (the `GET /v1/cluster/summary` answer), with `next` steps |
 | `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
-| `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason`, and its `sidecars` with their state and restarts *(0.3.3, not in 0.3.2)* |
+| `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason`, and its `sidecars` with their state and restarts |
 | `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `cordoned_by` (`upgrade`, `os_rollout` or null), `disk_pressure` and `unanswered`; an empty list on a standalone node |
 | `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, and the line in `text`, an `untrusted` object |
 | `events` | `events`, each with its `message` in an `untrusted` object, and `warnings` for the members that didn't answer |
@@ -57,7 +57,7 @@ Changing it:
 | `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
 | `rollback` | the `app`, its `namespace`, and whether it was `forced` |
 | `apply`, `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts; `apply --dry-run` prints the plan |
-| `apply --wait` | the `relish.agent/v1` envelope with `command: "apply"`: `data.ready`, each app's counts, phase and `reason` under `data.apps`, and `next`; exit 1 when an app wasn't ready in time *(0.3.3, not in 0.3.2)* |
+| `apply --wait` | the `relish.agent/v1` envelope with `command: "apply"`: `data.ready`, each app's counts, phase and `reason` under `data.apps`, and `next`; exit 1 when an app wasn't ready in time |
 | `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
@@ -129,7 +129,7 @@ Three commands answer "is it all right?" at three depths:
 | Command | Flags | What it shows |
 |---|---|---|
 | `relish status` | `--quick` skips `wtf`'s checks (otherwise run with a 2 s budget); `--check` sets the exit code from the verdict | one screen: a verdict (`HEALTHY`, `DEGRADED` or `DOWN`), then one line per part of the cluster, each needing attention ending in the command that shows the detail |
-| `relish apps [NAME]` | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age, and its sidecars under it *(0.3.3, not in 0.3.2)* |
+| `relish apps [NAME]` | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age, and its sidecars under it |
 | `relish nodes` | `--unhealthy` (not alive, cordoned, under disk pressure or not answering) | one row per node: gossip state, council seat, leader, version, CPU, memory and disk use, and what the scheduler allocated |
 
 An app's state in `relish apps` is, worst first, `down` (it wants replicas
@@ -189,7 +189,7 @@ systemd service (`relish manual appliance`):
 | Command | What |
 |---------|------|
 | `bun appliance prepare` | prepare the node from its seed: install a create seed's files, or enrol and fetch the master key, then write `node.toml`. With no seed, wait to be claimed |
-| `bun appliance console` | the node's read-only dashboard on its terminal (tty1 on an appliance): status and the claim key while it's unclaimed, then metrics, workloads, the cluster, versions and logs *(0.3.3, not in 0.3.2)* |
+| `bun appliance console` | the node's read-only dashboard on its terminal (tty1 on an appliance): status and the claim key while it's unclaimed, then metrics, workloads, the cluster, versions and logs |
 
 Host workloads require an explicit allowlist and `mount_isolation = false`;
 CPU/memory limits and container egress enforcement remain unavailable to them.
@@ -231,7 +231,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered *(0.3.3, not in 0.3.2)*, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
+| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -295,7 +295,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `owner` | The name of the API token of the controller that manages the app. Only that token or an admin may set it; `relish apply` and GitOps then leave the app alone, and `relish release` hands it back (see `writing-a-controller`) |
 | `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s or `interval`, whichever is shorter; at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros; `interval` and `initial_delay` at most 86400 s |
 | `[[init]]` | `image` (default: the app's), `command` and `env` (on top of the app's; plain or `PROVIDER[name:path]`, no encrypted values); runs before the app with its env and mounts |
-| `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute, and is adopted across a Bun restart *(0.3.3, not in 0.3.2)*. `relish apps NAME` lists it under its instance *(0.3.3, not in 0.3.2)*. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
+| `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute, and is adopted across a Bun restart. `relish apps NAME` lists it under its instance. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
 | `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
 | `[[volumes]]` | `path`, and `source` (a node directory, allowlisted) or a managed volume with optional `size`; not on `exec` or `script` apps. A `size` needs root, and can't change once the volume exists |
 | `placement` | `required` and `preferred` node labels, `key=value` |
@@ -384,6 +384,14 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
 | `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
+Fixed limits on the image directory, not settings (see `images-and-volumes`):
+
+| Limit | Value |
+|-------|-------|
+| One image's unpacked file content | 16 GiB, and at most the image filesystem's free space less 1 GiB |
+| One image's files (tar entries, across all layers) | 1,000,000 |
+| Unpacked images no container uses | collected at most hourly after a create from an image, or at once when the image filesystem is 95% full; anything a pull handed out, or an interrupted unpack left, within the last hour stays |
+
 ## Node config sections
 
 Every section is optional, and an unknown key is an error, so a typo fails at
@@ -397,7 +405,8 @@ startup instead of being ignored.
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
-| `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
+| `[ebpf]`, `[dns]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
+| `[ingress]` | `enabled` (false), `http_port` (80), `https_port` (443), `tls_cert` and `tls_key` (both or neither), `max_connections` (10,000 requests in flight, WebSockets included; past it, 503), `max_request_body_bytes` (10 MiB; past it, 413), `request_body_budget_bytes` (256 MiB shared by every body being buffered; past it, 503), `max_open_connections` (32,768 connections across both listeners; past it, the connection is closed), `max_tls_handshakes_per_source` (16 TLS handshakes in progress from one client address; past it, the connection is dropped). A request body that sends nothing for 30 s gets 408, and a response is cut after 30 s with no byte from the app (see `networking`) |
 | `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
@@ -523,10 +532,10 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish os list`: Each node's OS version, and the newest release
   - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots
   - `relish os status`: The rollout in progress, or the last one
-  - `relish os settings`: The cluster's `[appliance]` settings, such as whether the console invaders' kill mode is on, or change them: with --set, replace them with a file's `[appliance]` section (admin only; audited; a key left out is off) *(0.3.3, not in 0.3.2)*
+  - `relish os settings`: The cluster's `[appliance]` settings, such as whether the console invaders' kill mode is on, or change them: with --set, replace them with a file's `[appliance]` section (admin only; audited; a key left out is off)
   - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it
   - `relish os abort`: Stop the rollout; nodes keep the version they're on
-  - `relish os boot-logs`: Where each appliance sends its kernel and boot logs over UDP, or change it: with --to, to that machine from now on, where `relish machines logs` or `relish netboot --stream-logs` shows them; with --off, nowhere. The lines cross the LAN in cleartext. Each node keeps the setting on its ESP, so it holds across reboots and OS updates *(0.3.3, not in 0.3.2)*
+  - `relish os boot-logs`: Where each appliance sends its kernel and boot logs over UDP, or change it: with --to, to that machine from now on, where `relish machines logs` or `relish netboot --stream-logs` shows them; with --off, nowhere. The lines cross the LAN in cleartext. Each node keeps the setting on its ESP, so it holds across reboots and OS updates
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node

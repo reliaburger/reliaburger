@@ -179,6 +179,7 @@ async fn owned_follow_node(
 /// Supports `?tail=N` to return only the last N lines, and
 /// `?follow=true` to stream new lines as an SSE stream.
 pub(super) async fn logs_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
@@ -228,6 +229,9 @@ pub(super) async fn logs_handler(
     }
 
     if follow {
+        // A followed stream is authenticated once, here; the watch ends it
+        // when its token is revoked or expires (#2399).
+        let watch = watch.map(|extension| extension.0);
         let owned_node = if query.local.unwrap_or(false) {
             None
         } else {
@@ -250,9 +254,13 @@ pub(super) async fn logs_handler(
         {
             let stream = ReceiverStream::new(frames)
                 .map(|frame| Ok::<_, std::convert::Infallible>(log_frame_event(frame)));
-            return Sse::new(stream)
-                .keep_alive(axum::response::sse::KeepAlive::default())
-                .into_response();
+            return crate::sesame::auth::end_with_credential(
+                Sse::new(stream)
+                    .keep_alive(axum::response::sse::KeepAlive::default())
+                    .into_response(),
+                watch,
+                crate::sesame::auth::credential_ended_warning(),
+            );
         }
         let label = query
             .label
@@ -274,9 +282,13 @@ pub(super) async fn logs_handler(
         };
         let stream = ReceiverStream::new(lines_rx)
             .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
-        return Sse::new(stream)
-            .keep_alive(axum::response::sse::KeepAlive::default())
-            .into_response();
+        return crate::sesame::auth::end_with_credential(
+            Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response(),
+            watch,
+            crate::sesame::auth::credential_ended_warning(),
+        );
     }
 
     if selection.instances.is_empty() {
@@ -755,6 +767,7 @@ pub(super) async fn relay_peer_log_stream(
 /// A cluster member follows every node that runs the app, exactly as the SSE
 /// follow does; each text frame is one [`LogFrame`] as JSON.
 pub(super) async fn ws_logs_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
@@ -834,7 +847,9 @@ pub(super) async fn ws_logs_handler(
         },
     };
     upgrade
-        .on_upgrade(move |socket| ws_logs_session(socket, frames))
+        .on_upgrade(move |socket| {
+            ws_logs_session(socket, frames, watch.map(|extension| extension.0))
+        })
         .into_response()
 }
 
@@ -851,9 +866,30 @@ pub(super) fn frame_local_lines(mut lines: mpsc::Receiver<String>) -> mpsc::Rece
     frames_rx
 }
 
-pub(super) async fn ws_logs_session(mut socket: WebSocket, mut frames: mpsc::Receiver<LogFrame>) {
+/// The Close frame a live socket gets when the token that opened it is
+/// revoked or expires: policy violation, with the reason (#2399).
+pub(super) fn credential_ended_close() -> Message {
+    Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: axum::extract::ws::close_code::POLICY,
+        reason: crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE.into(),
+    }))
+}
+
+pub(super) async fn ws_logs_session(
+    mut socket: WebSocket,
+    mut frames: mpsc::Receiver<LogFrame>,
+    watch: Option<crate::sesame::auth::CredentialWatch>,
+) {
+    // `select!` polls this future again on every turn of the loop, so it is
+    // made once and pinned: a fresh one each turn would restart its timer.
+    let credential_ended = crate::sesame::auth::credential_ended(watch);
+    tokio::pin!(credential_ended);
     loop {
         tokio::select! {
+            () = &mut credential_ended => {
+                let _ = socket.send(credential_ended_close()).await;
+                return;
+            }
             frame = frames.recv() => {
                 let Some(frame) = frame else { return };
                 let Ok(json) = serde_json::to_string(&frame) else { continue };
