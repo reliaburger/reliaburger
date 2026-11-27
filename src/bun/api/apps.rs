@@ -244,6 +244,9 @@ pub(super) struct ScaleRequest {
 /// that isn't the count now. A follower forwards the whole request to the
 /// leader, which reads the spec from its own state. A standalone node has
 /// no desired state to change.
+// An axum handler takes one argument per extractor; the credential watch
+// made it eight.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn scale_handler(
     watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
