@@ -314,6 +314,8 @@ Image manifests are small (typically < 10KB) and must be consistent across the c
 
 This ensures that tag resolution (which digest does `myapp:v1.4.2` point to?) is always consistent, even during concurrent pushes. Layer location data is updated asynchronously via the reporting tree but committed to Raft periodically to survive leader elections.
 
+As shipped, the tables live in `ManifestCatalog` (`src/pickle/types.rs`) as vectors of pairs: manifests, tags keyed `repository:tag`, and blob holders. Lookups are linear scans, which is cheap at the sizes a cluster reaches but grows with a CI system that tags every build. GC builds a holder lookup once per sweep (`ManifestCatalog::holder_index`), and a push keeps one copy of the catalogue for rollback and writes `catalog.json` as compact JSON (#2427). Re-typing the tables as `BTreeMap`s changes the stored format and is left for a format-changing release, with tag retention (tagged images never expire today).
+
 ### 3.5 Layer Storage on Disk
 
 Layer blobs are the bulk of image data (megabytes to gigabytes) and are too large for Raft. They live on each node's local filesystem in the content-addressed blob store. Layer transfer between nodes uses a direct node-to-node HTTP streaming protocol over mTLS, outside the Raft consensus path.

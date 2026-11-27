@@ -150,14 +150,18 @@ pub fn gc_candidates(
         }
     }
 
+    let holder_index = catalog.holder_index();
     let mut candidates: Vec<Digest> = Vec::new();
     for blob_digest in &local_blobs {
         if protected_digests.contains(blob_digest.as_str()) {
             continue;
         }
 
-        let holders = catalog.layer_holders(blob_digest.as_str());
-        if holders.is_empty() {
+        let holders = holder_index
+            .get(blob_digest.as_str())
+            .copied()
+            .filter(|holders| !holders.is_empty());
+        let Some(holders) = holders else {
             // Untracked blob: an orphan, unless it's a push still in
             // flight — its manifest hasn't committed yet, so give it a
             // grace window before nominating.
@@ -165,7 +169,10 @@ pub fn gc_candidates(
                 orphan_grace_count += 1;
                 continue;
             }
-        } else if holders.len() == 1 && holders.contains(&config.node_id) {
+            candidates.push(blob_digest.clone());
+            continue;
+        };
+        if holders.len() == 1 && holders.contains(&config.node_id) {
             // This node owns the sole advertised copy: never nominate. The arbiter re-checks this
             // authoritatively; skipping here just avoids pointless
             // round-trips.

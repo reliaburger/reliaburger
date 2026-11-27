@@ -652,6 +652,16 @@ impl ManifestCatalog {
             .collect()
     }
 
+    /// Every tracked blob's holders, keyed by digest, for a caller that looks
+    /// up many digests at once (GC asks about every local blob). One pass
+    /// builds it, so `n` lookups cost `n`, not `n` times the table (#2427).
+    pub fn holder_index(&self) -> std::collections::HashMap<&str, &BTreeSet<u64>> {
+        self.layer_locations
+            .iter()
+            .map(|(digest, holders)| (digest.as_str(), holders))
+            .collect()
+    }
+
     /// Get the set of nodes holding a layer.
     pub fn layer_holders(&self, digest: &str) -> BTreeSet<u64> {
         self.layer_locations
@@ -896,7 +906,8 @@ impl ManifestCatalog {
     /// Single-node mode has no Raft to remember the catalog, and even
     /// cluster nodes want their local holder view back after a restart.
     pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
-        let json = serde_json::to_vec_pretty(self)
+        // Compact: every push rewrites this file (#2427).
+        let json = serde_json::to_vec(self)
             .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
         let parent = path
             .parent()
@@ -1700,6 +1711,48 @@ mod tests {
         assert!(catalog.get_manifest_by_tag("a", "x:y").is_none());
         assert_eq!(catalog.tags_for_repository("a"), vec!["x".to_string()]);
         assert_eq!(catalog.manifests.len(), 1);
+    }
+
+    /// #2427: GC asks for the holders of every local blob, so it builds
+    /// one lookup instead of scanning `layer_locations` per blob.
+    #[test]
+    fn layer_holders_is_answered_from_an_index() {
+        let catalog = ManifestCatalog {
+            layer_locations: (0..10_000u64)
+                .map(|index| {
+                    (
+                        test_digest(&format!("{index:x}")).0,
+                        BTreeSet::from([index]),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = catalog.holder_index();
+        assert_eq!(index.len(), 10_000);
+        let last = test_digest(&format!("{:x}", 9_999));
+        assert_eq!(index.get(last.as_str()), Some(&&BTreeSet::from([9_999])));
+        assert_eq!(index.get(test_digest("absent").as_str()), None);
+    }
+
+    /// #2427: every push rewrites the catalogue file, so it's compact JSON,
+    /// not pretty-printed.
+    #[test]
+    fn the_persisted_catalogue_is_compact_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("web", "a"),
+            tag: "v1".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog.persist_to(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert!(!written.contains(&b'\n'), "pretty-printed catalogue");
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert!(reloaded.get_manifest_by_tag("web", "v1").is_some());
     }
 
     #[test]

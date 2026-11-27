@@ -368,13 +368,16 @@ async fn record_commit_owned(
                 return Err(PickleError::MissingLayer(digest.clone()));
             }
         }
+        // One copy, kept for rollback; the guarded catalogue changes in
+        // place, and goes back to that copy if it can't be persisted (#2427).
         let previous = catalog.clone();
-        let mut next = catalog.clone();
-        next.apply_manifest_commit(&local_commit);
-        if let Some(path) = &persist {
-            next.persist_to(path)?;
+        catalog.apply_manifest_commit(&local_commit);
+        if let Some(path) = &persist
+            && let Err(error) = catalog.persist_to(path)
+        {
+            *catalog = previous;
+            return Err(error);
         }
-        *catalog = next;
         Ok((catalog, previous))
     })
     .await
