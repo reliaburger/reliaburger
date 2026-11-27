@@ -1067,7 +1067,7 @@ printf %s "$DB_PASSWORD" | relish secret encrypt --pubkey "$(relish secret pubke
 when you give it neither a file nor a value. At a terminal it asks for the
 value without echoing it. One trailing newline is dropped, so a file written
 by an editor or `echo` works. A value can also go on the command line
-(`relish secret encrypt --pubkey KEY 'the value'`), but other users on the
+(`relish secret encrypt --pubkey KEY VALUE`), but other users on the
 machine can see it in the process list while the command runs, and your shell
 history keeps it, so keep that form for values that aren't secret.
 
