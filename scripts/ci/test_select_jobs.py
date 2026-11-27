@@ -228,7 +228,10 @@ class SelectJobsTests(unittest.TestCase):
         # so a change to them or to what they measure runs it (#2493).
         for path in ["benches/scheduler.rs", "benches/policy.rs", "src/cluster/orchestrate.rs",
                      "src/meat/scheduler.rs", "src/meat/filter.rs", "src/meat/score.rs",
-                     "src/meat/quota.rs", "src/meat/cluster_state.rs", "src/policy/check.rs"]:
+                     "src/meat/quota.rs", "src/meat/cluster_state.rs", "src/policy/check.rs",
+                     # make bench runs the ingress drain tracker's benchmark
+                     # too (#2455).
+                     "benches/wrapper_drains.rs", "src/wrapper/draining.rs"]:
             with self.subTest(path=path):
                 self.pull_request(path)
                 gossip = self.repo.select(base_sha=self.main)["gossip"]

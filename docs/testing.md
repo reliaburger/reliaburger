@@ -353,12 +353,15 @@ The `benchmarks` job in [`ci.yml`](../.github/workflows/ci.yml) runs `make
 bench` (the gossip benchmarks, then [`benches/scheduler.rs`](../benches/scheduler.rs):
 a leader pass placing 150 replicas, and a converged pass, on 1,000 and 10,000
 nodes, then [`benches/policy.rs`](../benches/policy.rs): compiling 10, 100 and
-1,000 policies, and judging one app under them) and `make bench-large`, and the `task-array benchmarks` job runs `make
+1,000 policies, and judging one app under them, then
+[`benches/wrapper_drains.rs`](../benches/wrapper_drains.rs): the ingress
+drain tracker's capture and release on the request path,
+[#2455](https://github.com/reliaburger/reliaburger/issues/2455)) and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches what `make bench` measures: the gossip
 protocol, the scheduler's planning pass (`src/cluster/orchestrate.rs` and the
 scheduler, filter, score, quota and cluster-state modules under `src/meat/`),
-the policy engine (`src/policy/`), or any of their benchmarks
+the policy engine (`src/policy/`), the drain tracker (`src/wrapper/draining.rs`), or any of their benchmarks
 ([#2493](https://github.com/reliaburger/reliaburger/issues/2493)); and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
 itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
