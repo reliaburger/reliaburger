@@ -219,6 +219,16 @@ async fn what_has_no_count_to_set_is_refused() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("every node"), "{body}");
+    // A count in the billions would make every leader in turn plan it
+    // (#2368).
+    let (status, body) = cluster
+        .scale(&cluster.deployer, "/v1/scale/web/shop", u32::MAX)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains(&crate::config::MAX_REPLICAS.to_string()),
+        "{body}"
+    );
     assert_eq!(cluster.web().await.replicas, Replicas::Fixed(1));
 }
 

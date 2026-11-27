@@ -221,9 +221,20 @@ the borrow. `let ... else` is the Rust way to say "bind this or leave": the
 is known to exist.
 
 `scale_refusal` lives on `AppSpec` and returns `Option<ScaleRefusal>`, a
-three-variant enum. An agent's `relish agent propose scale` (Chapter 19)
+four-variant enum. An agent's `relish agent propose scale` (Chapter 19)
 calls the same method, so a person and an agent are refused for exactly the
 same things, each with its own wording.
+
+The fourth variant, `TooMany`, came from the November 2026 audit (#2368).
+`replicas` is a `u32`, so `relish scale web --replicas 4000000000` used to
+commit. The leader then planned four billion replicas in memory and died,
+and so did each leader elected after it, because they all read the same
+desired state. A count above `MAX_REPLICAS` (ten thousand) is now refused
+in three places that share the one constant: `relish apply` and `relish
+lint` (`validate_app`), the scale handler, and a scale proposal. The
+`Replicas` deserialiser doesn't enforce it. If it did, desired state that
+already held a larger count would fail to load, and you couldn't scale it
+back down.
 
 Two smaller decisions are worth a sentence each. We re-apply the *stored*
 spec, whose images are already bound to digests, so a scale never quietly

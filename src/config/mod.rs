@@ -35,7 +35,7 @@ pub use node::NodeConfig;
 pub use permission::{PermissionAction, PermissionSpec};
 pub use policy::{PolicyAction, PolicySpec, PolicyTarget};
 pub use template::{Provenance, TemplateError, TemplateSpec, UseSpec};
-pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
+pub use types::{ConfigFileSpec, EnvValue, MAX_REPLICAS, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.
 ///

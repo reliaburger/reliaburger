@@ -490,7 +490,7 @@ fn read_passphrase_file(path: &Path) -> Result<SecretString, RelishError> {
 
 /// Ask for a secret on the controlling terminal with echo off.
 #[cfg(unix)]
-fn prompt_secret(prompt: &str) -> Result<SecretString, RelishError> {
+pub(crate) fn prompt_secret(prompt: &str) -> Result<SecretString, RelishError> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 
     let no_terminal = |e: std::io::Error| {
@@ -533,7 +533,7 @@ fn ask_on(tty: &fs::File, prompt: &str) -> std::io::Result<String> {
 }
 
 #[cfg(not(unix))]
-fn prompt_secret(_prompt: &str) -> Result<SecretString, RelishError> {
+pub(crate) fn prompt_secret(_prompt: &str) -> Result<SecretString, RelishError> {
     Err(RelishError::InvalidFlag {
         flag: "passphrase-file".to_string(),
         reason: "prompting for a passphrase needs a Unix terminal".to_string(),

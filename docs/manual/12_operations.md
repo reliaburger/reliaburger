@@ -561,8 +561,9 @@ An `env` value whose key looks secret (it contains `PASSWORD`, `SECRET`,
 `ENC[AGE:...]` value gets a warning. It shows in the leader's log, in the
 sync status (`relish gitops status`) and in `relish wtf`. The sync still
 applies it: refusing would break repositories that worked yesterday. Encrypt
-the value with `relish secret encrypt` (see
-[Secrets](10_security.md#secrets)) and commit that instead.
+the value with `relish secret encrypt`, which reads it from a file or
+standard input (see [Secrets](10_security.md#secrets)), and commit that
+instead.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The

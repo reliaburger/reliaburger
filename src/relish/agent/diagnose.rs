@@ -833,7 +833,7 @@ Nothing about findings here.
                 id: "disk-high".to_string(),
                 title: "node node-2 filesystem for images is 88.0% full".to_string(),
                 details: vec!["88 of 100 bytes used; configured domains: images".to_string()],
-                suggestion: "node node-2 disk is at 88.0%; prune images (`relish pickle gc`) or logs".to_string(),
+                suggestion: "node node-2 disk is at 88.0%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml".to_string(),
                 correlated_events: Vec::new(),
                 affected_resource: "node.node-2".to_string(),
             }],

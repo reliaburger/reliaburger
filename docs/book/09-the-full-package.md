@@ -757,6 +757,25 @@ Init containers broke that rule for longer than anyone noticed. The importer kep
 
 Jobs had the same disease. A `completions: 50` Job imported as a single run, silently. `backoffLimit` and the pod's `activeDeadlineSeconds` now map onto `max_attempts` and `task_timeout_secs`, the run-policy fields 0.2.0 added (`backoffLimit` counts retries, so it's off by one from attempts, and anything above 9 is capped at Reliaburger's limit of 10, with a warning). A Job-wide `activeDeadlineSeconds` becomes the per-attempt timeout, with a warning, because the two don't mean the same thing. Everything else that changes how often a job runs (`completions`, `parallelism`, `completionMode`, a CronJob's `timeZone` and `startingDeadlineSeconds`) and everything a job's pod carries that a `[job.*]` can't (`workingDir`, the user, `nodeSelector`, tolerations, affinity, sidecars, volumes) gets a warning per field.
 
+Every one of those fixes added a warning for one field, and that's how the problem kept coming back. The November 2026 audit (#2461) counted the fields still dropped without a word: a StatefulSet's `volumeClaimTemplates` and every container's `volumeMounts`, so the usual Postgres StatefulSet imported as an app with no volume and a report that never mentioned storage; `imagePullSecrets`; `hostNetwork`; `startupProbe`; the hardening half of `securityContext`; a `Recreate` strategy. For a plain Deployment the report could be empty, and `--strict`, the CI gate, passed. Thirty more `if` statements would have fixed that list and left the next one.
+
+So the importer now checks itself. After it converts a resource it serialises the typed object back to JSON (`serde_json::to_value` works on any `Serialize` type, and the `k8s_openapi` types are all `Serialize`) and walks every field against a table of rules for that kind:
+
+```rust
+enum FieldUse {
+    Read,
+    Ignored,
+    Dropped { when: Values, why: &'static str },
+}
+
+struct FieldRule {
+    path: String,
+    field_use: FieldUse,
+}
+```
+
+`Read` means a conversion maps the field or already reports it in its own words. `Ignored` is for fields with nothing to lose: metadata, `status`, selectors, history limits. `Dropped` is reported, unless `when` says its value is the Kubernetes default, and `why` says what to do instead. A path such as `spec.template.spec.containers[*].volumeMounts[*].mountPath` uses `[*]` for any element, `[0]` for the first and `[+]` for the rest, which is how the first container (the app) and the others (sidecars) get different rules. The walk descends while some rule reaches deeper, applies the longest rule that matches, and reports anything no rule covers as `PATH = VALUE is not imported`. That last part is the point. The default is to warn, so a field Kubernetes adds next year shows up in the report instead of vanishing. `an_ordinary_deployment_imports_without_a_warning` keeps the other side honest: a Deployment as `kubectl get -o yaml` prints it, defaults and all, still imports with an empty report, so the walk doesn't bury the warnings that matter.
+
 ### The migration report
 
 Every import produces a report on stderr: what was converted, what was approximated, and what was dropped.
