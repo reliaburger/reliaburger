@@ -976,6 +976,39 @@ fn manual_reference_lists_every_app_and_job_field() {
     );
 }
 
+/// Every value `bun --help` offers for `--runtime` is in the manual's
+/// `--runtime` row, so the reference never hides one the binary shows.
+#[test]
+fn manual_bun_runtime_row_names_every_value_bun_offers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bun"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    // clap's long help lists each value as `- name: what it does`.
+    let after_flag = &help[help.find("--runtime <").expect("bun has no --runtime")..];
+    let values: Vec<&str> = after_flag
+        .lines()
+        .skip_while(|line| !line.contains("Possible values:"))
+        .skip(1)
+        .map_while(|line| line.trim().strip_prefix("- "))
+        .filter_map(|item| item.split(':').next())
+        .collect();
+    assert!(values.len() > 3, "found only {values:?} in:\n{after_flag}");
+
+    let reference = read("docs/manual/13_reference.md");
+    let row = manual_section(&reference, "## bun flags")
+        .lines()
+        .find(|line| line.starts_with("| `--runtime"))
+        .expect("no --runtime row under ## bun flags")
+        .to_string();
+    let missing: Vec<&&str> = values
+        .iter()
+        .filter(|value| !row.contains(&format!("`{value}`")))
+        .collect();
+    assert!(missing.is_empty(), "the --runtime row omits {missing:?}: {row}");
+}
+
 // --- The CLI design doc ------------------------------------------------------
 
 /// `docs/design/cli-relish.md` describes what `relish` does. Every inline
