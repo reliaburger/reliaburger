@@ -72,6 +72,17 @@ const MAX_SYNC_FLOORS: usize = MAX_PIGGYBACK_UPDATES * 2;
 /// so a stream of old datagrams draws one answer a second, not one each.
 const STALE_ANSWER_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The highest incarnation a node accepts from the wire (#2395).
+///
+/// Incarnations start at 1 and rise by one per refutation or restart, so
+/// no real node gets near half of `u64`'s range. A datagram, update, `Stale`
+/// answer or floor above this is dropped: without the bound one claim at
+/// `u64::MAX` left its subject with no higher incarnation to refute it with.
+pub const MAX_INCARNATION: u64 = u64::MAX / 2;
+
+/// Shortest gap between two log lines about dropped implausible incarnations.
+const IMPLAUSIBLE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How fresh a sender's datagram is: its incarnation, then its sequence.
 /// The derived ordering compares the fields in declaration order, so a
 /// higher incarnation wins whatever the sequence. That's what lets a
@@ -145,6 +156,40 @@ impl SendFailureLog {
         self.unreported = 0;
         self.last_logged = Some(now);
         Some(line)
+    }
+}
+
+/// Rate-limited reporting of incarnations dropped as above
+/// [`MAX_INCARNATION`]: every refusal is counted, and one line goes to
+/// stderr at most every [`IMPLAUSIBLE_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct ImplausibleLog {
+    /// Refusals since the node started.
+    total: u64,
+    /// Refusals since the last line we printed.
+    unreported: u64,
+    last_logged: Option<Instant>,
+}
+
+impl ImplausibleLog {
+    /// Count a refusal of `what` from `sender`, and log it unless the last
+    /// line is too recent.
+    fn record(&mut self, now: Instant, sender: &NodeId, what: &str) {
+        self.total += 1;
+        self.unreported += 1;
+        if self
+            .last_logged
+            .is_some_and(|last| now.duration_since(last) < IMPLAUSIBLE_LOG_INTERVAL)
+        {
+            return;
+        }
+        eprintln!(
+            "mustard: dropped {what} from {sender} with an incarnation above {MAX_INCARNATION} \
+             ({} refusal(s) since the last report)",
+            self.unreported
+        );
+        self.unreported = 0;
+        self.last_logged = Some(now);
     }
 }
 
@@ -300,6 +345,8 @@ pub struct MustardNode<T: MustardTransport> {
     pending_relays: VecDeque<PendingRelay>,
     /// Failed sends, reported at a bounded rate.
     send_failures: SendFailureLog,
+    /// Incarnations dropped as implausible (#2395).
+    implausible: ImplausibleLog,
     /// Whether we've already said that our directory extension is too big
     /// to send, so the line appears once rather than on every datagram.
     oversize_extension_logged: bool,
@@ -368,6 +415,7 @@ impl<T: MustardTransport> MustardNode<T> {
             highest_sent: 0,
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
+            implausible: ImplausibleLog::default(),
             oversize_extension_logged: false,
             stats: super::stats::GossipStats::default(),
         }
@@ -1064,9 +1112,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// else is no newer than our floor. A floor for a sender we hear
     /// directly and consider up is ignored (our own record is what counts),
     /// and so is a floor about this node.
-    fn merge_floors(&mut self, floors: &[SequenceFloor], now: Instant) {
+    fn merge_floors(&mut self, sender: &NodeId, floors: &[SequenceFloor], now: Instant) {
         for floor in floors {
             if floor.node_id == self.node_id {
+                continue;
+            }
+            if floor.incarnation > MAX_INCARNATION {
+                self.implausible.record(now, sender, "a sequence floor");
                 continue;
             }
             let freshness = Freshness {
@@ -1163,6 +1215,10 @@ impl<T: MustardTransport> MustardNode<T> {
             return false;
         }
         let now = Instant::now();
+        if message.incarnation > MAX_INCARNATION {
+            self.implausible.record(now, &message.sender, "a datagram");
+            return false;
+        }
         // Replay protection comes before anything is applied. The HMAC proves
         // the sender wrote these bytes once, not that it wrote them just now:
         // a captured datagram replayed from another socket would otherwise
@@ -1232,6 +1288,11 @@ impl<T: MustardTransport> MustardNode<T> {
         // Process piggybacked updates
         self.stats.record_updates(message.payload.updates().len());
         for update in message.payload.updates() {
+            if update.incarnation > MAX_INCARNATION {
+                self.implausible
+                    .record(now, &message.sender, "a membership update");
+                continue;
+            }
             let changed = self.membership.apply_update(update, now);
             if changed {
                 // Re-disseminate to other nodes
@@ -1301,7 +1362,7 @@ impl<T: MustardTransport> MustardNode<T> {
                 if let Some(sender) = &self.synced_watch {
                     sender.send_if_modified(|synced| !std::mem::replace(synced, true));
                 }
-                self.merge_floors(floors, now);
+                self.merge_floors(&message.sender, floors, now);
                 // The entries were merged above like any piggybacked update.
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
@@ -1324,7 +1385,10 @@ impl<T: MustardTransport> MustardNode<T> {
                     incarnation: *held_incarnation,
                     sequence: *held_sequence,
                 };
-                if !self.left && self.behind(held) {
+                if *held_incarnation > MAX_INCARNATION {
+                    self.implausible
+                        .record(now, &message.sender, "a stale answer");
+                } else if !self.left && self.behind(held) {
                     self.refute(*held_incarnation);
                 }
             }
@@ -1407,8 +1471,15 @@ impl<T: MustardTransport> MustardNode<T> {
     /// peers held it Dead@50, and restarted at 1 would otherwise need ~49
     /// refutes (often longer than the 60s reap) before its Alive out-ranks the
     /// stale Dead. Seeding from the seen value means a single refute wins.
+    ///
+    /// The step saturates at [`MAX_INCARNATION`]: a claim at the ceiling
+    /// burns this node's headroom (it can't out-rank it), but nothing wraps.
     fn refute(&mut self, offending_incarnation: u64) {
-        self.incarnation = self.incarnation.max(offending_incarnation) + 1;
+        self.incarnation = self
+            .incarnation
+            .max(offending_incarnation)
+            .saturating_add(1)
+            .min(MAX_INCARNATION);
         let update = MembershipUpdate {
             node_id: self.node_id.clone(),
             address: self.address,
@@ -3446,6 +3517,107 @@ mod tests {
         );
     }
 
+    /// #2395: a claim at `u64::MAX` used to make `refute` overflow: a panic
+    /// in a test build, and in a release build a wrap to incarnation 0 that
+    /// lost to the claim everywhere. Now the claim is dropped at the door.
+    #[tokio::test]
+    async fn a_claim_at_the_highest_incarnation_does_not_wrap_ours() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let claim = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Dead,
+                    incarnation: u64::MAX,
+                }],
+            },
+        );
+        node.handle_message(addr(9), claim).await;
+
+        assert!(node.incarnation >= 1);
+        assert_eq!(
+            node.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive
+        );
+        assert_eq!(node.implausible.total, 1, "the refusal went uncounted");
+    }
+
+    /// A claim at the ceiling itself is plausible, and refuting it can't go
+    /// past the ceiling: the node stays at the highest incarnation a peer
+    /// accepts instead of wrapping or stepping out of range.
+    #[tokio::test]
+    async fn a_claim_at_the_ceiling_saturates_instead_of_wrapping() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let claim = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Suspect,
+                    incarnation: MAX_INCARNATION,
+                }],
+            },
+        );
+        node.handle_message(addr(9), claim).await;
+        assert_eq!(node.incarnation, MAX_INCARNATION);
+    }
+
+    /// Every other way an incarnation arrives from the wire is bounded too:
+    /// a datagram's own incarnation, a `Stale` answer and a floor.
+    #[tokio::test]
+    async fn a_datagram_a_stale_answer_and_a_floor_above_the_ceiling_are_dropped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        let mut ping = ping_from("loud");
+        ping.incarnation = MAX_INCARNATION + 1;
+        assert!(!node.handle_message(addr(9), ping).await);
+        assert!(node.membership.get(&NodeId::new("loud")).is_none());
+
+        let stale = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Stale {
+                held_incarnation: u64::MAX,
+                held_sequence: u64::MAX,
+                updates: vec![],
+            },
+        );
+        node.handle_message(addr(2), stale).await;
+        assert_eq!(node.incarnation, 1, "an implausible Stale moved us");
+
+        let sync = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Sync {
+                entries: vec![],
+                floors: vec![SequenceFloor {
+                    node_id: NodeId::new("victim"),
+                    incarnation: u64::MAX,
+                    sequence: u64::MAX,
+                    expires_in_secs: 60,
+                }],
+                wants_reply: false,
+            },
+        );
+        node.handle_message(addr(2), sync).await;
+        assert!(
+            !node.sequence_floors.contains_key(&NodeId::new("victim")),
+            "an implausible floor was kept"
+        );
+        assert_eq!(node.implausible.total, 3);
+    }
+
     /// O9: refuting told the cluster we're alive but left our own record
     /// holding the claim we'd just refuted, so the node disagreed with
     /// everyone else about itself — including the scheduler and council reads
@@ -4153,11 +4325,15 @@ mod tests {
         assert!(node.handle_message(addr(2), ping_from("live")).await);
         let floor = |name: &str| SequenceFloor {
             node_id: NodeId::new(name),
-            incarnation: u64::MAX,
+            incarnation: MAX_INCARNATION,
             sequence: u64::MAX,
             expires_in_secs: u32::MAX,
         };
-        node.merge_floors(&[floor("n1"), floor("live"), floor("gone")], Instant::now());
+        node.merge_floors(
+            &NodeId::new("peer"),
+            &[floor("n1"), floor("live"), floor("gone")],
+            Instant::now(),
+        );
 
         assert_eq!(
             node.sequence_floors.keys().cloned().collect::<Vec<_>>(),

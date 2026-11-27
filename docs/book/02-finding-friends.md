@@ -485,6 +485,20 @@ fn refute(&mut self) {
 
 Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
 
+The refutation jumps past the claim, `max(own, offending) + 1`, so a node that restarted at 1 while its peers hold it `Dead` at 50 wins in one step. The claim's incarnation comes straight off the wire, though, and an audit in 0.3.4 asked what a claim at `u64::MAX` does to that `+ 1` (#2395). In C an unsigned overflow silently wraps. Rust is stricter, and also less uniform than you might expect: a debug or test build checks every `+` and panics on overflow ("attempt to add with overflow"), while a release build, by default, skips the check and wraps. So the same claim killed the gossip task in our tests and, in production, wrapped the node's incarnation to 0, a refutation that loses to the claim everywhere. Neither is acceptable from one datagram.
+
+The fix has two halves. Nothing real comes near half of `u64`'s range, so `handle_message` drops any incarnation above `MAX_INCARNATION` (`u64::MAX / 2`) before it's applied: the datagram's own, each update's, a `Stale` answer's and a floor's. And the arithmetic says what it means:
+
+```rust
+self.incarnation = self
+    .incarnation
+    .max(offending_incarnation)
+    .saturating_add(1)
+    .min(MAX_INCARNATION);
+```
+
+`saturating_add` clamps at the type's maximum instead of overflowing, in debug and release alike; `checked_add` is its sibling that returns `None` on overflow when you want to refuse instead. The `.min` keeps our own incarnation inside the range our peers accept. `a_claim_at_the_highest_incarnation_does_not_wrap_ours` panicked before the fix; `a_claim_at_the_ceiling_saturates_instead_of_wrapping` and `a_datagram_a_stale_answer_and_a_floor_above_the_ceiling_are_dropped` cover the rest.
+
 A node only refutes a claim at or above its own incarnation. A `Suspect` at a lower one has already lost to the node's own record, since the higher incarnation wins, so refuting it would raise the incarnation and spread an `Alive` for nothing; a delayed or repeated rumour used to do exactly that. `a_claim_below_our_incarnation_is_not_refuted` checks `Suspect`, `Dead` and `Left` below the incarnation, and a `Suspect` at it.
 
 ### Three holes in the probe cycle
