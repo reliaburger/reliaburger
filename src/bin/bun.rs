@@ -1262,6 +1262,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
         .await
         .context("cannot account physical image storage")?;
+    blob_store
+        .configure_file_limit(config.images.max_files)
+        .context("cannot set images.max_files")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
@@ -4003,6 +4006,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             retain_days: config.images.gc_retain_days,
             node_id: node_raft_id,
             orphan_grace: std::time::Duration::from_secs(3600),
+            pinned_digests: Default::default(),
         };
         let gc_interval = std::time::Duration::from_secs(
             u64::from(config.images.gc_interval_hours.max(1)) * 3600,
@@ -4075,7 +4079,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     (None, false) => Arc::new(gc_catalog.read().await.clone()),
                 };
                 let store = Arc::clone(&gc_store);
-                let gc_cfg = gc_config.clone();
+                let mut gc_cfg = gc_config.clone();
+                // An active upgrade's binaries are untracked blobs nodes still
+                // need (#2419). The arbiter keeps them as well; this only
+                // saves nominating them.
+                if let Some(council) = &gc_council {
+                    gc_cfg.pinned_digests = council
+                        .read_desired(|state| {
+                            state
+                                .active_upgrade
+                                .as_ref()
+                                .map(reliaburger::upgrade::types::ClusterUpgradeState::binary_digests)
+                                .unwrap_or_default()
+                        })
+                        .await;
+                }
                 let nominated = tokio::task::spawn_blocking(move || {
                     gc_candidates(&store, &catalog_snapshot, &active, &gc_cfg)
                 })

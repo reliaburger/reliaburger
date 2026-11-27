@@ -263,7 +263,7 @@ do only what the block lists:
 
 | Action | What it covers |
 |--------|----------------|
-| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and push images to their repositories, with `relish build` or any registry client (see `images-and-volumes`) |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
 | `host-exec` | jobs and process workloads that run host commands, apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`), and apps with `[runtime]` knobs (each node also lists each knob; see "Runtime knobs" below) |

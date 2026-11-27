@@ -81,6 +81,12 @@ impl BlobStore {
             })?
     }
 
+    /// Cap the number of payload files (blobs, receipts and upload
+    /// temporaries) the store may hold: `[images] max_files` (#2431).
+    pub fn configure_file_limit(&self, limit: usize) -> Result<(), PickleError> {
+        self.budget.set_file_limit(limit)
+    }
+
     /// Bytes still free under `[images] max_storage`, or `None` when no
     /// ceiling is configured. A pull compares a layer's advertised size with
     /// this before it asks for a single byte (#2424).
@@ -1088,6 +1094,25 @@ mod tests {
         ));
     }
 
+    /// #2431: hitting the file-count cap says so, with the count and the
+    /// setting to raise, rather than borrowing the byte quota's message.
+    #[tokio::test]
+    async fn the_file_count_limit_has_its_own_error() {
+        let (store, _directory) = test_store();
+        store.configure_storage_limit(0).await.unwrap();
+        store.configure_file_limit(2).unwrap();
+        let _a = store.initiate_upload().await.unwrap();
+        let _b = store.initiate_upload().await.unwrap();
+        let refused = store.initiate_upload().await.unwrap_err();
+        assert!(
+            matches!(refused, PickleError::StorageFileLimitExceeded { limit: 2 }),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.contains("2 files"), "{message}");
+        assert!(message.contains("max_files"), "{message}");
+    }
+
     #[tokio::test]
     async fn empty_upload_file_admission_is_bounded_and_cancel_restores_capacity() {
         let (store, _directory) = test_store();
@@ -1097,7 +1122,7 @@ mod tests {
         let b = store.initiate_upload().await.unwrap();
         assert!(matches!(
             store.initiate_upload().await,
-            Err(PickleError::StorageQuotaExceeded)
+            Err(PickleError::StorageFileLimitExceeded { limit: 2 })
         ));
         store.cancel_upload(&a).await.unwrap();
         let replacement = store.initiate_upload().await.unwrap();
@@ -1165,7 +1190,7 @@ mod tests {
         store.budget.set_file_limit(2).unwrap();
         assert!(matches!(
             store.initiate_upload().await,
-            Err(PickleError::StorageQuotaExceeded)
+            Err(PickleError::StorageFileLimitExceeded { limit: 2 })
         ));
         store.delete_blob(&digest).unwrap();
         let upload = store.initiate_upload().await.unwrap();
@@ -1207,7 +1232,7 @@ mod tests {
         restarted.budget.set_file_limit(3).unwrap();
         assert!(matches!(
             restarted.initiate_upload().await,
-            Err(PickleError::StorageQuotaExceeded)
+            Err(PickleError::StorageFileLimitExceeded { limit: 3 })
         ));
         restarted.budget.set_file_limit(4).unwrap();
         let upload = restarted.initiate_upload().await.unwrap();

@@ -867,6 +867,35 @@ impl StateMachineInner {
                         reason: "registry writer identity is retired".into(),
                     });
                 }
+                // An active upgrade's binaries are bare blobs no manifest
+                // tracks, so the catalogue would approve them as orphans.
+                // Nodes fetch them only when their turn comes, paused runs
+                // included, so they stay until the upgrade has gone (#2419).
+                let kept = self
+                    .state
+                    .active_upgrade
+                    .as_ref()
+                    .map(crate::upgrade::types::ClusterUpgradeState::binary_digests)
+                    .unwrap_or_default();
+                let without_binaries;
+                let report = if report
+                    .deleted_layers
+                    .iter()
+                    .any(|digest| kept.contains(digest.as_str()))
+                {
+                    without_binaries = crate::pickle::types::GcReport {
+                        node_id: report.node_id,
+                        deleted_layers: report
+                            .deleted_layers
+                            .iter()
+                            .filter(|digest| !kept.contains(digest.as_str()))
+                            .cloned()
+                            .collect(),
+                    };
+                    &without_binaries
+                } else {
+                    report
+                };
                 // The state machine is the deletion arbiter (M2): apply
                 // runs serialised through the Raft log, so two nodes
                 // racing to delete the last two copies of a layer get
@@ -7174,6 +7203,47 @@ mod tests {
         assert_eq!(
             retained.tags,
             std::collections::BTreeSet::from(["latest".into()])
+        );
+    }
+
+    /// #2419: `relish upgrade` uploads the new binary once, as a bare blob no
+    /// manifest tracks, and nodes fetch it only when their turn comes. While
+    /// the upgrade is active (paused included) the arbiter refuses to let
+    /// GC delete it; once the upgrade has gone it's an ordinary orphan.
+    #[test]
+    fn gc_arbitration_refuses_the_binary_of_an_active_upgrade() {
+        let mut inner = StateMachineInner::default();
+        let binary = test_digest("b1");
+        let other = test_digest("o1");
+        let mut upgrade = upgrade_state("up-1");
+        upgrade.binaries = vec![crate::upgrade::types::PlatformBinary {
+            platform: "linux-x86_64".into(),
+            sha256: binary.as_str().trim_start_matches("sha256:").into(),
+            embedded_signature: String::new(),
+            external_signature: None,
+        }];
+        upgrade.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
+            reason: "node 5 failed its health check".into(),
+        };
+        inner.state.active_upgrade = Some(upgrade);
+        let report = || {
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: 1,
+                deleted_layers: vec![binary.clone(), other.clone()],
+            })
+        };
+        assert_eq!(
+            inner.apply_request(&report()),
+            Some(CouncilResponse::GcApproved {
+                approved: vec![other.clone()]
+            })
+        );
+        inner.state.active_upgrade = None;
+        assert_eq!(
+            inner.apply_request(&report()),
+            Some(CouncilResponse::GcApproved {
+                approved: vec![binary.clone(), other.clone()]
+            })
         );
     }
 

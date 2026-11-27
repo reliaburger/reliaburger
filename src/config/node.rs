@@ -1042,6 +1042,11 @@ impl ReconstructionSection {
 pub struct ImagesSection {
     /// Maximum storage for image blobs (e.g. "50Gi"). 0 means unlimited.
     pub max_storage: String,
+    /// Maximum number of files the image store holds: blobs, their upload
+    /// receipts (two files per pushed blob) and uploads in progress. It
+    /// applies with or without `max_storage`, because a byte ceiling can't
+    /// bound empty uploads or tiny receipts.
+    pub max_files: usize,
     /// Number of replicas for each layer (including the original pusher).
     pub redundancy: u32,
     /// Days an untagged image is kept before it expires: a manifest whose
@@ -1233,6 +1238,7 @@ impl Default for ImagesSection {
     fn default() -> Self {
         Self {
             max_storage: "0".to_string(),
+            max_files: 65_536,
             redundancy: 2,
             gc_retain_days: 7,
             gc_interval_hours: 1,
@@ -1509,6 +1515,13 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn images_max_files_defaults_to_65536_and_can_be_raised() {
+        assert_eq!(NodeConfig::parse("").unwrap().images.max_files, 65_536);
+        let raised = NodeConfig::parse("[images]\nmax_files = 1000000\n").unwrap();
+        assert_eq!(raised.images.max_files, 1_000_000);
     }
 
     #[test]

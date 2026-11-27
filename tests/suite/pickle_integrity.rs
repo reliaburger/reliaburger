@@ -157,6 +157,7 @@ async fn run_gc(registry: &Registry) {
         retain_days: 0,
         node_id: registry.state.node_raft_id,
         orphan_grace: Duration::ZERO,
+        pinned_digests: HashSet::new(),
     };
     let nominated = gc_candidates(
         &registry.state.store,

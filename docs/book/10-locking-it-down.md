@@ -977,6 +977,8 @@ Reads got the same rule, for the same reason `/v1/status` did: a token scoped to
 
 One case has no scope to apply. On the loopback listener reads are open to anyone, and a scoped token that gets refused could just be left off the request. We check it only where reads need a principal in the first place.
 
+Scopes weren't the only thing the registry forgot. A `[permission]` block narrows one token to named actions on named apps, and `/v1/build` already treated pushing an image as a `deploy` of its app. The registry port didn't read the blocks at all, so a Deployer token whose block allowed only `logs` could still `docker push` over any repository its scope reached (#2398). Chapter 5 has the fix: the write gate now holds a push to the same `deploy` rule, so `relish build` and `docker push` agree again.
+
 ### Fail closed, not open
 
 A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine: you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
