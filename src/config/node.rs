@@ -370,8 +370,14 @@ pub struct IngressSection {
     pub tls_cert: Option<PathBuf>,
     /// TLS private key PEM path.
     pub tls_key: Option<PathBuf>,
-    /// Maximum concurrent proxied connections.
+    /// Maximum requests in flight at once; a request past it gets 503.
+    /// This counts requests, not open connections.
     pub max_connections: usize,
+    /// Largest request body the ingress forwards; a larger one gets 413.
+    pub max_request_body_bytes: usize,
+    /// Bytes every request body being buffered may hold between them; a
+    /// request whose body won't fit in what is left gets 503.
+    pub request_body_budget_bytes: usize,
 }
 
 impl Default for IngressSection {
@@ -383,6 +389,8 @@ impl Default for IngressSection {
             tls_cert: None,
             tls_key: None,
             max_connections: 10_000,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            request_body_budget_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -410,6 +418,8 @@ impl IngressSection {
             http_port: self.http_port,
             https_port: self.https_port,
             max_connections: self.max_connections,
+            max_request_body_bytes: self.max_request_body_bytes,
+            request_body_budget_bytes: self.request_body_budget_bytes,
             tls_cert_path: self.tls_cert.clone(),
             tls_key_path: self.tls_key.clone(),
             ..crate::wrapper::types::WrapperConfig::default()
@@ -1707,6 +1717,22 @@ mod tests {
         assert_eq!(wc.https_port, 8443);
         assert_eq!(wc.max_connections, 500);
         assert!(wc.tls_cert_path.is_none());
+    }
+
+    /// #2381: an operator can lower the body cap and the shared body budget.
+    #[test]
+    fn ingress_section_sets_the_request_body_limits() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ingress]
+            max_request_body_bytes = 65536
+            request_body_budget_bytes = 1048576
+        "#,
+        )
+        .unwrap();
+        let wc = nc.ingress.to_wrapper_config();
+        assert_eq!(wc.max_request_body_bytes, 65_536);
+        assert_eq!(wc.request_body_budget_bytes, 1_048_576);
     }
 
     #[test]

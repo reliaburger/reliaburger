@@ -187,6 +187,10 @@ pub struct ConnectionTimeouts {
     pub tcp_keepalive_idle: Duration,
     /// Gap between TCP keepalive probes once they start.
     pub tcp_keepalive_interval: Duration,
+    /// How long the ingress proxy waits for the next piece of a request body
+    /// before it answers 408. Only the ingress proxy reads this: the API and
+    /// registry listeners stream long uploads and set no body deadline here.
+    pub request_body_idle: Duration,
 }
 
 impl ConnectionTimeouts {
@@ -205,6 +209,7 @@ impl ConnectionTimeouts {
         write_stall: Duration::from_secs(300),
         tcp_keepalive_idle: Duration::from_secs(60),
         tcp_keepalive_interval: Duration::from_secs(15),
+        request_body_idle: Duration::from_secs(30),
     };
 }
 

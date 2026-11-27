@@ -29,6 +29,7 @@ fn quick_timeouts() -> ConnectionTimeouts {
         write_stall: Duration::from_millis(400),
         tcp_keepalive_idle: Duration::from_secs(60),
         tcp_keepalive_interval: Duration::from_secs(15),
+        request_body_idle: Duration::from_millis(300),
     }
 }
 

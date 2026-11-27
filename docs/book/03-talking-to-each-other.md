@@ -1439,6 +1439,27 @@ The response side now streams. `reqwest` gives us `resp.bytes_stream()`, an asyn
 
 The test for this is deliberately a bit odd: the backend sends a 5 MiB response through a proxy configured with a 1 KiB *request* cap, and we assert the client receives all 5 MiB. If the response were bounded by (or buffered to) the request cap, it would be truncated. Getting every byte back proves the response path is genuinely unbounded and streaming.
 
+### A body that stops arriving (0.3.4 audit fix)
+
+The 413 cap bounded how big one body could get. It said nothing about how long the proxy would wait for it. The November 2026 audit ([#2381](https://github.com/reliaburger/reliaburger/issues/2381)) did the sums: a client that declares a 10 MiB body, sends all but the last byte and goes quiet holds that 10 MiB, one request permit and a drain count on three backends, for as long as it keeps the socket open. Four HTTP/2 connections with a hundred streams each pin 4 GiB inside Bun, and Bun's OOM score means the kernel kills your workloads first. Ten thousand requests that send only a head take every permit. Hyper has a deadline for the request head and none for the body, and our first-byte timer switches itself off after the first byte, so nothing ever fired.
+
+Why not put a read deadline in `StallGuardedIo`, next to the write-stall timer? Because that wrapper is shared with the API and the registry, and a `docker push` of a big layer legitimately goes quiet while the client compresses the next chunk. The ingress is the only listener that buffers bodies, so the fix lives in its handler. `read_request_body` replaces the one-line `to_bytes` with a loop over the body's chunks, and wraps each `next()` in `tokio::time::timeout`:
+
+```rust
+let chunk = match tokio::time::timeout(idle, stream.next()).await {
+    Err(_) => return Err(StatusCode::REQUEST_TIMEOUT),
+    Ok(None) => break,
+    Ok(Some(Err(_))) => return Err(StatusCode::BAD_REQUEST),
+    Ok(Some(Ok(chunk))) => chunk,
+};
+```
+
+The nesting reads inside out. `timeout` gives `Err` when the clock won and `Ok(whatever the future returned)` otherwise. `stream.next()` gives `None` at the end of the body and `Some(item)` otherwise, and the item is itself a `Result`. One `match` takes all four cases apart, and the compiler refuses to build it if we forget one. The deadline is per gap, not per body, so a large upload over a slow link is fine as long as it keeps moving. Thirty seconds of silence gets `408 Request Timeout`.
+
+A deadline bounds time. It doesn't bound memory: a thousand clients each trickling a byte every 29 seconds still pin a thousand buffers. So the bodies being buffered now share a budget, a second `Semaphore` counted in KiB (256 MiB by default, `[ingress] request_body_budget_bytes`). Before reading a byte, the handler takes as many permits as the `Content-Length` declares, with `try_acquire_many_owned`; a chunked body with no declared length takes them as it grows, and `OwnedSemaphorePermit::merge` folds each new handful into the one permit the body holds. When the budget is gone the request gets 503 at once, rather than queueing. `BufferedBody` owns the permit next to the bytes, so dropping the body hands its share back, on every path, with no release call to forget. Why KiB? `try_acquire_many_owned` takes a `u32`, and counting single bytes would cap the budget at 4 GiB.
+
+The third change is about drains. The proxy used to capture its backends' drain counts before reading the body, so a stalled upload made every rollout of that app wait its full `drain_timeout`. Now a plain request picks its backends only once the body is in hand, under a second read of the routing table. A WebSocket sends no body, so it still captures up front. `a_stalled_upload_holds_no_drain_open` starts an upload, waits until the handler has reserved budget for it (proof it's reading the body), retires the backend and checks the drain completes at once. The old code captured the count before the body, so that drain would have waited out its deadline.
+
 ### Don't let the client lie about who it is (post-audit fix)
 
 A backend behind a proxy often wants to know the real client's IP and whether the original request was HTTPS. The convention is the `X-Forwarded-For` and `X-Forwarded-Proto` headers, and the proxy is supposed to *set* them. Our header-copy loop forwarded them instead — including any the client sent. So a client could send `X-Forwarded-For: 10.0.0.1` and the backend would believe it came from `10.0.0.1`, defeating every IP allowlist or audit log that trusted the header.

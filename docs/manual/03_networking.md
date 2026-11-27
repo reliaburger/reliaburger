@@ -198,6 +198,23 @@ If a route that slipped past those checks reaches the cluster anyway (say, one
 written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
+A request body is read whole before the ingress contacts your app, so it can
+retry another instance if the first one can't be reached. Three limits guard
+that buffer. A body over `[ingress] max_request_body_bytes` (10 MiB) gets 413.
+A body that sends nothing for 30 seconds gets 408. And all the bodies a node is
+buffering share `[ingress] request_body_budget_bytes` (256 MiB): a request
+whose declared body won't fit in what's left gets 503 before any of it is
+read, so a crowd of slow uploads can't pin the node's memory. The node picks a
+backend only once the body has arrived, so a slow upload doesn't hold up a
+rollout.
+
+```toml
+[ingress]
+enabled = true
+max_request_body_bytes = 1048576     # 1 MiB
+request_body_budget_bytes = 67108864 # 64 MiB shared by every upload
+```
+
 Streaming responses pass through, and so do WebSockets on routes that allow
 them. A stopping instance drains its connections before it goes. A WebSocket
 still open when the drain timeout ends gets a Close frame with code 1001

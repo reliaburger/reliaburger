@@ -39,6 +39,10 @@ pub struct ProxyState {
     pub rate_limiter: ShardedRateLimiter,
     /// Largest request body the proxy will forward before rejecting with 413.
     pub max_request_body_bytes: usize,
+    /// The bytes every request body being buffered may hold between them,
+    /// counted in KiB. A request that would take the total past it is
+    /// answered 503 before its body is read (#2381).
+    pub request_body_budget: Arc<Semaphore>,
     /// Shared drain tracker. When Bun retires an old backend it starts a
     /// drain here; the proxy bumps that instance's in-flight count around
     /// each forwarded request so Bun waits for it to reach zero before
@@ -115,13 +119,26 @@ const MAX_UPSTREAM_ATTEMPTS: usize = 3;
 /// Wrapper usually retires an idle connection before the backend does.
 const UPSTREAM_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
 
-/// Marks that the current request arrived over the HTTPS listener.
+/// What the listener a request arrived on knows about it.
 ///
-/// Inserted as a request extension by the HTTPS serving path. The handler
-/// reads it to decide whether a TLS-requiring route needs a redirect, and
+/// Each listener inserts one as a request extension. The handler reads
+/// `over_tls` to decide whether a TLS-requiring route needs a redirect, and
 /// to set `X-Forwarded-Proto` to the proxy's real view (ING5).
 #[derive(Clone, Copy)]
-struct ServedOverTls(bool);
+struct Listener {
+    /// Whether the request arrived over the HTTPS listener.
+    over_tls: bool,
+    /// How long the request body may go without a new byte (#2381).
+    request_body_idle: std::time::Duration,
+}
+
+/// One KiB, the unit [`ProxyState::request_body_budget`] counts in.
+const BUDGET_UNIT: usize = 1024;
+
+/// The number of budget units `bytes` takes, rounded up.
+fn budget_units(bytes: usize) -> usize {
+    bytes.div_ceil(BUDGET_UNIT)
+}
 
 /// Decrements a draining backend's in-flight count when the request ends.
 ///
@@ -266,6 +283,9 @@ pub async fn bind_proxy_with_tls(
         fresh_client,
         rate_limiter: ShardedRateLimiter::new(),
         max_request_body_bytes: config.max_request_body_bytes,
+        request_body_budget: Arc::new(Semaphore::new(
+            budget_units(config.request_body_budget_bytes).min(Semaphore::MAX_PERMITS),
+        )),
         drains,
         view_lease,
         empty_pool_log: Default::default(),
@@ -348,14 +368,21 @@ impl BoundProxy {
         // The two listeners share one handler but tag requests with the
         // scheme they arrived on, so a TLS route on the plain listener
         // redirects and `X-Forwarded-Proto` reflects reality (ING1/ING5).
+        let request_body_idle = self.connection_timeouts.request_body_idle;
         let http_router = axum::Router::new()
             .fallback(proxy_handler)
-            .layer(axum::Extension(ServedOverTls(false)))
+            .layer(axum::Extension(Listener {
+                over_tls: false,
+                request_body_idle,
+            }))
             .with_state(Arc::clone(&self.state));
 
         let https_router = axum::Router::new()
             .fallback(proxy_handler)
-            .layer(axum::Extension(ServedOverTls(true)))
+            .layer(axum::Extension(Listener {
+                over_tls: true,
+                request_body_idle,
+            }))
             .with_state(Arc::clone(&self.state));
 
         let http = async {
@@ -467,7 +494,7 @@ async fn serve_tls(
 async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    axum::Extension(ServedOverTls(over_tls)): axum::Extension<ServedOverTls>,
+    axum::Extension(listener): axum::Extension<Listener>,
     req: Request<Body>,
 ) -> Response {
     // Count the request and mark it in flight. Mayo reads these process-global
@@ -483,7 +510,7 @@ async fn proxy_handler(
         let Ok(permit) = Arc::clone(&state.connection_limit).try_acquire_owned() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
-        do_proxy(&state, remote, over_tls, req, permit).await
+        do_proxy(&state, remote, listener, req, permit).await
     })
     .await
 }
@@ -563,14 +590,145 @@ fn same_authority(host: &str, authority: &axum::http::uri::Authority, default_po
         && header.port_u16().unwrap_or(default_port) == authority.port_u16().unwrap_or(default_port)
 }
 
+/// The backends picked for one request and the drain ownership it holds on
+/// them.
+struct Capture {
+    /// The primary backend first, then failover candidates.
+    candidates: Vec<(String, SocketAddr)>,
+    /// Releases the captured drain counts when the request ends.
+    guard: Option<DrainGuard>,
+    /// One termination token per captured backend.
+    terminate: Vec<CancellationToken>,
+}
+
+/// Pick up to `max` backends from `route` and capture their drain counts.
+///
+/// The caller holds the routing read lock. Withdrawal takes the write lock
+/// before starting a drain, so it cannot miss a handler that has already
+/// copied an endpoint. `None` means a candidate's drain deadline has passed,
+/// which the caller answers with 503.
+async fn capture_backends(
+    state: &ProxyState,
+    route: &super::routing::PathRoute,
+    max: usize,
+    scope: BackendScope,
+    websocket: bool,
+) -> Option<Capture> {
+    let candidates = route.select_backends(max, scope);
+    let Some(drains) = &state.drains else {
+        return Some(Capture {
+            candidates,
+            guard: None,
+            terminate: Vec::new(),
+        });
+    };
+    let instance_ids: Vec<_> = candidates.iter().map(|(id, _)| id.clone()).collect();
+    let terminate = drains.capture_requests(&instance_ids, websocket).await?;
+    Some(Capture {
+        candidates,
+        guard: Some(DrainGuard {
+            drains: drains.clone(),
+            instance_ids,
+            websocket,
+        }),
+        terminate,
+    })
+}
+
+/// The answer when a route has no backend to try. An empty list means
+/// nothing is routable, so 502, unless only the lapsed lease is holding
+/// remote backends back: that's temporary, so 503.
+async fn no_backend(
+    state: &ProxyState,
+    scope: BackendScope,
+    route_key: &super::routing::RouteKey,
+) -> Response {
+    if scope == BackendScope::LocalOnly {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let line = state
+        .empty_pool_log
+        .lock()
+        .await
+        .record(std::time::Instant::now(), route_key);
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+    StatusCode::BAD_GATEWAY.into_response()
+}
+
+/// A request body held in memory, with the share of the body budget it uses.
+struct BufferedBody {
+    bytes: axum::body::Bytes,
+    /// Returned to [`ProxyState::request_body_budget`] when dropped.
+    _budget: OwnedSemaphorePermit,
+}
+
+/// Read a whole request body into memory, within three limits (#2381).
+///
+/// A body over `max_bytes` is answered 413, whether its `Content-Length`
+/// says so up front or it grows past the cap. A body that sends nothing for
+/// `idle` is answered 408, so a client can't hold a buffer and a request
+/// permit open by going quiet. And every body being buffered shares
+/// `budget`: a request whose body won't fit in what's left is answered 503
+/// before any of it is read, so many clients together can't pin unbounded
+/// memory either.
+async fn read_request_body(
+    body: Body,
+    declared_length: Option<usize>,
+    max_bytes: usize,
+    idle: std::time::Duration,
+    budget: &Arc<Semaphore>,
+) -> Result<BufferedBody, StatusCode> {
+    use futures_util::StreamExt;
+
+    if declared_length.is_some_and(|length| length > max_bytes) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let take = |units: usize| -> Result<OwnedSemaphorePermit, StatusCode> {
+        let units = u32::try_from(units).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+        Arc::clone(budget)
+            .try_acquire_many_owned(units)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    };
+    // Reserve what the client declared before reading a byte of it. A body
+    // with no length (chunked) reserves as it grows.
+    let mut held_units = budget_units(declared_length.unwrap_or(0));
+    let mut permit = take(held_units)?;
+    let mut buffer = Vec::new();
+    let mut stream = body.into_data_stream();
+    loop {
+        let chunk = match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => return Err(StatusCode::REQUEST_TIMEOUT),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return Err(StatusCode::BAD_REQUEST),
+            Ok(Some(Ok(chunk))) => chunk,
+        };
+        if buffer.len() + chunk.len() > max_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        buffer.extend_from_slice(&chunk);
+        let needed_units = budget_units(buffer.len());
+        if needed_units > held_units {
+            permit.merge(take(needed_units - held_units)?);
+            held_units = needed_units;
+        }
+    }
+    Ok(BufferedBody {
+        bytes: axum::body::Bytes::from(buffer),
+        _budget: permit,
+    })
+}
+
 /// Route and proxy a single request.
 async fn do_proxy(
     state: &ProxyState,
     remote: SocketAddr,
-    over_tls: bool,
+    listener: Listener,
     req: Request<Body>,
     permit: OwnedSemaphorePermit,
 ) -> Response {
+    let over_tls = listener.over_tls;
     // Check for WebSocket upgrade before anything else
     let is_ws = super::websocket::is_websocket_upgrade(&req);
 
@@ -593,42 +751,31 @@ async fn do_proxy(
         BackendScope::Cluster
     };
 
-    // Capture request ownership before releasing the routing read lock.
-    // Withdrawal takes the write lock before starting a drain, so it cannot
-    // miss a handler that has already copied an endpoint (including failover).
-    let (route_allows_ws, tls_required, route_key, candidates, rate_limit, drain_guard, terminate) = {
+    // Everything that can refuse the request without its body: an unknown
+    // host, a TLS route over plain HTTP, the rate limit. A WebSocket sends
+    // no body, so it picks and captures its one backend here, under the
+    // read lock. A plain request captures its backend only once its body
+    // has arrived, so a slow upload holds no drain open (#2381).
+    let (route_allows_ws, tls_required, route_key, rate_limit, ws_capture) = {
         let table = state.routing_table.read().await;
         let route = match table.lookup(&host, &path) {
             Some(r) => r,
             None => return StatusCode::NOT_FOUND.into_response(),
         };
-        let candidates =
-            route.select_backends(if is_ws { 1 } else { MAX_UPSTREAM_ATTEMPTS }, scope);
-        let (guard, tokens) = match &state.drains {
-            Some(drains) => {
-                let instance_ids: Vec<_> = candidates.iter().map(|(id, _)| id.clone()).collect();
-                let Some(tokens) = drains.capture_requests(&instance_ids, is_ws).await else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
-                (
-                    Some(DrainGuard {
-                        drains: drains.clone(),
-                        instance_ids,
-                        websocket: is_ws,
-                    }),
-                    tokens,
-                )
+        let ws_capture = if is_ws {
+            match capture_backends(state, route, 1, scope, true).await {
+                Some(capture) => Some(capture),
+                None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-            None => (None, Vec::new()),
+        } else {
+            None
         };
         (
             route.websocket,
             route.tls_mode.requires_tls(),
             route.route_key(),
-            candidates,
             route.rate_limit.clone(),
-            guard,
-            tokens,
+            ws_capture,
         )
     };
 
@@ -661,58 +808,71 @@ async fn do_proxy(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // The primary backend, plus failover candidates behind it. An empty list
-    // means nothing is routable, so 502, unless only the lapsed lease is
-    // holding remote backends back: that's temporary, so 503.
-    let backend = match (candidates.first(), scope) {
-        (Some((_id, addr)), _) => *addr,
-        (None, BackendScope::LocalOnly) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        (None, BackendScope::Cluster) => {
-            let line = state
-                .empty_pool_log
-                .lock()
-                .await
-                .record(std::time::Instant::now(), &route_key);
-            if let Some(line) = line {
-                eprintln!("{line}");
-            }
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-    };
-
     // WebSocket: delegate to the upgrade handler (no body buffering). The
     // connection permit and drain guard move into the splice task so they're
     // released when the WebSocket actually closes, not at the 101 (ING2/ING4).
     // WebSocket has no failover: it is a stateful splice to one backend.
-    if is_ws {
-        let boxed_guard: Option<Box<dyn std::any::Any + Send>> =
-            drain_guard.map(|g| Box::new(g) as Box<dyn std::any::Any + Send>);
+    if let Some(capture) = ws_capture {
+        let Some((_id, backend)) = capture.candidates.first() else {
+            return no_backend(state, scope, &route_key).await;
+        };
+        let boxed_guard: Option<Box<dyn std::any::Any + Send>> = capture
+            .guard
+            .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>);
         return super::websocket::handle_websocket_upgrade(
             req,
-            backend,
+            *backend,
             remote,
             over_tls,
             permit,
             boxed_guard,
-            terminate,
+            capture.terminate,
         )
         .await;
     }
 
-    // Forward the request. Buffer the body once (bounded) so it can be replayed
-    // against a failover backend on a pure connection failure. `to_bytes` still
-    // buffers, but bounded: a body over the cap is rejected with 413 rather
-    // than allowed to exhaust memory (ING3).
+    // Buffer the body once so it can be replayed against a failover backend
+    // on a pure connection failure. The cap answers 413 (ING3), the idle
+    // deadline 408, and the shared budget 503 (#2381).
     let (parts, body) = req.into_parts();
-    let buffered = tokio::select! {
-        biased;
-        _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        result = axum::body::to_bytes(body, state.max_request_body_bytes) => result,
+    let declared_length = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let buffered = match read_request_body(
+        body,
+        declared_length,
+        state.max_request_body_bytes,
+        listener.request_body_idle,
+        &state.request_body_budget,
+    )
+    .await
+    {
+        Ok(buffered) => buffered,
+        Err(status) => return status.into_response(),
     };
-    let body_bytes = match buffered {
-        Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let body_bytes = &buffered.bytes;
+
+    // Now pick and capture the backends, under the read lock again: the
+    // table may have changed while the body arrived.
+    let Capture {
+        candidates,
+        guard: drain_guard,
+        terminate,
+    } = {
+        let table = state.routing_table.read().await;
+        let Some(route) = table.lookup(&host, &path) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match capture_backends(state, route, MAX_UPSTREAM_ATTEMPTS, scope, false).await {
+            Some(capture) => capture,
+            None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
     };
+    if candidates.is_empty() {
+        return no_backend(state, scope, &route_key).await;
+    }
 
     // Preserve a client-supplied request id, or mint one. A backend and its
     // logs can then correlate the request across the proxy hop.
@@ -759,7 +919,7 @@ async fn do_proxy(
         remote,
         over_tls,
         request_id: &request_id,
-        body: &body_bytes,
+        body: body_bytes,
         // The buffered body is the truth about its length, whatever framing
         // the client used.
         content_length: (!body_bytes.is_empty()
@@ -2017,6 +2177,232 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 413);
+
+        shutdown.cancel();
+    }
+
+    /// A routing table for `web.test` over the given `(instance id, port)`
+    /// loopback backends.
+    fn web_test_table(backends: &[(&str, u16)]) -> Arc<RwLock<RoutingTable>> {
+        use crate::onion::types::BackendInstance;
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        service_map
+            .register_app("web", "default", 80, None)
+            .unwrap();
+        for (id, port) in backends {
+            service_map
+                .add_backend(
+                    &crate::onion::service_id::ServiceId::new("default", "web"),
+                    BackendInstance {
+                        instance_id: id.to_string(),
+                        node_ip: std::net::Ipv4Addr::LOCALHOST,
+                        host_port: *port,
+                        healthy: true,
+                        local: false,
+                    },
+                )
+                .unwrap();
+        }
+        let mut ingress = std::collections::HashMap::new();
+        ingress.insert(
+            ("default".to_string(), "web".to_string()),
+            crate::config::app::IngressSpec {
+                host: "web.test".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress).unwrap();
+        Arc::new(RwLock::new(table))
+    }
+
+    /// Start a raw HTTP/1.1 upload that declares `declared` bytes, sends
+    /// `sent` of them and then goes quiet.
+    async fn stalled_upload(http_port: u16, declared: usize, sent: usize) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .unwrap();
+        let head =
+            format!("POST / HTTP/1.1\r\nHost: web.test\r\nContent-Length: {declared}\r\n\r\n");
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(&vec![b'x'; sent]).await.unwrap();
+        sock
+    }
+
+    /// Poll until `condition` holds, for up to five seconds.
+    async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..250 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        condition()
+    }
+
+    /// #2381: a body that stops arriving is answered 408 once it has been
+    /// quiet for the body deadline, and its request permit comes back.
+    /// Before, nothing timed the body out and the request sat forever.
+    #[tokio::test]
+    async fn a_request_body_that_stops_arriving_is_timed_out() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            web_test_table(&[("default__web-0", backend_port)]),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap()
+        .with_connection_timeouts(ConnectionTimeouts {
+            request_body_idle: Duration::from_millis(300),
+            ..ConnectionTimeouts::PRODUCTION
+        });
+        let http_port = bound.http_addr.port();
+        let state = Arc::clone(&bound.state);
+        let starting = state.connection_limit.available_permits();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let mut sock = stalled_upload(http_port, 100, 3).await;
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("a stalled request body was never timed out")
+            .unwrap_or(0);
+        let answer = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            n == 0 || answer.starts_with("HTTP/1.1 408"),
+            "unexpected answer to a stalled body: {answer}"
+        );
+        assert!(
+            eventually(|| state.connection_limit.available_permits() == starting).await,
+            "the stalled request kept its permit"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// #2381: bodies being buffered share one byte budget. Two stalled
+    /// uploads that hold all of it leave a third answered 503 at once,
+    /// instead of every client pinning its own full-size buffer.
+    #[tokio::test]
+    async fn buffered_request_bytes_are_bounded_across_requests() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                max_request_body_bytes: 1024,
+                request_body_budget_bytes: 2048,
+                ..WrapperConfig::default()
+            },
+            web_test_table(&[("default__web-0", backend_port)]),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        let state = Arc::clone(&bound.state);
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let _first = stalled_upload(http_port, 1024, 1000).await;
+        let _second = stalled_upload(http_port, 1024, 1000).await;
+        assert!(
+            eventually(|| state.request_body_budget.available_permits() == 0).await,
+            "two stalled uploads never took the whole budget"
+        );
+
+        let mut third = stalled_upload(http_port, 1024, 1000).await;
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+            .await
+            .expect("an upload past the budget was not refused at once")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&buf[..n]);
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+
+        shutdown.cancel();
+    }
+
+    /// #2381: a slow upload holds no drain count. The backend is captured
+    /// only once the body is in hand, so retiring it mid-upload completes
+    /// the drain at once instead of waiting out its deadline.
+    #[tokio::test]
+    async fn a_stalled_upload_holds_no_drain_open() {
+        use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::time::Duration;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_drains(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            web_test_table(&[("default__web-0", backend_port)]),
+            Some(drains.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        let state = Arc::clone(&bound.state);
+        let budget = state.request_body_budget.available_permits();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let _upload = stalled_upload(http_port, 100, 3).await;
+        // The handler has reserved budget for the body, so it is reading it.
+        assert!(
+            eventually(|| state.request_body_budget.available_permits() < budget).await,
+            "the upload never reached the body read"
+        );
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: "default__web-0".to_string(),
+                timeout: Duration::from_secs(30),
+            })
+            .await;
+        let mut completed = Vec::new();
+        for _ in 0..30 {
+            completed = drains.check_completions().await;
+            if !completed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed,
+            vec!["default__web-0".to_string()],
+            "a stalled upload held the backend's drain open"
+        );
 
         shutdown.cancel();
     }
