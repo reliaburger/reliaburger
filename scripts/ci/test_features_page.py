@@ -228,6 +228,20 @@ class IssueStateTests(unittest.TestCase):
         problems = features_page.check_issues(loaded, state={10: "OPEN", 11: "OPEN", 12: "CLOSED"}.__getitem__)
         self.assertEqual(problems, [])
 
+    def test_rows_whose_issues_a_pull_request_closes_are_reported(self):
+        # Merging the PR would close the issue and turn the nightly red on
+        # main, so the row must change before it merges (#2492).
+        problems = features_page.closing(catalogue(), {11, 99})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'Bare metal'", problems[0])
+        self.assertIn("#11", problems[0])
+        self.assertEqual(features_page.closing(catalogue(), {99}), [])
+
+    def test_check_closing_reads_the_issue_numbers_from_its_arguments(self):
+        self.assertEqual(features_page.parse_issue_numbers(["405", "#286", "405"]), {405, 286})
+        with self.assertRaises(ValueError):
+            features_page.parse_issue_numbers(["abc"])
+
 
 class RepositoryTests(unittest.TestCase):
     """The real docs/features.toml and the page generated from it."""
@@ -255,6 +269,13 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", workflow)
         self.assertIn("python3 scripts/ci/features_page.py check-issues", workflow)
         self.assertIn("docs/features.toml", workflow)
+
+    def test_ci_refuses_a_pull_request_into_main_that_closes_a_linked_issue(self):
+        workflow = (REPO / ".github" / "workflows" / "features.yml").read_text()
+        self.assertRegex(workflow, r"(?m)^  pull-requests: read$")
+        self.assertIn("closingIssuesReferences", workflow)
+        self.assertIn("python3 scripts/ci/features_page.py check-closing", workflow)
+        self.assertIn("github.base_ref == 'main'", workflow)
 
     def test_the_homepage_links_the_page(self):
         homepage = (REPO / "docs/website/index.html").read_text(encoding="utf-8")

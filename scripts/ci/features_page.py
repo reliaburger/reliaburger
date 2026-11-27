@@ -12,6 +12,10 @@ page and checks that the two stay honest:
                                     still open, and that every open issue a
                                     row's restrictions cite is linked (needs
                                     gh, and GH_TOKEN in CI)
+    features_page.py check-closing N...
+                                    fail if a row links one of these issues,
+                                    the ones a pull request into main will
+                                    close (features.yml passes them)
 
 `make features-page` runs `write`. The page's Markdown copy,
 docs/website/features.md, comes from `make agent-docs` like every other
@@ -487,6 +491,30 @@ def check_issues(catalogue, state=issue_state):
     return problems
 
 
+def closing(catalogue, fixes):
+    """Rows that link an issue in `fixes`, the issues a pull request into main
+    will close. Merged as it is, the nightly check-issues on main would fail
+    the next day (#2492), so the row has to change on the branch first."""
+    return [
+        f"{feature.group}: {feature.name!r} links #{number}, which this pull request closes; "
+        "update the row before it merges"
+        for feature in catalogue.features()
+        for number in feature.issues
+        if number in fixes
+    ]
+
+
+def parse_issue_numbers(words):
+    """Issue numbers from the command line, written `405` or `#405`."""
+    numbers = set()
+    for word in words:
+        digits = word.removeprefix("#")
+        if not digits.isdigit():
+            raise ValueError(f"{word!r} isn't an issue number")
+        numbers.add(int(digits))
+    return numbers
+
+
 # --- Command line -------------------------------------------------------------
 
 
@@ -507,7 +535,8 @@ def check(repo=REPO):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=["write", "check", "check-issues"])
+    parser.add_argument("command", choices=["write", "check", "check-issues", "check-closing"])
+    parser.add_argument("issues", nargs="*", help="check-closing: the issues a pull request closes")
     args = parser.parse_args(argv)
     if args.command == "write":
         catalogue = load((REPO / SOURCE).read_text(encoding="utf-8"))
@@ -520,6 +549,12 @@ def main(argv=None):
         return 0
     if args.command == "check":
         problems = check()
+    elif args.command == "check-closing":
+        try:
+            fixes = parse_issue_numbers(args.issues)
+        except ValueError as error:
+            parser.error(str(error))
+        problems = closing(load((REPO / SOURCE).read_text(encoding="utf-8")), fixes)
     else:
         problems = check_issues(load((REPO / SOURCE).read_text(encoding="utf-8")))
     if problems:
