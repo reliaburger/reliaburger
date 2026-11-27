@@ -329,6 +329,11 @@ pub struct Compatibility {
 /// required `permissions` map, the leader's `[permission]` blocks, so a node
 /// with no Raft seat can enforce them; old and new nodes can't read each
 /// other's view (#2538).
+/// Jobs keep their declared spec for the policy audit:
+/// `JobDefinition::declared_image`, `DeploymentRecord::declared_images` and
+/// the `declared_images` on `TaskArrayWrite::RegisterJobs` and `DeployBegin`
+/// are new. `JobDefinition` and `DeploymentRecord` refuse unknown fields, so
+/// an older replica can't read them (#1322).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
