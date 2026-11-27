@@ -20,6 +20,15 @@ and CA, but an explicit endpoint doesn't borrow them. Plain `http://` is
 allowed only to a loopback address, so a bearer token never crosses the network
 in the clear.
 
+Over `https://`, `relish` accepts the server only if its certificate chains to
+that CA *and* is a cluster node's: it carries a node identity
+(`spiffe://reliaburger/node/<id>`), which only the Node CA issues. Workload and
+ingress certificates chain to the same root, so a workload that answers on
+the API port is refused before your token is sent. `relish` doesn't check the
+node's name against the address you gave it, and it has no revocation list: a
+removed node's certificate passes until it expires
+([#362](https://github.com/reliaburger/reliaburger/issues/362)).
+
 ### Reaching a node from another machine
 
 A clustered Linux node runs its own nftables perimeter firewall. Out of the box

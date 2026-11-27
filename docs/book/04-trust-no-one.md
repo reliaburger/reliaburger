@@ -573,6 +573,18 @@ There's a catch for clusters that already exist. A leaf picks up the extension a
 
 One thing the AKI doesn't change: a node certificate names the node, not its address. Python's default context also checks the hostname, so connect with `server_hostname` set to the node's id. Give it `127.0.0.1` and it now fails for an honest reason, `IP address mismatch`. `relish` doesn't hit this because it verifies the chain and never the name.
 
+Never the name, though, turned out to be too little. The operator gives `relish` the *root* CA, and the root signs the Workload and Ingress CAs too. Their leaves carry the server-auth usage, and a workload holds its own key in `/run/reliaburger/identity/`. So anything with a workload identity that could answer the operator's connection to port 9117 passed the handshake, and `relish` sent it the bearer token on the first request ([#2396](https://github.com/reliaburger/reliaburger/issues/2396)). The node side never had this problem, because it pins the Node CA. The CLI keeps the root as its anchor, so a saved context survives a `relish ca rotate --role node`, and adds one check after the chain walk in `src/relish/tls.rs`:
+
+```rust
+if crate::sesame::mtls::node_id_from_leaf(leaf).is_none() {
+    return Err(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::Other(rustls::OtherError(Arc::new(NotANodeCertificate))),
+    ));
+}
+```
+
+Only the Node CA puts a `spiffe://reliaburger/node/<id>` URI SAN on a leaf. A workload's SAN is rebuilt by the CA from its spec, an ingress leaf has DNS names only, and webpki refuses a path whose issuer isn't a CA, so a workload's key can't mint a node-looking leaf of its own. `rustls::OtherError` wraps any `std::error::Error` in an `Arc`, which is how a custom verifier hands rustls a reason of its own: `NotANodeCertificate` is a one-line `thiserror` struct whose message reaches the operator as "the server's certificate is not a cluster node's". `cluster_client_refuses_a_workload_certificate_under_the_same_root` and its ingress twin start a TLS server with each kind of leaf and check both that the call fails and that no `Authorization` header arrived.
+
 ### Binding a connection to a node
 
 Chapter 10 pins the client verifier to the Node CA: a peer must present a valid, unrevoked certificate that the Node CA issued. That stops outsiders cold. It does *not* stop one cluster node from impersonating another. Node B holds a perfectly valid Node-CA certificate. If B connects to A pretending to be C, the CA-pin check is happy — B's cert is genuine. We just never asked "genuine as *whom*?"
