@@ -202,7 +202,7 @@ An unpack is bounded (#2385): `UnpackLimits` caps the file content (each entry's
 
 The runc runtime collects what no container uses (#2423). After each create from an image it starts `ImageStore::collect_rootfs_garbage` on its own task when the last pass began over an hour ago, or at once when the image filesystem is at least 95% full (`FilesystemUsage::is_pressured`). The live set is every bundle's `rootfs-lower` marker (writable overlays) and `config.json` `root.path` (read-only roots), read by `grill::runc::live_image_generations`; an unreadable bundle spec aborts the pass. A pass:
 
-1. Holds the unpack lock, so nothing is published or cleared meanwhile.
+1. Takes each generation's publication lock with `try_lock` before touching it, and skips a generation an unpack holds. Publication itself checks the marker before any lock, then takes only its own generation's lock (#2456), so unpacks of different images never wait for each other.
 2. For each `gen-*` directory outside the live set and not handed out by a pull within the grace period (one hour): removes the marker, then the tree. The hand-out record and the marker removal share one lock with a pull's own marker check, so a generation is either claimed by a pull or retired, never both.
 3. Removes marker-less trees (interrupted unpacks) older than the grace period, markers whose tree is gone, and emptied directories.
 4. Removes cached manifests whose `rootfs/<registry>/<repo>/<tag>` directory is gone, and metadata files that no remaining pinned tag directory (`sha256%3A<hex>`) reaches through its pin, index entries and configs. Both spare files younger than the grace period, which a pull in flight may have just written.

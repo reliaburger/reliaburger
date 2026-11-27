@@ -584,7 +584,7 @@ The `if` after a pattern is a *match guard*: the arm only matches when the patte
 
 Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.
 
-The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises generation publication across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
+The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises the publication of each generation across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
 
 That marker turned out to be a promise we hadn't kept. The V02 soak powered a node off a few seconds after it unpacked Redis. When the node came back, `gen-…/.complete` was there and `usr/local/bin/redis-server` was 0 bytes: ext4 had written the tiny marker and was still holding the unpacked data in the page cache when the power went. Every redeploy then failed with `exec format error`, the node never got its pinned workload back, and the agent retried every two seconds. The marker now waits for `syncfs` on the unpacked tree, which flushes the whole filesystem in one call rather than fsyncing thousands of files, and is itself written with the same synced temp-file-and-rename as everything else. Cached blobs got the same treatment: they used to be renamed into place without a sync.
 
@@ -640,6 +640,37 @@ but it doesn't quietly turn “rootless” into “every local workload shares o
 writable filesystem”. We can add an unprivileged snapshotter later and keep the
 same ownership contract.
 
+### One lock per generation
+
+That serialisation started life as one node-wide `tokio::sync::Mutex`, taken
+before anything else in `unpack_to`, even the check for the marker (#2456).
+So while a six-gigabyte image unpacked, and then `syncfs` waited for every
+dirty page on the filesystem, a crashed Redis replica whose image was
+unpacked days ago couldn't restart: its create queued behind the same lock
+just to read a marker file. New images unpacked strictly one after another
+too.
+
+Two changes fix it. First, the marker check moved in front of any lock. That's
+safe because of how the marker is written: after the tree is flushed, and
+atomically (temp file, sync, rename), so a reader sees either no marker or
+a marker over a complete tree. A published generation is returned at once,
+whatever else is unpacking. Second, the one lock became one lock per
+generation path, in a `tokio::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`.
+The outer lock guards only the map and is held for a lookup. The inner one,
+an `Arc` so it can outlive the lookup, is what an unpack holds while it
+extracts. The unpack checks the marker again once it has the lock, since
+another pull of the same image may have published it meanwhile, and that
+keeps the property the lock was for: a generation is never cleared and
+re-extracted under a running container. Afterwards `retain` drops every entry
+whose `Arc::strong_count` is 1, which means only the map still holds it, so
+the map doesn't grow with every image the node has ever run.
+
+`syncfs` stayed. It still flushes the whole filesystem, but it now holds only
+its own generation's lock, so a slow flush delays that one image and nothing
+else. Flushing each file of the tree instead would avoid waiting for
+unrelated writers, at the cost of thousands of `fsync` calls per image; we'll
+revisit it if the profile says so.
+
 ### Generations nobody runs any more
 
 Content-addressing fixed the clobbering, and it also meant nothing ever
@@ -662,6 +693,10 @@ and hands the set to `ImageStore::collect_rootfs_garbage`, which removes every
 since their bundles sit in the same directory. Note the error policy: if one
 `config.json` can't be read, the whole set is refused. A set that's missing
 a running container's root would delete that container's files.
+
+The collector takes each generation's lock before it touches it, with
+`try_lock`: a generation an unpack holds is skipped, not waited for, so a
+collection pass never stalls a pull and a pull waits for at most one removal.
 
 There's a gap between a pull and a bundle, though. `pull_and_unpack` returns
 a generation, and only some time later does `mount_private` write the marker
