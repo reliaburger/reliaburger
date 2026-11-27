@@ -2188,6 +2188,7 @@ pub fn spawn_autoscaler(
             }
 
             let desired = council.desired_state().await;
+            forget_unscaled_apps(&mut tracker, &desired);
             for (app_id, spec) in &desired.apps {
                 let Some(autoscale) = &spec.autoscale else {
                     continue;
@@ -2247,6 +2248,25 @@ pub fn spawn_autoscaler(
             }
         }
     });
+}
+
+/// Forget every app the autoscaler tracks that no longer autoscales: one
+/// deleted, or applied again without `[autoscale]`. Its cooldown must not
+/// hold back an app created later under the same name, and the tracker must
+/// not grow with every app name that ever autoscaled (#2434). An app deleted
+/// and applied again within one autoscale interval keeps its entry: the loop
+/// never sees it leave.
+fn forget_unscaled_apps(
+    tracker: &mut crate::meat::autoscaler::AutoscaleTracker,
+    desired: &crate::council::types::DesiredState,
+) {
+    let autoscaled: HashSet<crate::meat::types::AppId> = desired
+        .apps
+        .iter()
+        .filter(|(_, spec)| spec.autoscale.is_some())
+        .map(|(app_id, _)| app_id.clone())
+        .collect();
+    tracker.retain_apps(&autoscaled);
 }
 
 /// Start the autoscaler's cooldown for `decision` once its override write
@@ -9181,6 +9201,34 @@ image = "busybox:latest"
         assert!(plan.quota_blocked.is_empty(), "{:?}", plan.quota_blocked);
         assert_eq!(plan.decisions.len(), 1, "{:?}", plan.decisions);
         assert!(nodes_of(&plan.decisions[0]).iter().all(|n| *n == "big"));
+    }
+
+    // -- #2434: the autoscaler forgets apps that stopped autoscaling ---------
+
+    #[test]
+    fn an_app_that_stopped_autoscaling_is_forgotten() {
+        use crate::meat::autoscaler::{AutoscaleDecision, AutoscaleTracker};
+        let web = AppId::new("web", "default");
+        let mut tracker = AutoscaleTracker::default();
+        tracker.get_or_insert(&web, 2);
+        tracker.apply_decision(
+            &AutoscaleDecision {
+                app_id: web.clone(),
+                from: 2,
+                to: 6,
+                reason: "cpu".into(),
+            },
+            std::time::Instant::now(),
+        );
+
+        // `web` was deleted, then applied again without `[autoscale]`.
+        let mut desired = DesiredState::default();
+        desired.apps.insert(web.clone(), app_spec(100, 2));
+        forget_unscaled_apps(&mut tracker, &desired);
+
+        let state = tracker.get_or_insert(&web, 2);
+        assert_eq!(state.last_scale_event, None, "no cooldown carries over");
+        assert_eq!(state.current_replicas, 2);
     }
 
     // -- #2366: a pass never plans more than the council admits ------------
