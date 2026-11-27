@@ -88,6 +88,10 @@ pub struct ClusterRuntime {
     /// This node's council backup loop state (#2016), served by
     /// `GET /v1/diagnostics` for `relish wtf`.
     pub backup_rx: watch::Receiver<crate::council::backup::BackupStatus>,
+    /// The council this node expects while it has none of its own (#2397),
+    /// kept current by the runtime. A seatless node's security-view fetch
+    /// asks only its voters (#2406).
+    pub expected_council: crate::council::admission::ExpectedCouncil,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -539,6 +543,7 @@ pub async fn start(
     // "partitioned" node over the connections it opens (#1810).
     let rpc_blocklist = raft_blocklist.clone();
     let expected_maintainer = raft_admission.clone();
+    let fence_admission = raft_admission.clone();
     let expected_raft = council.raft().clone();
     let expected_shutdown = shutdown.clone();
     spawn_supervised(
@@ -571,6 +576,7 @@ pub async fn start(
     crate::cluster::recovery_fence::spawn_recovery_fence_supervisor(
         fence.clone(),
         Arc::clone(&council),
+        fence_admission,
         crate::cluster::recovery_fence::FenceSupervisorInputs {
             directory_rx: directory_rx.clone(),
             gossip_synced_rx,
@@ -822,6 +828,7 @@ pub async fn start(
             roster_rx,
             gossip_stats,
             backup_rx,
+            expected_council,
         },
     ))
 }

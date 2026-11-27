@@ -217,6 +217,15 @@ the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
 and Workload CA keys, the OIDC signing key, join tokens, secret seals,
 pending intermediates and the serial counter.
 
+Where the leader is comes from gossip, and gossip is authenticated only by
+a key every node holds, so a forged leader hint could have pointed seatless
+nodes at a compromised worker (#2406). The node therefore asks only a node
+that is a voter of the council it knows: its own Raft membership, or, while
+it has none, the council `relish join` saved beside its identity
+(`council.json`, see `docs/design/gossip-mustard.md`, "Council membership
+check"). The TLS connection is bound to that voter's node id, and a node that
+isn't a voter is refused before the service token leaves the node.
+
 ---
 
 ## 4. Data Structures

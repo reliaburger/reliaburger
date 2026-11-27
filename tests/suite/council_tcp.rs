@@ -1328,6 +1328,52 @@ async fn a_node_with_no_council_serves_a_leader_its_expected_voters_name() {
     shutdown.cancel();
 }
 
+/// Over the real transport: a node whose council is `{5, 2}` asks voter 2
+/// which epoch it serves when gossip claims a newer one (#2406). A voter
+/// still on the node's epoch leaves it serving; one serving a newer epoch
+/// refuses the question, names that epoch, and the node fences itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asking_the_voters_fences_a_node_only_when_one_serves_a_newer_epoch() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+    for (voter_epoch, fenced_by) in [(0, None), (1, Some(1))] {
+        // The voter's own council is `{1}`; the asker knows it as voter 2.
+        // The asker's dial isn't bound to a node id here.
+        let (_voter, voter_address) = council_node_over_mtls(
+            &tls,
+            &[(1, "n1")],
+            RecoveryFence::serving(voter_epoch),
+            &shutdown,
+        )
+        .await;
+        let asker = lone_council(5).await;
+        asker
+            .initialize(BTreeMap::from([
+                (5, info_at(5, addr(1))),
+                (2, info_at(2, voter_address)),
+            ]))
+            .await
+            .unwrap();
+        let fence = RecoveryFence::serving(0);
+        let identity = tls.identity("n5", 15);
+        let connector = tokio_rustls::TlsConnector::from(
+            reliaburger::sesame::mtls::build_mtls_client_config(&identity, CrlHandle::default())
+                .unwrap(),
+        );
+        let admission = reliaburger::council::admission::RaftAdmission::new(
+            TcpRaftNetworkFactory::new_tls(5, connector).with_fence(fence.clone()),
+        );
+        admission.ask_voters_for_their_epoch(asker.raft()).await;
+        assert_eq!(
+            fence.snapshot().fenced_by(),
+            fenced_by,
+            "voter on epoch {voter_epoch}"
+        );
+        asker.shutdown().await.ok();
+    }
+    shutdown.cancel();
+}
+
 /// A vote request from candidate `id` whose log reaches `index` at term 9.
 fn vote_reaching(id: u64, index: u64) -> reliaburger::council::network::RaftRpc {
     reliaburger::council::network::RaftRpc::Vote(openraft::raft::VoteRequest::new(

@@ -35,8 +35,11 @@ use crate::mustard::directory::NodeDirectory;
 /// membership never hears AppendEntries, so its term stays at 0 for good:
 /// bounding hints by it would lose the leader once the cluster had seen more
 /// than ten elections. Such a node follows the newest hint gossip has shown
-/// it. Gossip datagrams are HMAC-authenticated with the cluster key, and the
-/// reporting epoch only gates anything on the leader, which is a member.
+/// it. Gossip datagrams are HMAC-authenticated with the cluster key, which
+/// every node holds, so a hint proves nothing about the node it names: the
+/// reporting epoch only gates anything on the leader, which is a member,
+/// and a seatless node fetches its security state only from a voter of the
+/// council it knows, over TLS bound to that voter (#2406).
 pub const MAX_LEADER_HINT_TERM_LEAD: u64 = 10;
 
 /// Where a [`LeaderView`] came from.
@@ -198,12 +201,27 @@ pub fn leader_api_address(
     metrics: Option<&MetricsReceiver>,
     directory: &watch::Receiver<NodeDirectory>,
 ) -> Option<SocketAddr> {
+    leader_api_target(metrics, directory).map(|(_, address)| address)
+}
+
+/// [`leader_api_address`], with the node id of the leader the address
+/// belongs to, so a caller can bind its TLS connection to that node (#2406).
+pub fn leader_api_target(
+    metrics: Option<&MetricsReceiver>,
+    directory: &watch::Receiver<NodeDirectory>,
+) -> Option<(NodeId, SocketAddr)> {
     // The metrics borrow is a temporary, dropped at the end of this
     // statement, before the directory borrow below.
     let raft = metrics.map(|metrics| raft_leader(&metrics.borrow()));
     let directory = directory.borrow();
+    let hinted = || {
+        directory
+            .leader
+            .as_ref()
+            .map(|leader| (leader.node_id.clone(), leader.api_address))
+    };
     let Some((leader, local_term)) = raft else {
-        return directory.leader.as_ref().map(|leader| leader.api_address);
+        return hinted();
     };
     resolve_leader_view(leader, &directory, local_term, 0, 0)
         .and_then(|leader| {
@@ -218,8 +236,9 @@ pub fn leader_api_address(
                         .filter(|hint| hint.node_id == leader.node_id && hint.term == leader.term)
                         .map(|hint| hint.api_address)
                 })
+                .map(|address| (leader.node_id, address))
         })
-        .or_else(|| directory.leader.as_ref().map(|leader| leader.api_address))
+        .or_else(hinted)
 }
 
 /// Whether the leader-target maintainer should publish `view.term` as this

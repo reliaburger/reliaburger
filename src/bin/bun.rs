@@ -567,9 +567,9 @@ async fn refresh_leader_security_view(
         return;
     }
     let metrics = council.metrics();
-    let leader = reliaburger::cluster::directory::leader_api_address(Some(&metrics), directory);
+    let leader = reliaburger::cluster::directory::leader_api_target(Some(&metrics), directory);
     let result = match leader {
-        Some(leader) => client.fetch(leader).await,
+        Some((leader, address)) => client.fetch(council, &leader.0, address).await,
         None => Err("no council leader is known yet".to_string()),
     };
     match result {
@@ -1420,6 +1420,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
     let mut registry_directory = None;
+    let mut expected_council = None;
     // Address peers use for this node, captured before ClusterParams moves.
     let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
@@ -1507,6 +1508,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
         registry_directory = Some(cluster_runtime.directory_rx.clone());
+        expected_council = Some(cluster_runtime.expected_council.clone());
         api_gossip_stats = Some(cluster_runtime.gossip_stats.clone());
         api_backup_monitor = Some(reliaburger::council::backup::BackupMonitor(
             cluster_runtime.backup_rx.clone(),
@@ -2052,12 +2054,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if let Some(council) = &api_council {
         // A node with no Raft seat reads the leader's view of the security
         // state instead of its own empty replica (#1477).
-        let view_client = match (&api_identity, &crl_refresh, service_token.as_deref()) {
-            (Some(identity), Some(crl), Some(token)) => {
+        let view_client = match (
+            &api_identity,
+            &crl_refresh,
+            service_token.as_deref(),
+            &expected_council,
+        ) {
+            (Some(identity), Some(crl), Some(token), Some(expected)) => {
                 match reliaburger::sesame::security_view::SecurityViewClient::new(
                     identity,
                     crl.clone(),
                     token,
+                    expected.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {

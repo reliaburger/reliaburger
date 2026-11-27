@@ -899,6 +899,8 @@ pub async fn security_state(&self) -> SecurityState {
 
 `unwrap_or(local)` returns the empty local state when no view has arrived yet, so a reader never waits here. Bun's five-second security refresh fetches the view whenever its replica holds nothing, and keeps the last one if the leader can't be reached, the way a follower that can't reach quorum keeps its replica. A token revoked on the leader stops working on the node within one refresh.
 
+The weak link was "the leader". A node with no seat has no Raft metrics, so it learns who leads from the gossip leader hint, and the first version sent its service token to whatever address that hint named, over TLS that accepted any node certificate. Every node holds the gossip key, so one compromised worker could name itself leader and hand every seatless node its own tokens and CA (#2406). Now `SecurityViewClient::fetch` takes the node id the hint names along with its address. It refuses before connecting unless that node is a voter of the council this node knows, its own membership or, with no seat, the expected council `relish join` saved (Chapter 2, "Council membership check"), and the TLS connection is bound to that node id, so a voter's name with an impostor's address fails the handshake. `leader_api_target` returns the pair, and `leader_api_address` is now a one-line wrapper around it for callers that only need the address.
+
 ### Evaluating a policy isn't enforcing it
 
 Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
