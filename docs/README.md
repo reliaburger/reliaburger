@@ -309,7 +309,8 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
 - **Kubernetes import covers the kinds listed [above](#whats-in-the-binary).**
   Anything else is reported, not applied.
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
-  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
+  whose outcome is unknown skips its later firings until you settle it with
+  `relish batch replay` ([Jobs and cron](#jobs-and-cron)).
 
 ## Operating notes
 
