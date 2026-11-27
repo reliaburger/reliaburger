@@ -31,8 +31,8 @@
 # After each release, update the statuses, `since` versions and `release`
 # below (docs/releasing.md, step 10).
 
-release = "0.3.2"
-released = "23 November 2026"
+release = "0.3.3"
+released = "27 November 2026"
 reviewed = "10 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
@@ -72,7 +72,7 @@ evidence = "Every gate run installs this way: two staged installs passed on 0.2.
 name = "Cluster on Linux machines over SSH"
 status = "beta"
 since = "0.2.6"
-summary = "`relish setup --ssh` checks every machine first, then builds an mTLS cluster on Linux machines you already have."
+summary = "`relish setup --ssh` checks every machine first, then builds an mTLS cluster on Linux machines you already have; from 0.3.3 its context lists every node, and `relish` falls over to another when the one it asked doesn't answer."
 restrictions = "Ubuntu or Debian, with passwordless sudo. There's no command to remove the cluster yet, and `relish local` doesn't manage it."
 issues = []
 docs = ["docs/manual/00_getting-started.md#a-cluster-on-your-laptop"]
@@ -144,11 +144,11 @@ needs_maintainer = "Beta or Alpha? The site offers it from 0.2.8, with bottles, 
 name = "Bare metal in an hour"
 status = "alpha"
 since = "0.3.0"
-summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with signed weekly OS builds and A/B updates; from 0.3.2 `relish netboot --stream-logs` shows an appliance's boot logs as it installs."
+summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with signed weekly OS builds and A/B updates; from 0.3.2 `relish netboot --stream-logs` shows an appliance's boot logs as it installs, and from 0.3.3 `--stream-logs=units` shows only the boot units, `relish os boot-logs` turns the logs on and off on a claimed cluster, and tty1 shows a read-only console dashboard."
 restrictions = "x86_64 and arm64 machines with UEFI network boot and a wired card the installer has a driver for. Built for the Dell Wyse 3040; other firmware may still have surprises. New in 0.3.0, so its shape may still change."
 issues = [407]
 docs = ["docs/manual/17_appliance.md"]
-evidence = "CI netboots, claims, seeds and updates QEMU appliances on every image change (x86_64; boot test only on aarch64). The release gate doesn't cover it. The Wyse lab exit test (#407) ran on candidate 4's artefacts in parallel with the release. Claiming over the LAN (#405) and `relish netboot` itself (#404) are done."
+evidence = "CI netboots, claims, seeds and updates QEMU appliances on every image change (x86_64; boot test only on aarch64). The release gate doesn't cover it. The Wyse lab exit test (#407) ran on 0.3.0's candidate 4 and on 0.3.2; 0.3.3 went out before it, and the lab runs on the released 0.3.3 next. Claiming over the LAN (#405) and `relish netboot` itself (#404) are done. The console's dashboard shipped in 0.3.3 (#2150 stays open in 0.3.4)."
 needs_maintainer = "Alpha or Beta once the Wyse lab exit test has a record?"
 
 [[group.feature]]
@@ -191,7 +191,7 @@ evidence = "The gate's soak runs six apps with health checks (scripts/release/su
 name = "Rolling deploys with automatic rollback"
 status = "ready"
 since = "0.1.0"
-summary = "A new version starts beside the old, must pass its health check, and rolls back on its own if it doesn't; a cluster rolls out one node at a time."
+summary = "A new version starts beside the old, must pass its health check, and rolls back on its own if it doesn't; a cluster rolls out one node at a time. From 0.3.3 `relish apply --wait` returns once every app in the file is ready."
 restrictions = "Rolling update latency is recorded by the soak, not yet gated."
 issues = []
 docs = ["docs/manual/01_deploy-an-app.md#rolling-deploys"]
@@ -241,11 +241,11 @@ evidence = "Init images, env and volumes honoured since 0.2.1 (#701). Not in the
 name = "Sidecars"
 status = "beta"
 since = "0.2.4"
-summary = "Extra containers that share an app's network, start before it and stop after it."
-restrictions = "Follow-ups are open: adoption, egress allowlists, network during stop, stop settings and visibility. Kubernetes sidecars are dropped on import."
+summary = "Extra containers that share an app's network, start before it and stop after it; from 0.3.3 `relish apps NAME` lists each instance's sidecars with their state and restarts, and a Bun restart adopts them instead of restarting them."
+restrictions = "Follow-ups are open: egress allowlists, network during stop and stop settings. Kubernetes sidecars are dropped on import."
 issues = [1315]
 docs = ["docs/manual/01_deploy-an-app.md#sidecars"]
-evidence = "Shipped in 0.2.4 (roadmap); #1315 has no milestone. Not in the soak workloads."
+evidence = "Shipped in 0.2.4 (roadmap); adoption and visibility in 0.3.3 (#2336), and the rest of #1315 is in Later. Not in the soak workloads."
 
 [[group.feature]]
 name = "Stop signals, grace and pre-stop commands"
@@ -262,11 +262,11 @@ name = "Runtime knobs: capabilities, sysctls and devices"
 status = "alpha"
 since = "0.2.4"
 summary = "An app can ask for an added capability, a namespaced sysctl or a host device, where the node allows it and the token carries `host-exec`."
-restrictions = "No test runs it against a real container yet, and a restart doesn't re-check the node's allowlist."
-issues = [1316]
+restrictions = "The release gate doesn't exercise it."
+issues = []
 docs = ["docs/manual/10_security.md#runtime-knobs"]
-evidence = "#1316 (no milestone): 'a real-container test, restart re-check and fuller refusals'. Shipped in 0.2.4 (#1122)."
-needs_maintainer = "Alpha because #1316 says there's no real-container test. Beta if the privileged Linux suite covers it after all."
+evidence = "Shipped in 0.2.4 (#1122). Since 0.3.3 (#1316, #2335) a `make test-linux` test starts a real runc container with a capability, a network and an IPC sysctl and `/dev/fuse`, a restart re-checks the node's allowlist and host paths, and a refusal names every knob."
+needs_maintainer = "Alpha until 0.3.3; #1316's real-container test, restart re-check and fuller refusals are done. Beta now?"
 
 [[group.feature]]
 name = "Kubernetes YAML import"
@@ -539,10 +539,10 @@ name = "API tokens with roles and scopes"
 status = "ready"
 since = "0.1.0"
 summary = "Tokens carry a role and namespace scopes, expire after 90 days by default, and rotate with a grace period."
-restrictions = "A plaintext cluster with no master key stops taking its nodes' calls once the first API token exists."
-issues = [1248]
+restrictions = "On a plaintext cluster, the first API token needs a master key; `relish token create` refuses it without one."
+issues = []
 docs = ["docs/manual/10_security.md#api-tokens"]
-evidence = "Rotation and lifetimes since 0.1.6. The gate's harness runs with its own tokens (verifier run token). #1248 (Later) affects plaintext clusters only."
+evidence = "Rotation and lifetimes since 0.1.6. The gate's harness runs with its own tokens (verifier run token). Since 0.3.3 (#1248) a plaintext cluster with no master key refuses the first token instead of locking its nodes out."
 
 [[group.feature]]
 name = "Workload identity"
@@ -666,7 +666,7 @@ summary = "A volume can mount a host directory that the node's `allowed_host_pat
 restrictions = "Refused by default. Anyone who can write under a listed prefix can still swap a directory for a symlink between the check and the mount."
 issues = []
 docs = ["docs/manual/11_images-and-volumes.md#host-paths"]
-evidence = "Allowlist since 0.2.0 (#675 to #691). Manual describes the remaining race. Not in the soak workloads."
+evidence = "Allowlist since 0.2.0 (#675 to #691); since 0.3.3 a restart re-checks an instance's host paths against the node's list (#1316, #2335). Manual describes the remaining race. Not in the soak workloads."
 
 [[group.feature]]
 name = "Snapshots and scheduled backups"
@@ -702,14 +702,14 @@ summary = "An OCI registry built into the cluster: push once and nodes pull laye
 restrictions = "Deleting by digest isn't supported: an image leaves by losing its tags. One Bun per writable image store."
 issues = [2128]
 docs = ["docs/manual/11_images-and-volumes.md#where-images-come-from", "docs/design/registry-pickle.md"]
-evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'. 0.3.0 ships with #2128: in its 8-hour final, one of 59 catalogue deploys from the cluster registry stalled for 5 minutes after a disk fault and recovered by itself, cause unverified. It didn't recur in 0.3.1's or 0.3.2's gates, but both ship with it: two possible causes are fixed in 0.3.1, 0.3.2 logs what a stalled helper is doing, and the cause isn't proven."
+evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'. 0.3.0 ships with #2128: in its 8-hour final, one of 59 catalogue deploys from the cluster registry stalled for 5 minutes after a disk fault and recovered by itself, cause unverified. It didn't recur in 0.3.1's, 0.3.2's or 0.3.3's gates, but each ships with it: two possible causes are fixed in 0.3.1, 0.3.2 logs what a stalled helper is doing, and the cause isn't proven."
 
 [[group.feature]]
 name = "Building images in the cluster"
 status = "ready"
 since = "0.1.0"
 summary = "`relish build` builds an image with Buildah on a node, straight into Pickle, signed, for one or several platforms."
-restrictions = "Builds run on a Linux node with Buildah."
+restrictions = "Builds run on a Linux node with Buildah; appliance nodes have it from 0.3.3, but can't emulate the other architecture's `RUN` steps in a multi-platform build."
 issues = []
 docs = ["docs/manual/11_images-and-volumes.md#building-images", "docs/manual/11_images-and-volumes.md#multi-platform-images"]
 evidence = "Every staged install runs `relish build` on the burger demo (22 s on 0.2.7). Multi-platform builds since 0.1.2."
@@ -1005,7 +1005,7 @@ evidence = "Exit test passed on 6 November 2026: Claude Code with a read-only to
 name = "`relish mcp`"
 status = "beta"
 since = "0.2.7"
-summary = "Serves the `relish agent` commands as read-only MCP tools over stdio."
+summary = "Serves the `relish agent` commands as read-only MCP tools over stdio; from 0.3.3 it falls over to another node to make its token, as `relish` does."
 restrictions = "From an admin context it makes and sends a read-only agent token of its own, never the admin one; a token you pass explicitly is sent as given. `--propose` adds tools that propose changes and take leases, with a deployer agent token."
 issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#through-mcp"]
@@ -1116,7 +1116,7 @@ summary = "A controller is an ordinary app with a namespace-scoped token that re
 restrictions = "Before 1.0, any release may change the JSON shapes it reads and writes."
 issues = [1322]
 docs = ["docs/manual/15_writing-a-controller.md", "docs/manual/15_writing-a-controller.md#how-stable-is-this"]
-evidence = "Shapes pinned by snapshot tests (manual 15 'How stable is this?'); 0.2.4 exit test #1126; #1322 follow-ups."
+evidence = "Shapes pinned by snapshot tests (manual 15 'How stable is this?'); 0.2.4 exit test #1126. Since 0.3.3 a controller reads one app's spec back, redacted (`GET /v1/apps/{app}/{namespace}/spec`), and a scoped token sees its own events on a busy cluster; the rest of #1322 is in 0.3.4."
 
 [[group.feature]]
 name = "Wasm extension modules"

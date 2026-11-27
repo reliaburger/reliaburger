@@ -600,6 +600,20 @@ migration and no feature gate
   ([closure](qualification/2026-11-27-v0.3.3-release-closure.md)). 0.3.3
   keeps 0.3.2's cluster formats, so a 0.3.2 cluster rolls onto it in place
   ([upgrading from 0.3.2](releasing.md#upgrading-from-032)).
+- [ ] **0.3.4: the November code audit**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/37)).
+  A patch release with the findings of the
+  [November 2026 code audit](https://github.com/reliaburger/reliaburger/issues/2364)
+  of the 0.3.3 train: 157 issues, 2 Critical and 13 High among them, from a
+  control plane that can wedge itself to docs that disagree with the binary.
+  It also carries what 0.3.3 left open: the V02 leftovers
+  ([#287](https://github.com/reliaburger/reliaburger/issues/287)), the Wyse
+  lab's exit test on the released 0.3.3
+  ([#407](https://github.com/reliaburger/reliaburger/issues/407)), #2128's
+  unproven registry stall
+  ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)) and the
+  appliance console
+  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)). Next.
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),
@@ -614,7 +628,7 @@ migration and no feature gate
   rolling OS update of three appliance nodes, where a volume app keeps every
   acknowledged write and no instance dies without its stop hook. The
   [0.4.x review](plans/2026-11-19-review-0.4.x.md) of 19 November 2026 set
-  this order for 0.4.0 to 0.4.5. Next after 0.3.3.
+  this order for 0.4.0 to 0.4.5. Next after 0.3.4.
 - [ ] **0.4.1: "The front door"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/13)). ACME certificates for the ingress ([#1667](https://github.com/reliaburger/reliaburger/issues/1667),
   [plan](plans/2026-11-06-plan-f08-acme.md)), an ingress address that fails
@@ -753,7 +767,7 @@ what's shipped and what's scheduled.
   0.3.0 and passed on three Wyse 3040s running 0.3.2 on 23 November 2026
   ([lab record](qualification/2026-11-20-wyse-3040.md)). The V02 leftovers
   ([#287](https://github.com/reliaburger/reliaburger/issues/287)) are in
-  [0.3.3](https://github.com/reliaburger/reliaburger/milestone/36): the
+  [0.3.4](https://github.com/reliaburger/reliaburger/milestone/37): the
   snapshot uploader passed 20 of 20 power cuts on Btrfs
   ([record](qualification/2026-11-23-power-cut-volumes.md),
   [#2227](https://github.com/reliaburger/reliaburger/pull/2227)), and the
