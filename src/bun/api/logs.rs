@@ -1098,15 +1098,18 @@ pub(super) async fn logs_cross_node_handler(
 
     // If we have council + membership, do cross-node fan-out
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
-        let desired = council.desired_state().await;
         let app_id = AppId::new(&app, &namespace);
 
         // Where the app runs now; its history may be on any live member.
-        let placed: Vec<String> = desired
-            .scheduling
-            .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
-            .unwrap_or_default();
+        let placed: Vec<String> = council
+            .read_desired(|desired| {
+                desired
+                    .scheduling
+                    .get(&app_id)
+                    .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
         let live: Vec<(String, String)> = membership
             .read()
             .await

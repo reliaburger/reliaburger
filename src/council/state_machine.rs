@@ -3664,6 +3664,10 @@ pub struct CouncilStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
     gitops_triggers: Arc<tokio::sync::watch::Sender<(u64, u64)>>,
     api_tokens: Arc<tokio::sync::watch::Sender<Vec<crate::sesame::types::ApiToken>>>,
+    /// Test hook: how many times [`Self::desired_state`] copied the whole
+    /// state (#2436).
+    #[cfg(test)]
+    full_clones: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for CouncilStateMachine {
@@ -3681,7 +3685,16 @@ impl CouncilStateMachine {
                 tokio::sync::watch::channel(inner.state.security_state.api_tokens.clone()).0,
             ),
             inner: Arc::new(RwLock::new(inner)),
+            #[cfg(test)]
+            full_clones: Arc::default(),
         }
+    }
+
+    /// Test hook: how many times [`Self::desired_state`] has copied the
+    /// whole state.
+    #[cfg(test)]
+    pub(crate) fn full_clones(&self) -> usize {
+        self.full_clones.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Observe the applied API tokens. A receiver sees a change as soon as an
@@ -3916,6 +3929,9 @@ impl CouncilStateMachine {
 
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
+        #[cfg(test)]
+        self.full_clones
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.read().await.state.clone()
     }
 

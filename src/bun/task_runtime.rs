@@ -265,7 +265,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         }
         let identities = match &self.secrets {
             Some((council, ikm)) => crate::sesame::secret::namespace_identities(
-                &council.security_state().await,
+                &*council.security_state().await,
                 resolved.namespace.as_deref().unwrap_or("default"),
                 ikm,
             ),

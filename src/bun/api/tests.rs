@@ -3176,7 +3176,7 @@ async fn a_settled_leader_rotates_the_signing_key_after_a_missed_heartbeat_round
     assert_eq!(status, StatusCode::OK, "rotate: {reply}");
     let rotated = nodes[0].security_state().await;
     assert_ne!(
-        rotated.oidc_signing_config.unwrap().key_id,
+        rotated.oidc_signing_config.as_ref().unwrap().key_id,
         old.key_id,
         "the signing key didn't change"
     );
@@ -5315,7 +5315,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
         keys
     };
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 0, true),
@@ -5334,7 +5334,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 1, false),
@@ -7976,7 +7976,7 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
 
     // The token landed in Raft, and the returned plaintext validates
     // against the stored hash.
-    let stored = council.security_state().await.api_tokens;
+    let stored = council.security_state().await.api_tokens.clone();
     let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
     assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
 }
@@ -8071,7 +8071,7 @@ async fn join_token_create_returns_two_distinct_plaintexts_and_stores_only_hashe
     }
     assert_ne!(plaintexts[0], plaintexts[1]);
 
-    let stored = council.security_state().await.join_tokens;
+    let stored = council.security_state().await.join_tokens.clone();
     assert_eq!(stored.len(), 2, "init mints none; two new tokens");
     for plaintext in &plaintexts {
         assert!(
@@ -12008,7 +12008,10 @@ async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
     assert_ne!(rotated.key_id, old.key_id);
 
     let after = council.security_state().await;
-    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(
+        after.oidc_signing_config.as_ref().unwrap().key_id,
+        rotated.key_id
+    );
     assert_eq!(after.retiring_oidc_keys.len(), 1);
     assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
 

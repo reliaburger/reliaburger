@@ -449,13 +449,16 @@ pub(super) async fn app_metric_rows(
     // reading just this node's store misses instances scheduled elsewhere.
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
         use crate::meat::types::AppId;
-        let desired = council.desired_state().await;
         let app_id = AppId::new(app, namespace);
-        let node_ids: Vec<crate::meat::NodeId> = desired
-            .scheduling
-            .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
-            .unwrap_or_default();
+        let node_ids: Vec<crate::meat::NodeId> = council
+            .read_desired(|desired| {
+                desired
+                    .scheduling
+                    .get(&app_id)
+                    .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
 
         if !node_ids.is_empty() {
             let members = membership.read().await;

@@ -117,7 +117,7 @@ async fn rotate_issues_a_new_secret_that_works_at_once_while_the_old_one_keeps_w
     assert_eq!(read_with(&fx.app, &new_secret).await, StatusCode::OK);
     assert_eq!(read_with(&fx.app, &ci.plaintext).await, StatusCode::OK);
     // Still one token, under the same name.
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     assert_eq!(tokens.iter().filter(|t| t.name == "ci").count(), 1);
 }
 
@@ -260,7 +260,7 @@ async fn the_last_admin_can_be_rotated() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&fx.app, request).await.0, StatusCode::OK);
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].role, ApiRole::Admin);
 }
@@ -340,7 +340,7 @@ async fn a_token_created_without_a_lifetime_gets_the_default_unless_admin_or_opt
     assert_eq!(status, StatusCode::OK, "{body}");
     let after = SystemTime::now();
 
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     let ninety_days = Duration::from_secs(90 * 86_400);
     for name in ["ci", "reader"] {
         let expiry = expiry_of(&tokens, name).unwrap();

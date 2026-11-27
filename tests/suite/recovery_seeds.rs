@@ -65,7 +65,7 @@ async fn start_with_a_seed(
         .voter_ids()
         .count();
     let leader = council.current_leader().await;
-    let security = council.security_state().await;
+    let security = (*council.security_state().await).clone();
     cancel.cancel();
     council.shutdown().await.unwrap();
     Started {
