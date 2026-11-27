@@ -306,18 +306,17 @@ impl RecoveryFence {
 
     /// The claim to stamp on a question that reaches no Raft state
     /// ([`super::network::RaftRpc::CouncilVoters`]): this node's own claim
-    /// while it serves or probes, the newest epoch it knows (with no
-    /// recovery id) while it holds none, and `None` once it is fenced, when
-    /// nothing a peer answers can change anything.
+    /// once it holds an epoch, fenced or not, and the newest epoch it knows
+    /// (with no recovery id) while it holds none. A fenced node still asks:
+    /// a split node learns of a newer recovery that way (#2406).
     pub fn question_claim(&self) -> Option<RecoveryClaim> {
         let snapshot = self.snapshot();
         match snapshot.state {
-            FenceState::Serving | FenceState::Probing => snapshot.claim(),
             FenceState::Unclaimed => Some(RecoveryClaim {
                 epoch: snapshot.epoch,
                 id: None,
             }),
-            FenceState::Fenced { .. } | FenceState::Split { .. } => None,
+            _ => snapshot.claim(),
         }
     }
 

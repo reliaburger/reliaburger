@@ -453,8 +453,18 @@ pub async fn start(
             }),
         None => crate::council::admission::ExpectedCouncil::default(),
     };
+    // BLOCKING-OK: one small file read once at startup, before any task runs on this worker
+    let previous_council = crate::council::admission::load_previous_council(&raft_dir)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "cluster: could not read the voters this node's recovery replaced ({error}); \
+                 gossip epoch claims are confirmed with its current voters only"
+            );
+            Default::default()
+        });
     let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone())
-        .expecting(expected_council.clone());
+        .expecting(expected_council.clone())
+        .remembering(previous_council);
     let committed_flusher = log_store.committed_flusher();
     let council = CouncilNode::new(
         raft_id,
