@@ -78,9 +78,15 @@ exercises the declined cross-repository mount. oras and buildah are not tested. 
 are whatever the runner image ships; the gate logs them.
 
 **Write admission.** At most four write requests (`POST`, `PATCH`, `PUT`, `DELETE`) run at
-once. A fifth waits up to 60 seconds for a slot, with its body unread, and only then gets
+once. A fifth waits up to six minutes for a slot, with its body unread, and only then gets
 429 with `Retry-After: 1`. Refusing at once broke `docker push`: docker 29 with the
 containerd image store uploads every blob of an image in parallel and doesn't retry a 429.
+The wait is longer than a slot can be held (an upload may take five minutes, then it is
+verified and stored), so a layer queued behind four slow but live uploads still gets its
+turn; until 0.3.4 it gave up after 60 seconds (#2466). The internal storage routes other
+nodes call (`/copies/` and the heal loop's `/replicas/`, which can hold a request for five
+minutes) queue for four slots of their own, so heal work never takes a client's slot. A
+queued request costs an open connection, not memory.
 
 **Token scope.** A token created with `--apps` or `--namespaces` is also held to its
 scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the

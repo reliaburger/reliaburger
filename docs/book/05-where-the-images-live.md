@@ -867,8 +867,8 @@ backpressure: a slow disk slows the sender. Completion hashes the file with a
 content-addressed store. The digest must match before the blob becomes visible.
 Manifests still need parsing in memory, so they have a separate 4 MiB limit.
 
-A semaphore allows four simultaneous write requests. A fifth waits up to a
-minute for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
+A semaphore allows four simultaneous write requests. A fifth waits up to six
+minutes for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
 its body stays unread on the socket, so the queue costs a connection, not
 memory. (It used to get the 429 at once. Then docker pushed its layers in
 parallel and gave up on the whole image. "Four clients, no `--insecure`"
@@ -1483,7 +1483,16 @@ match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned()).await 
 }
 ```
 
-`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a one-minute clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+
+That clock was a minute at first, and a minute was too short (#2466). Each upload request may take five minutes to arrive (`UPLOAD_TIMEOUT`) and carry 512 MiB (`MAX_REQUEST_BYTES`); the bound keeps one slow client from holding a slot for ever. But it also means four slow, perfectly live uploads can hold every slot for longer than a minute, and then the fifth layer got the 429 docker never retries. The wait is now derived from the upload timeout, so it can't fall behind it again:
+
+```rust
+const WRITE_ADMISSION_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(UPLOAD_TIMEOUT.as_secs() + 60);
+```
+
+A `const` is evaluated at compile time, so only `const fn`s can appear on its right-hand side. `Duration::from_secs` and `Duration::as_secs` are both `const fn`, which is why one constant can be computed from another here. Heal copies between nodes (`/replicas/`) can hold their request for five minutes as well, so they now queue for their own four slots and never take a client's. `a_queued_writer_outlasts_a_slow_but_live_upload` waits two virtual minutes with every slot held and checks the fifth writer is still queued, then admitted. `a_running_replica_copy_leaves_every_client_write_slot_free` stalls a heal copy and three uploads and checks that a fourth upload goes straight through. The manual now states all of these limits, and `the_manual_states_the_registry_push_limits` renders them from the constants and looks for them in the chapter, so the two can't drift apart (#2520).
 
 The rest were already right, and now there are tests to keep them that way. docker's anonymous `GET /v2/` gets the `Basic` challenge and an OCI error body. It now also gets `Docker-Distribution-API-Version: registry/2.0`, which the spec asks for and docker reads to tell a v2 registry from anything else. A blob `HEAD` returns the digest and the real length. And when skopeo copies an image between two repositories, it offers a cross-repository mount (`POST …/blobs/uploads/?mount=<digest>&from=<repo>`). Pickle doesn't mount. It answers `202` with an ordinary upload location, which the spec allows, and skopeo uploads the bytes instead. All three have portable tests next to the client ones, so you don't need docker installed to break them.
 

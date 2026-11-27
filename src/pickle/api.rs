@@ -27,8 +27,18 @@ const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Admission bounds open writers and the small buffers retained by each stream.
 const MAX_CONCURRENT_WRITES: usize = 4;
-/// How long a write over that limit waits for a slot before a 429.
-const WRITE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Slots for the internal storage routes (`/copies/`, `/replicas/`), kept
+/// apart so a heal copy, which can hold its request for `REPLICA_TIMEOUT`,
+/// never takes a client's slot (#2466).
+const MAX_CONCURRENT_INTERNAL_WRITES: usize = 4;
+/// How long a write over that limit waits for a slot before a 429. At least
+/// as long as a slot can be held, a body upload of up to `UPLOAD_TIMEOUT`,
+/// plus a minute to verify and store it: docker pushes layers in parallel and
+/// never retries a 429, so a layer queued behind four slow ones must outlast
+/// them (#2466).
+const WRITE_ADMISSION_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(UPLOAD_TIMEOUT.as_secs() + 60);
+/// Longest a single upload or manifest request may take to arrive.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared state for Pickle API handlers.
@@ -543,6 +553,7 @@ impl PickleState {
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));
+    let internal_writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INTERNAL_WRITES));
     Router::new()
         .route("/v2/", get(v2_check))
         .route(
@@ -556,7 +567,11 @@ pub fn router(state: PickleState) -> Router {
         )
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let writers = Arc::clone(&writers);
+                let writers = if is_internal_storage_route(request.uri().path()) {
+                    Arc::clone(&internal_writers)
+                } else {
+                    Arc::clone(&writers)
+                };
                 async move {
                     let _permit = if matches!(
                         *request.method(),
@@ -592,6 +607,14 @@ pub fn router(state: PickleState) -> Router {
         .layer(axum::middleware::from_fn(standard_client_credentials))
         .layer(axum::middleware::from_fn(api_version_header))
         .with_state(state)
+}
+
+/// Whether `path` is one of the routes only other cluster nodes call: a copy
+/// confirmation or a heal copy. They queue for their own write slots.
+fn is_internal_storage_route(path: &str) -> bool {
+    path.strip_prefix("/v2/")
+        .and_then(parse_v2_route)
+        .is_some_and(|route| matches!(route, V2Route::Copy { .. } | V2Route::Replica { .. }))
 }
 
 /// Mark every answer as coming from a v2 registry, as the distribution spec
@@ -2437,6 +2460,60 @@ mod tests {
         let response = waiting.await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         drop(writers);
+    }
+
+    /// #2466: a slot can be held for a whole upload (`UPLOAD_TIMEOUT`), so a
+    /// queued writer waits at least that long. A layer pushed beside four
+    /// slow ones mustn't fail with a 429 that docker never retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_writer_outlasts_a_slow_but_live_upload() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        let mut waiting = Box::pin(app.clone().oneshot(start_upload()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+        drop(writers.pop());
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(writers);
+    }
+
+    /// #2466: a heal copy (`/replicas/`) can hold its request for
+    /// `REPLICA_TIMEOUT`; it takes an internal slot, never a client's.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_replica_copy_leaves_every_client_write_slot_free() {
+        let (state, _dir) = test_state();
+        let app = router(state).layer(axum::Extension(super::super::replication::ReplicaClient(
+            reqwest::Client::new(),
+        )));
+        let digest = compute_sha256(b"image");
+        let replica = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/web/replicas/{}", digest.as_str()))
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let mut replica = Box::pin(app.clone().oneshot(replica));
+        assert!(futures_util::poll!(replica.as_mut()).is_pending());
+        let mut writers = stalled_writers(&app);
+        writers.truncate(MAX_CONCURRENT_WRITES - 1);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        // Three client slots are taken; the fourth is still free.
+        // Were the copy holding a client slot, this would queue until the
+        // admission wait ran out and answer 429.
+        let response = app.clone().oneshot(start_upload()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(writers);
+        drop(replica);
     }
 
     async fn serve_peer_body(
