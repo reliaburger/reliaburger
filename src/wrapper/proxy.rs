@@ -132,6 +132,9 @@ struct Listener {
     request_body_idle: std::time::Duration,
     /// The port the listener is bound to, for `X-Forwarded-Port`.
     port: u16,
+    /// The port the HTTPS listener is bound to, for the redirect a TLS
+    /// route answers on plain HTTP (#2471).
+    https_port: u16,
 }
 
 /// What the proxy itself saw of a client's request. The forwarding headers
@@ -413,6 +416,7 @@ impl BoundProxy {
                 over_tls: false,
                 request_body_idle,
                 port: self.http_addr.port(),
+                https_port: self.https_addr.port(),
             }))
             .with_state(Arc::clone(&self.state));
 
@@ -422,6 +426,7 @@ impl BoundProxy {
                 over_tls: true,
                 request_body_idle,
                 port: self.https_addr.port(),
+                https_port: self.https_addr.port(),
             }))
             .with_state(Arc::clone(&self.state));
 
@@ -913,7 +918,7 @@ async fn do_proxy(
     // served in the clear (ING1). ACME is not implemented, so there is no
     // plaintext challenge-path exception in the v1 contract.
     if tls_required && !over_tls {
-        return redirect_to_https(&host, req.uri());
+        return redirect_to_https_port(&view.host, listener.https_port, req.uri());
     }
 
     // Rate limit before touching the backend: a limited client gets
@@ -1303,13 +1308,52 @@ where
 ///
 /// 308 (Permanent Redirect) preserves the method and body, unlike 301/302
 /// which some clients rewrite to GET.
-pub(crate) fn redirect_to_https(host: &str, uri: &Uri) -> Response {
-    let location = format!("https://{host}{}", origin_form(uri));
+///
+/// `host` is the `Host` the client sent. A port in it names the plain-HTTP
+/// listener, so the redirect swaps it for `https_port` (left out when that
+/// is 443). A `Host` with no port redirects with no port: behind a port
+/// mapping, the client's 80 and 443 aren't the ports Bun binds (#2471).
+pub(crate) fn redirect_to_https_port(host: &str, https_port: u16, uri: &Uri) -> Response {
+    let authority = match split_port(host) {
+        (name, Some(_)) if https_port != 443 => format!("{name}:{https_port}"),
+        (name, _) => name.to_string(),
+    };
+    let location = format!("https://{authority}{}", origin_form(uri));
     Response::builder()
         .status(StatusCode::PERMANENT_REDIRECT)
         .header("location", location)
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::PERMANENT_REDIRECT.into_response())
+}
+
+/// [`redirect_to_https_port`] for an HTTPS listener on the default port 443.
+/// The fuzz harness checks the redirect never leaves the routed host.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn redirect_to_https(host: &str, uri: &Uri) -> Response {
+    redirect_to_https_port(host, 443, uri)
+}
+
+/// Split a `Host` value into its name and its port, if it names one.
+///
+/// A bracketed IPv6 literal keeps its brackets (`[::1]:8080` gives `[::1]`
+/// and `8080`); a bare one has no port. Only a tail of digits is a port, the
+/// same rule the routing lookup uses, so a host that routed here splits the
+/// way the lookup read it.
+fn split_port(host: &str) -> (&str, Option<&str>) {
+    let digits = |port: &str| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    if host.starts_with('[') {
+        return match host.find(']') {
+            Some(end) => match host[end + 1..].strip_prefix(':') {
+                Some(port) if digits(port) => (&host[..=end], Some(port)),
+                _ => (host, None),
+            },
+            None => (host, None),
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && digits(port) => (name, Some(port)),
+        _ => (host, None),
+    }
 }
 
 /// Whether a header name is one of the forwarding headers the proxy owns and
@@ -1572,10 +1616,52 @@ mod tests {
     #[test]
     fn redirect_to_https_preserves_path() {
         let uri: Uri = "/dashboard?tab=1".parse().unwrap();
-        let resp = redirect_to_https("myapp.com", &uri);
+        let resp = redirect_to_https_port("myapp.com", 443, &uri);
         assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://myapp.com/dashboard?tab=1");
+    }
+
+    fn redirect_location(host: &str, https_port: u16, uri: &str) -> String {
+        let resp = redirect_to_https_port(host, https_port, &uri.parse().unwrap());
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        resp.headers()["location"].to_str().unwrap().to_string()
+    }
+
+    /// #2471: a `Host` that names the plain-HTTP port is sent to the HTTPS
+    /// port, not back to the plain one, where the TLS handshake would fail.
+    #[test]
+    fn redirect_to_https_replaces_the_plain_port_with_the_https_port() {
+        assert_eq!(
+            redirect_location("app.example:8080", 8443, "/login?next=1"),
+            "https://app.example:8443/login?next=1"
+        );
+    }
+
+    #[test]
+    fn redirect_to_https_omits_the_default_https_port() {
+        assert_eq!(
+            redirect_location("app.example:80", 443, "/"),
+            "https://app.example/"
+        );
+    }
+
+    #[test]
+    fn redirect_to_https_keeps_a_bracketed_ipv6_host() {
+        assert_eq!(
+            redirect_location("[2001:db8::1]:8080", 8443, "/"),
+            "https://[2001:db8::1]:8443/"
+        );
+    }
+
+    /// A `Host` with no port redirects with no port: behind a port mapping
+    /// the client's 443 isn't the port Bun binds.
+    #[test]
+    fn redirect_to_https_adds_no_port_to_a_host_that_named_none() {
+        assert_eq!(
+            redirect_location("app.example", 8443, "/"),
+            "https://app.example/"
+        );
     }
 
     /// `OPTIONS * HTTP/1.1` carries the asterisk-form request target, which
@@ -1584,7 +1670,7 @@ mod tests {
     #[test]
     fn redirect_to_https_sends_an_asterisk_form_target_to_the_root() {
         let uri: Uri = "*".parse().unwrap();
-        let resp = redirect_to_https("tls.example", &uri);
+        let resp = redirect_to_https_port("tls.example", 443, &uri);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://tls.example/");
     }
@@ -2289,6 +2375,7 @@ mod tests {
         .await
         .unwrap();
         let http_port = bound.http_addr.port();
+        let https_port = bound.https_addr.port();
         tokio::spawn(async move {
             bound.serve().await.ok();
         });
@@ -2308,6 +2395,17 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 308);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://secure.test/panel");
+
+        // A `Host` naming the plain port is sent to the HTTPS port (#2471).
+        let resp = client
+            .get(&url)
+            .header("host", format!("secure.test:{http_port}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 308);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, format!("https://secure.test:{https_port}/panel"));
 
         // ACME isn't implemented in v1, so its well-known path is not a
         // plaintext escape hatch. It follows the same fail-closed redirect.

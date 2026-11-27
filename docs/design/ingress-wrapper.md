@@ -56,7 +56,7 @@ If no ingress routes are configured in any app spec, Wrapper still binds its por
 
 Wrapper binds two TCP listeners on the host network namespace:
 
-- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1.
+- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1. The redirect keeps the client's host. When the `Host` named a port, the redirect names the HTTPS listener's port instead (left out when it is 443); a `Host` with no port redirects with none, which is right behind a port mapping (#2471).
 - **Port 443 (HTTPS)**: The primary listener. Terminates TLS using `rustls`, performs SNI-based certificate selection, and routes the decrypted request to the appropriate backend.
 
 Both ports are configurable via `node.toml`:
