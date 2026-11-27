@@ -971,7 +971,7 @@ Bun on each worker node maintains a rotation schedule for every running workload
 4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, `token` (OIDC JWT) and `api-token` (the same JWT with the API's audience, §5.3) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
-7. **Council unreachable.** If the CSR fails, Bun keeps the current certificate and tries again on each check while it's still valid. Nothing extends it: when its hour runs out it has expired, peers that verify it refuse it, and Bun logs `identity expired` for the instance (`check_identity_rotation` in `src/bun/agent/identity.rs`). A certificate's signed `notAfter` can't be extended locally anyway, because the peer checks it.
+7. **Council unreachable.** If the CSR fails, Bun keeps the current certificate and tries again on every rotation tick (every second, one signing per instance in flight). Nothing extends it: when its hour runs out it has expired, peers that verify it refuse it, and Bun logs `identity expired` for the instance (`check_identity_rotation` in `src/bun/agent/identity.rs`). A certificate's signed `notAfter` can't be extended locally anyway, because the peer checks it. Bun keeps asking after expiry too, so a certificate that ran out during a council outage is renewed as soon as a leader signs again, without restarting the instance (#2533).
 
 > **Grace period: planned, not implemented.** The design keeps the current certificate past expiry for up to 4 more hours (configurable) when the council is unreachable, logs a security event, warns in `relish wtf` and fires an alert. `extend_grace_period` and `RotationState::GracePeriod` in `src/sesame/identity.rs` model it, but nothing in Bun's renewal loop calls them, and a peer would still refuse the certificate. The `cert_grace_period` key in §6.1 is part of the same sketch.
 
@@ -1882,6 +1882,7 @@ council_size = 3
 - Running workloads continue operating with their current certificates.
 - Bun rotates each workload certificate at half its one-hour lifetime. While the council is down, each attempt fails and Bun keeps the certificate it has, trying again until it expires.
 - Total window before mTLS breaks: one hour from each instance's last successful rotation, so between 30 and 60 minutes after the outage starts. After that the certificate has expired and peers that verify it refuse it.
+- A certificate that expires during the outage stays expired until a leader signs again; Bun retries its CSR every rotation tick and installs the new certificate as soon as one comes back, with no restart (#2533).
 - New workloads that start during the outage cannot receive identity certificates. They wait for council availability.
 
 > **Grace period: planned, not implemented.** The design extends an expired certificate locally by up to 4 hours, for a 5-hour window, flags it in the event log, warns in `relish wtf` and fires an alert (§5.3 step 7). None of that runs.

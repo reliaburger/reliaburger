@@ -7538,6 +7538,127 @@ async fn a_cluster_query_without_a_start_reads_the_last_hour() {
     assert_eq!(result.data[0].timestamp, now - now % 60 - 60);
 }
 
+fn roster_member(name: &str, state: crate::mustard::state::NodeState) -> RosterMember {
+    RosterMember {
+        info: NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new(name),
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 19117)),
+            api_advertised: true,
+            jobs: None,
+        },
+        gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], 19114)),
+        state,
+        incarnation: 1,
+        labels: std::collections::BTreeMap::new(),
+    }
+}
+
+/// #2536: a cluster metric query names the live member whose rollups
+/// stopped, and not the one that joined a minute ago. Three nodes have
+/// been members for ten minutes; w3's rollup sender stopped eight minutes
+/// ago, and w4 has just joined.
+#[tokio::test]
+async fn a_cluster_query_names_a_member_whose_rollups_stopped() {
+    use crate::mustard::state::NodeState::Alive;
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rollups = crate::mayo::rollup_store::RollupStore::new(dir.path().to_path_buf());
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    let minute = now - now % 60;
+    for (node, timestamp) in [
+        ("w1", minute - 60),
+        ("w2", minute - 120),
+        ("w3", minute - 480),
+    ] {
+        rollups.ingest(&crate::mayo::rollup::NodeRollup {
+            node_id: crate::meat::NodeId::new(node),
+            timestamp,
+            part: 0,
+            entries: Vec::new(),
+        });
+    }
+    let known = KnownMembers::default();
+    // Ten minutes, not an hour: a monotonic clock starts at boot, and a
+    // fresh CI runner may not have been up for an hour.
+    let ten_minutes_ago = std::time::Instant::now() - std::time::Duration::from_secs(600);
+    let founders = || {
+        ["w1", "w2", "w3"]
+            .into_iter()
+            .map(|name| roster_member(name, Alive))
+            .collect::<Vec<_>>()
+    };
+    known
+        .refresh(founders(), &Default::default(), ten_minutes_ago)
+        .await;
+    let mut roster = founders();
+    roster.push(roster_member("w4", Alive));
+    known
+        .refresh(roster, &Default::default(), std::time::Instant::now())
+        .await;
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(rollups))),
+        None,
+        None,
+        9117,
+        None,
+    )
+    .layer(axum::Extension(known));
+    let (status, body) = get_bytes(app, "/v1/metrics/cluster?name=cpu").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        result.warnings,
+        [QueryWarning::NodeSilent {
+            node_id: "w3".into(),
+            last_seen: Some(minute - 480),
+        }]
+    );
+}
+
+/// A member that was down and comes back joins again: it owes no rollup
+/// for the time it was away.
+#[tokio::test]
+async fn a_member_back_from_down_counts_as_newly_joined() {
+    use crate::mustard::state::NodeState::{Alive, Dead};
+    let known = KnownMembers::default();
+    let start = std::time::Instant::now();
+    let later = start + std::time::Duration::from_secs(600);
+    let back = start + std::time::Duration::from_secs(1_200);
+    let refresh = |state, at| {
+        let known = known.clone();
+        async move {
+            known
+                .refresh(
+                    vec![roster_member("w1", Alive), roster_member("w2", state)],
+                    &Default::default(),
+                    at,
+                )
+                .await;
+        }
+    };
+    refresh(Alive, start).await;
+    refresh(Dead, later).await;
+    refresh(Alive, back).await;
+    let mut joined = known.live_since().await;
+    joined.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    assert_eq!(
+        joined,
+        [
+            (crate::meat::NodeId::new("w1"), start),
+            (crate::meat::NodeId::new("w2"), back)
+        ]
+    );
+}
+
 /// #1499: `relish logs-export` copies a node's archive to the operator's
 /// machine through these two routes. The listing names each Parquet file
 /// with its size and SHA-256, the file route serves those exact bytes, and
@@ -7695,6 +7816,7 @@ async fn scoped_token_is_refused_cluster_wide_metrics() {
         "/v1/metrics/keys",
         "/v1/metrics/rollup",
         "/v1/metrics/rollup/owned",
+        "/v1/metrics/rollup/reporters",
         "/v1/metrics/cluster",
     ] {
         let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
