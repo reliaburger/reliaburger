@@ -310,16 +310,149 @@ impl RollupStore {
         Ok(())
     }
 
-    /// Build a DataFusion session exposing a `rollups` table over all data: the
-    /// Parquet files unioned with the unflushed buffer, streamed per query and
-    /// pruned by each query's time and metric-name predicates (#377), so a
-    /// cluster query reads the files its window touches, not every one.
+    /// What one query reads, captured now: the Parquet files and the
+    /// unflushed rollups. Query it after releasing the store's lock, so a
+    /// slow query never holds up the aggregator's ingest or a flush (#2443,
+    /// #2449):
+    ///
+    /// ```ignore
+    /// let snapshot = rollups.read().await.snapshot().await?;
+    /// let rows = snapshot.query_cluster_metric("cpu", start, end).await?;
+    /// ```
+    ///
+    /// The rollups table is streamed per query and pruned by each query's
+    /// time and metric-name predicates (#377), so a cluster query reads the
+    /// files its window touches, not every one.
+    pub async fn snapshot(&self) -> Result<RollupSnapshot, MayoError> {
+        Ok(RollupSnapshot {
+            sources: Arc::new(list_local_off_runtime(&self.data_dir).await?),
+            memory: self.buffer_to_batch()?,
+            index: self.index.clone(),
+        })
+    }
+
     async fn session(&self) -> Result<SessionContext, MayoError> {
+        self.snapshot().await?.session()
+    }
+
+    /// See [`RollupSnapshot::query_sql`].
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot().await?.query_sql(sql).await
+    }
+
+    /// See [`RollupSnapshot::query_owned_rows`].
+    pub async fn query_owned_rows(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<OwnedRollupRow>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_owned_rows(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::query_cluster_metric`].
+    pub async fn query_cluster_metric(
+        &self,
+        metric_name: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_cluster_metric(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::query_all`].
+    pub async fn query_all(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot().await?.query_all(start, end).await
+    }
+
+    /// See [`RollupSnapshot::query_cluster_aggregates`].
+    pub async fn query_cluster_aggregates(
+        &self,
+        metric_name: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ClusterAggregate>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_cluster_aggregates(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::metric_names`].
+    pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
+        self.snapshot().await?.metric_names().await
+    }
+
+    /// Prune Parquet files whose newest datapoint is older than `before`.
+    ///
+    /// Keyed on the data's own newest timestamp (O12), read from row-group
+    /// statistics, not the file's mtime — the rollup schema shares the
+    /// leading `timestamp` column, so `store::file_max_timestamp` applies.
+    ///
+    /// Opening every file's footer is slow on a slow disk, so the scan runs
+    /// on a blocking thread (#1417).
+    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
+        let data_dir = self.data_dir.clone();
+        let index = self.index.clone();
+        tokio::task::spawn_blocking(move || {
+            super::store::prune_directory(&data_dir, before, None, &index)
+        })
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Prune rollups older than `retention`, measured back from `now`.
+    ///
+    /// A thin convenience over [`prune`](Self::prune) for the periodic
+    /// maintenance tick: it turns the operator-facing `[metrics]
+    /// rollup_retention_hours` (a `Duration`) into the absolute cutoff
+    /// timestamp `prune` expects. A zero `retention` keeps everything —
+    /// matching the "0 means unlimited" convention the other storage limits
+    /// use — so an unconfigured council never deletes rollups by surprise.
+    pub async fn prune_expired(
+        &self,
+        now: SystemTime,
+        retention: Duration,
+    ) -> Result<usize, MayoError> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let before = now_secs.saturating_sub(retention.as_secs());
+        self.prune(before).await
+    }
+}
+
+/// What [`RollupStore::snapshot`] captured: the files and rollups a query
+/// reads, independent of the store's lock.
+pub struct RollupSnapshot {
+    sources: Arc<Vec<ParquetSource>>,
+    memory: Option<RecordBatch>,
+    index: SourceIndex,
+}
+
+impl RollupSnapshot {
+    /// A session exposing the snapshot as the `rollups` table. Cheap: no
+    /// I/O until a query runs.
+    fn session(&self) -> Result<SessionContext, MayoError> {
         let ctx = streaming_session();
         let table = ParquetTable::new(
             Arc::new(rollup_schema()),
-            list_local_off_runtime(&self.data_dir).await?,
-            self.buffer_to_batch()?,
+            Arc::clone(&self.sources),
+            self.memory.clone(),
             None,
             "rollup",
             self.index.clone(),
@@ -334,7 +467,7 @@ impl RollupStore {
     /// Returns (timestamp, metric_name, labels, value) tuples where
     /// value is the sum across nodes for each (timestamp, metric_name, labels).
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let ctx = self.session().await?;
+        let ctx = self.session()?;
         let batches = super::store::collect_sql(&ctx, sql).await?;
 
         let mut results = Vec::new();
@@ -396,7 +529,7 @@ impl RollupStore {
         let sql = format!(
             "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT 10001"
         );
-        let batches = super::store::collect_sql(&self.session().await?, &sql).await?;
+        let batches = super::store::collect_sql(&self.session()?, &sql).await?;
         let mut rows = Vec::new();
         for batch in batches {
             let timestamps = batch
@@ -516,7 +649,7 @@ impl RollupStore {
              ORDER BY timestamp"
         );
 
-        let ctx = self.session().await?;
+        let ctx = self.session()?;
         let batches = super::store::collect_sql(&ctx, &sql).await?;
 
         let mut results = Vec::new();
@@ -576,7 +709,7 @@ impl RollupStore {
 
     /// List all distinct metric names in the rollup store.
     pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
-        let ctx = self.session().await?;
+        let ctx = self.session()?;
         let batches = super::store::collect_sql(
             &ctx,
             "SELECT DISTINCT metric_name FROM rollups ORDER BY metric_name",
@@ -596,48 +729,6 @@ impl RollupStore {
         }
 
         Ok(names)
-    }
-
-    /// Prune Parquet files whose newest datapoint is older than `before`.
-    ///
-    /// Keyed on the data's own newest timestamp (O12), read from row-group
-    /// statistics, not the file's mtime — the rollup schema shares the
-    /// leading `timestamp` column, so `store::file_max_timestamp` applies.
-    ///
-    /// Opening every file's footer is slow on a slow disk, so the scan runs
-    /// on a blocking thread (#1417).
-    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
-        let data_dir = self.data_dir.clone();
-        let index = self.index.clone();
-        tokio::task::spawn_blocking(move || {
-            super::store::prune_directory(&data_dir, before, None, &index)
-        })
-        .await
-        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
-    }
-
-    /// Prune rollups older than `retention`, measured back from `now`.
-    ///
-    /// A thin convenience over [`prune`](Self::prune) for the periodic
-    /// maintenance tick: it turns the operator-facing `[metrics]
-    /// rollup_retention_hours` (a `Duration`) into the absolute cutoff
-    /// timestamp `prune` expects. A zero `retention` keeps everything —
-    /// matching the "0 means unlimited" convention the other storage limits
-    /// use — so an unconfigured council never deletes rollups by surprise.
-    pub async fn prune_expired(
-        &self,
-        now: SystemTime,
-        retention: Duration,
-    ) -> Result<usize, MayoError> {
-        if retention.is_zero() {
-            return Ok(0);
-        }
-        let now_secs = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let before = now_secs.saturating_sub(retention.as_secs());
-        self.prune(before).await
     }
 }
 

@@ -122,7 +122,19 @@ impl<T: ReportingTransport> RollupWorker<T> {
             .as_secs();
 
         let extended = self.send_extended;
-        let store = self.mayo.read().await;
+        // One statement, so the read guard is dropped before the queries run:
+        // holding it stalled the collector's write and every read queued
+        // behind it (#2449). One snapshot serves all five backfill windows.
+        let store = match self.mayo.read().await.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.send_extended = true;
+                eprintln!(
+                    "mayo: rollup generation failed; requesting the last five minutes next tick: {e}"
+                );
+                return;
+            }
+        };
         // The backfill is per-minute rollups, not one 5-minute blob: a blob's
         // single timestamp collided with an already-sent minute key, so the
         // parent's dedup dropped or double-counted the whole thing (M9). The
@@ -136,7 +148,6 @@ impl<T: ReportingTransport> RollupWorker<T> {
                 .await
                 .map(|rollup| vec![rollup])
         };
-        drop(store);
 
         let rollups = match generated {
             Ok(r) => r,
@@ -341,6 +352,45 @@ mod tests {
                 "normal and backfill failures request recovery"
             );
         }
+    }
+
+    /// #2449: the worker held the store's read guard through its queries,
+    /// and tokio's `RwLock` is fair, so the collector's next write (and every
+    /// read behind it) waited for the slowest rollup. A write now goes
+    /// through while a rollup's query runs.
+    #[tokio::test]
+    async fn a_metrics_write_is_not_blocked_while_a_rollup_is_generated() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let _council_transport = net.register(addr(2)).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        let gate = Arc::new(crate::mayo::store::QueryGate::default());
+        store.set_query_gate(Arc::clone(&gate));
+        let mayo = Arc::new(RwLock::new(store));
+
+        let council = vec![(NodeId::new("c1"), addr(2))];
+        let (_council_tx, council_rx) = watch::channel(council);
+        let mut worker = RollupWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            Arc::clone(&mayo),
+            council_rx,
+            Duration::from_millis(100),
+            CancellationToken::new(),
+        );
+        let generating = tokio::spawn(async move { worker.push_rollup().await });
+
+        gate.entered.notified().await;
+        let write = tokio::time::timeout(Duration::from_millis(200), mayo.write()).await;
+        assert!(
+            write.is_ok(),
+            "a write waited for the rollup's query to finish"
+        );
+        drop(write);
+        gate.release.notify_one();
+        generating.await.unwrap();
     }
 
     #[tokio::test]

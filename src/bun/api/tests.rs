@@ -7363,6 +7363,48 @@ async fn a_log_query_cut_at_the_default_cap_says_so() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 }
 
+/// #2449: the metrics handlers held the store's read guard through their
+/// queries, so one slow dashboard request stalled the collector's write and
+/// every read queued behind it. A write now goes through while a metrics
+/// query runs.
+#[tokio::test]
+async fn the_metrics_query_handler_releases_the_store_before_it_queries() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::mayo::store::MayoStore::new(dir.path().to_path_buf());
+    store.insert(
+        &crate::mayo::types::MetricKey::simple("cpu"),
+        crate::mayo::types::Sample::at(1, 1.0),
+    );
+    let gate = Arc::new(crate::mayo::store::QueryGate::default());
+    store.set_query_gate(Arc::clone(&gate));
+    let mayo = Arc::new(RwLock::new(store));
+    let app = router(
+        cmd_tx,
+        Some(Arc::clone(&mayo)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let request = tokio::spawn(get_bytes(app, "/v1/metrics?name=cpu"));
+    gate.entered.notified().await;
+    let write = tokio::time::timeout(std::time::Duration::from_millis(200), mayo.write()).await;
+    assert!(write.is_ok(), "a write waited for the query to finish");
+    drop(write);
+    gate.release.notify_one();
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
 /// #1499: `relish logs-export` copies a node's archive to the operator's
 /// machine through these two routes. The listing names each Parquet file
 /// with its size and SHA-256, the file route serves those exact bytes, and

@@ -864,6 +864,28 @@ pub(crate) async fn dir_has_parquet_off_runtime(data_dir: &std::path::Path) -> b
         .unwrap_or(false)
 }
 
+/// A test's hold on a metrics query: the query says it has started, then
+/// waits to be released, so a test can check what the query holds while it
+/// runs (#2449).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct QueryGate {
+    /// Notified when a query reaches the gate.
+    pub entered: tokio::sync::Notify,
+    /// Notify once per query to let it run.
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl QueryGate {
+    async fn pass(gate: &Option<Arc<QueryGate>>) {
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+}
+
 /// A buffered sample waiting to be flushed.
 struct BufferedSample {
     timestamp: u64,
@@ -900,6 +922,8 @@ pub struct MayoStore {
     index: SourceIndex,
     #[cfg(test)]
     test_gate: Option<Arc<MayoWriteGate>>,
+    #[cfg(test)]
+    query_gate: Option<Arc<QueryGate>>,
 }
 
 impl MayoStore {
@@ -922,6 +946,8 @@ impl MayoStore {
             index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
+            #[cfg(test)]
+            query_gate: None,
         }
     }
 
@@ -949,6 +975,8 @@ impl MayoStore {
             index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
+            #[cfg(test)]
+            query_gate: None,
         })
     }
 
@@ -972,6 +1000,12 @@ impl MayoStore {
                 .join(format!("nodes/{}", hex::encode(Sha256::digest(owner.as_bytes()))).as_str());
         }
         Ok(store)
+    }
+
+    /// Hold every query this store runs at `gate` (#2449).
+    #[cfg(test)]
+    pub(crate) fn set_query_gate(&mut self, gate: Arc<QueryGate>) {
+        self.query_gate = Some(gate);
     }
 
     /// The local directory where Parquet files are stored (the configured
@@ -1168,19 +1202,17 @@ impl MayoStore {
         Ok(Some(pending))
     }
 
-    /// A DataFusion session exposing a `metrics` table over all data, the
-    /// Parquet files unioned with the unflushed buffer, for a query whose SQL
-    /// only wants samples at or after `since` (`None`: any time).
+    /// What one query reads, captured now: the Parquet sources and the
+    /// unflushed samples. `floor` is a lower time bound every query on the
+    /// snapshot promises its SQL applies (`None`: any time).
     ///
     /// The `metrics` table is streamed (#377): this method lists file names
     /// and verifies only the exact retained publication, if present, so that
-    /// its memory rows do not duplicate a committed archive chunk. Each query reads its files one at a time, skips
-    /// files and row groups whose footer statistics rule out its time range
-    /// or metric names, and decodes only the columns it uses. `since` is one
-    /// more lower bound for that pruning; the SQL's own `timestamp`
-    /// predicates already give the same, so it's a promise, not a filter.
-    async fn session_since(&self, since: Option<u64>) -> Result<SessionContext, MayoError> {
-        let ctx = streaming_session();
+    /// its memory rows do not duplicate a committed archive chunk. Each query
+    /// reads its files one at a time, skips files and row groups whose
+    /// footer statistics (or the [`SourceIndex`]) rule out its time range or
+    /// metric names, and decodes only the columns it uses.
+    async fn capture(&self, floor: Option<u64>) -> Result<MetricsSnapshot, MayoError> {
         let sources = match &self.backend {
             Backend::Local => list_local_off_runtime(&self.data_dir).await?,
             Backend::Remote { store, prefix } => list_remote(store, prefix, "metrics").await?,
@@ -1211,64 +1243,57 @@ impl MayoStore {
                     .map_err(|error| MayoError::Arrow(error.to_string()))?,
             )
         };
-        let table = ParquetTable::new(
-            Arc::new(metrics_schema()),
-            archived,
+        Ok(MetricsSnapshot {
+            sources: Arc::new(archived),
             memory,
-            since,
-            "metrics",
-            self.index.clone(),
-        );
-        ctx.register_table("metrics", Arc::new(table))
-            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-        Ok(ctx)
+            floor,
+            index: self.index.clone(),
+            #[cfg(test)]
+            query_gate: self.query_gate.clone(),
+        })
     }
 
-    /// Query metrics using SQL. Returns (timestamp, name, labels, value) tuples.
+    /// A snapshot of the whole store: the archive files and unflushed
+    /// samples as they are now. Take it in one statement, so the store's
+    /// read guard is dropped at the semicolon, then query it holding
+    /// nothing:
+    ///
+    /// ```ignore
+    /// let snapshot = mayo.read().await.snapshot().await?;
+    /// let rows = snapshot.query("cpu", start, end).await?;
+    /// ```
+    ///
+    /// A slow query then never holds up the collector's write, or the
+    /// readers a fair `RwLock` queues behind that writer (#2215, #2449).
+    pub async fn snapshot(&self) -> Result<MetricsSnapshot, MayoError> {
+        self.capture(None).await
+    }
+
+    /// [`snapshot`](Self::snapshot) for queries that only want samples at
+    /// or after `since`: files entirely older than it aren't read.
+    pub async fn snapshot_since(&self, since: u64) -> Result<MetricsSnapshot, MayoError> {
+        self.capture(Some(since)).await
+    }
+
+    /// Query metrics using SQL. Returns (timestamp, name, labels, value)
+    /// tuples. Like every query method on the store, this runs on a
+    /// [`snapshot`](Self::snapshot) under the caller's borrow; a caller
+    /// holding the store's lock should take the snapshot itself and query
+    /// it after releasing the lock.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        self.query_rows(sql, None).await
+        self.snapshot().await?.query_sql(sql).await
     }
 
-    /// [`query_sql`](Self::query_sql) for SQL that only selects samples with
-    /// `timestamp >= since`. Files entirely older than `since` aren't read,
-    /// so the SQL must filter on that bound itself or it would see a subset.
+    /// See [`MetricsSnapshot::query_sql_since`].
     pub async fn query_sql_since(
         &self,
         sql: &str,
         since: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        self.query_rows(sql, Some(since)).await
+        self.snapshot().await?.query_sql_since(sql, since).await
     }
 
-    async fn query_rows(
-        &self,
-        sql: &str,
-        since: Option<u64>,
-    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let ctx = self.session_since(since).await?;
-        rows_from(&ctx, sql).await
-    }
-
-    /// A snapshot of the store for a query that only wants samples at or
-    /// after `since`: the archive files and unflushed samples as they are
-    /// now. Query it with [`MetricsSnapshot::query_sql`] after releasing the
-    /// store's lock, so a slow query doesn't hold up writers or the readers
-    /// queued behind them (#2215).
-    pub async fn snapshot_since(&self, since: u64) -> Result<MetricsSnapshot, MayoError> {
-        Ok(MetricsSnapshot {
-            ctx: self.session_since(Some(since)).await?,
-        })
-    }
-
-    /// One app's samples in `[start, end]`, oldest first, newest kept.
-    ///
-    /// `app_label` is matched against label values (the `namespace/app`
-    /// every per-app sample carries) and `name`, when given, against the
-    /// metric name. At most [`APP_QUERY_ROW_LIMIT`] rows come back, and they
-    /// are the newest ones: a long window loses its oldest samples, never the
-    /// latest. `per_series` keeps only the newest N samples of each series
-    /// (metric name plus labels), which is how a caller asks for "the latest
-    /// value of everything" without paying for the whole window.
+    /// See [`MetricsSnapshot::query_app`].
     pub async fn query_app(
         &self,
         app_label: &str,
@@ -1277,240 +1302,73 @@ impl MayoStore {
         end: u64,
         per_series: Option<u32>,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let app_filter = escape_sql_literal(app_label);
-        let name_filter = name
-            .map(|name| format!("metric_name = '{}' AND ", escape_sql_literal(name)))
-            .unwrap_or_default();
-        let filter = format!(
-            "{name_filter}labels LIKE '%\"{app_filter}\"%' \
-             AND timestamp >= {start} AND timestamp <= {end}"
-        );
-        let sql = match per_series {
-            None => format!(
-                "SELECT timestamp, metric_name, labels, value FROM metrics \
-                 WHERE {filter} ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
-            ),
-            Some(keep) => format!(
-                "SELECT timestamp, metric_name, labels, value FROM ( \
-                   SELECT timestamp, metric_name, labels, value, \
-                     ROW_NUMBER() OVER ( \
-                       PARTITION BY metric_name, labels ORDER BY timestamp DESC \
-                     ) AS series_rank \
-                   FROM metrics WHERE {filter} \
-                 ) WHERE series_rank <= {keep} \
-                 ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
-            ),
-        };
-        let mut rows = self.query_sql_since(&sql, start).await?;
-        rows.reverse();
-        Ok(rows)
+        self.snapshot()
+            .await?
+            .query_app(app_label, name, start, end, per_series)
+            .await
     }
 
-    /// One metric's samples in `[start, end]`, oldest first, at most
-    /// [`ALL_QUERY_ROW_LIMIT`] of them, the newest.
+    /// See [`MetricsSnapshot::query`].
     pub async fn query(
         &self,
         metric_name: &str,
         start: u64,
         end: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let metric_name = escape_sql_literal(metric_name);
-        // Newest first under the limit, then back to oldest first, as
-        // `query_app` does: without a limit one request returned every
-        // sample of the metric in the retention period (#2382).
-        let sql = format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE metric_name = '{metric_name}' \
-             AND timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp DESC LIMIT {ALL_QUERY_ROW_LIMIT}"
-        );
-        let mut rows = self.query_sql_since(&sql, start).await?;
-        rows.reverse();
-        Ok(rows)
+        self.snapshot().await?.query(metric_name, start, end).await
     }
 
-    /// Every series' samples in `[start, end]`, oldest first, at most
-    /// [`ALL_QUERY_ROW_LIMIT`] of them: what `/v1/metrics?name=*` returns.
+    /// See [`MetricsSnapshot::query_all`].
     pub async fn query_all(
         &self,
         start: u64,
         end: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let sql = format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT {ALL_QUERY_ROW_LIMIT}"
-        );
-        self.query_sql_since(&sql, start).await
+        self.snapshot().await?.query_all(start, end).await
     }
 
-    /// Samples of the named metrics at or after `since`, oldest first. `relish
-    /// top` reads its CPU and memory columns this way.
+    /// See [`MetricsSnapshot::query_names_since`].
     pub async fn query_names_since(
         &self,
         names: &[&str],
         since: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let names = names
-            .iter()
-            .map(|name| format!("'{}'", escape_sql_literal(name)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE metric_name IN ({names}) \
-             AND timestamp >= {since} ORDER BY timestamp"
-        );
-        self.query_sql_since(&sql, since).await
+        self.snapshot().await?.query_names_since(names, since).await
     }
 
-    /// Query the average value of a metric over a time window.
-    ///
-    /// Used by the autoscaler to compute average CPU/memory utilisation.
-    /// The `app_label` filters by the `app` label in the metrics labels JSON.
-    /// Returns `None` if no data points exist in the window.
+    /// See [`MetricsSnapshot::query_avg`].
     pub async fn query_avg(
         &self,
         metric_name: &str,
         app_label: &str,
         window_secs: u64,
     ) -> Result<Option<f64>, MayoError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let start = now.saturating_sub(window_secs);
-
-        let metric_name = escape_sql_literal(metric_name);
-        let app_label = escape_sql_literal(app_label);
-        let sql = format!(
-            "SELECT AVG(value) as avg_val FROM metrics \
-             WHERE metric_name = '{metric_name}' \
-             AND labels LIKE '%\"{app_label}\"%' \
-             AND timestamp >= {start} AND timestamp <= {now}"
-        );
-
-        let ctx = self.session_since(Some(start)).await?;
-        let batches = collect_sql(&ctx, &sql).await?;
-
-        for batch in &batches {
-            if batch.num_rows() == 0 || batch.num_columns() == 0 {
-                continue;
-            }
-            if let Some(col) = batch.column(0).as_any().downcast_ref::<Float64Array>()
-                && !col.is_null(0)
-            {
-                return Ok(Some(col.value(0)));
-            }
-        }
-
-        Ok(None)
+        self.snapshot()
+            .await?
+            .query_avg(metric_name, app_label, window_secs)
+            .await
     }
 
-    /// Every distinct metric name in the store, whatever its age.
+    /// See [`MetricsSnapshot::metric_names`].
     pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
-        self.metric_names_since(0).await
+        self.snapshot().await?.metric_names().await
     }
 
-    /// The distinct metric names with a sample at or after `since`. The API
-    /// asks for the last [`METRIC_NAMES_WINDOW_SECS`]: listing every name
-    /// in the retention period read every file on each call (#2382).
+    /// See [`MetricsSnapshot::metric_names_since`].
     pub async fn metric_names_since(&self, since: u64) -> Result<Vec<String>, MayoError> {
-        let ctx = self.session_since(Some(since)).await?;
-        let batches = collect_sql(
-            &ctx,
-            &format!(
-                "SELECT DISTINCT metric_name FROM metrics \
-                 WHERE timestamp >= {since} ORDER BY metric_name"
-            ),
-        )
-        .await?;
-
-        let mut names = Vec::new();
-        for batch in &batches {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("column type mismatch".into()))?;
-            for i in 0..batch.num_rows() {
-                names.push(col.value(i).to_string());
-            }
-        }
-
-        Ok(names)
+        self.snapshot().await?.metric_names_since(since).await
     }
 
-    /// Query aggregated statistics for all metrics in a time window.
-    ///
-    /// Returns (metric_name, labels_json, min, max, sum, count) tuples,
-    /// one per distinct (metric_name, labels) combination. Used by the
-    /// rollup generator to build `NodeRollup` entries.
+    /// See [`MetricsSnapshot::query_window_aggregates`].
     pub async fn query_window_aggregates(
         &self,
         start: u64,
         end: u64,
     ) -> Result<Vec<(String, String, f64, f64, f64, u32)>, MayoError> {
-        let sql = format!(
-            "SELECT metric_name, labels, \
-             MIN(value) as min_val, MAX(value) as max_val, \
-             SUM(value) as sum_val, COUNT(*) as count_val \
-             FROM metrics \
-             WHERE timestamp >= {start} AND timestamp < {end} \
-             GROUP BY metric_name, labels \
-             ORDER BY metric_name, labels"
-        );
-
-        let ctx = self.session_since(Some(start)).await?;
-        let batches = collect_sql(&ctx, &sql).await?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            let names = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
-            let labels = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
-            let mins = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| MayoError::Arrow("min column type mismatch".into()))?;
-            let maxs = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| MayoError::Arrow("max column type mismatch".into()))?;
-            let sums = batch
-                .column(4)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| MayoError::Arrow("sum column type mismatch".into()))?;
-            // COUNT(*) returns i64 in DataFusion
-            let counts = batch
-                .column(5)
-                .as_any()
-                .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                .ok_or_else(|| MayoError::Arrow("count column type mismatch".into()))?;
-
-            for i in 0..batch.num_rows() {
-                results.push((
-                    names.value(i).to_string(),
-                    labels.value(i).to_string(),
-                    mins.value(i),
-                    maxs.value(i),
-                    sums.value(i),
-                    counts.value(i) as u32,
-                ));
-            }
-        }
-
-        Ok(results)
+        self.snapshot()
+            .await?
+            .query_window_aggregates(start, end)
+            .await
     }
 
     /// Prune Parquet files whose newest datapoint is older than `before`.
@@ -1645,17 +1503,323 @@ pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
     max
 }
 
-/// What [`MayoStore::snapshot_since`] captured: the files and samples one
-/// query reads, independent of the store's lock.
+/// What [`MayoStore::snapshot`] captured: the files and samples a query
+/// reads, independent of the store's lock. Every read the API and the
+/// rollup worker make runs on one (#2449).
 pub struct MetricsSnapshot {
-    ctx: SessionContext,
+    sources: Arc<Vec<super::scan::ParquetSource>>,
+    memory: Option<RecordBatch>,
+    /// The lower time bound [`MetricsSnapshot::query_sql`] promises.
+    floor: Option<u64>,
+    index: SourceIndex,
+    #[cfg(test)]
+    query_gate: Option<Arc<QueryGate>>,
 }
 
 impl MetricsSnapshot {
-    /// Run `sql` over the snapshot. Returns (timestamp, name, labels, value)
-    /// tuples, as [`MayoStore::query_sql`] does.
+    /// A session over the snapshot whose queries want samples at or after
+    /// `since` (and the snapshot's own floor). Cheap: no I/O until a query
+    /// runs.
+    fn session(&self, since: Option<u64>) -> Result<SessionContext, MayoError> {
+        let floor = match (since, self.floor) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let ctx = streaming_session();
+        let table = ParquetTable::new(
+            Arc::new(metrics_schema()),
+            Arc::clone(&self.sources),
+            self.memory.clone(),
+            floor,
+            "metrics",
+            self.index.clone(),
+        );
+        ctx.register_table("metrics", Arc::new(table))
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+        Ok(ctx)
+    }
+
+    /// Run `sql` over the snapshot. Returns (timestamp, name, labels,
+    /// value) tuples.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        rows_from(&self.ctx, sql).await
+        self.query_rows(sql, None).await
+    }
+
+    /// [`query_sql`](Self::query_sql) for SQL that only selects samples with
+    /// `timestamp >= since`. Files entirely older than `since` aren't read,
+    /// so the SQL must filter on that bound itself or it would see a subset.
+    pub async fn query_sql_since(
+        &self,
+        sql: &str,
+        since: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.query_rows(sql, Some(since)).await
+    }
+
+    async fn query_rows(
+        &self,
+        sql: &str,
+        since: Option<u64>,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let ctx = self.session(since)?;
+        #[cfg(test)]
+        QueryGate::pass(&self.query_gate).await;
+        rows_from(&ctx, sql).await
+    }
+
+    /// One app's samples in `[start, end]`, oldest first, newest kept.
+    ///
+    /// `app_label` is matched against label values (the `namespace/app`
+    /// every per-app sample carries) and `name`, when given, against the
+    /// metric name. At most [`APP_QUERY_ROW_LIMIT`] rows come back, and they
+    /// are the newest ones: a long window loses its oldest samples, never the
+    /// latest. `per_series` keeps only the newest N samples of each series
+    /// (metric name plus labels), which is how a caller asks for "the latest
+    /// value of everything" without paying for the whole window.
+    pub async fn query_app(
+        &self,
+        app_label: &str,
+        name: Option<&str>,
+        start: u64,
+        end: u64,
+        per_series: Option<u32>,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let app_filter = escape_sql_literal(app_label);
+        let name_filter = name
+            .map(|name| format!("metric_name = '{}' AND ", escape_sql_literal(name)))
+            .unwrap_or_default();
+        let filter = format!(
+            "{name_filter}labels LIKE '%\"{app_filter}\"%' \
+             AND timestamp >= {start} AND timestamp <= {end}"
+        );
+        let sql = match per_series {
+            None => format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE {filter} ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
+            ),
+            Some(keep) => format!(
+                "SELECT timestamp, metric_name, labels, value FROM ( \
+                   SELECT timestamp, metric_name, labels, value, \
+                     ROW_NUMBER() OVER ( \
+                       PARTITION BY metric_name, labels ORDER BY timestamp DESC \
+                     ) AS series_rank \
+                   FROM metrics WHERE {filter} \
+                 ) WHERE series_rank <= {keep} \
+                 ORDER BY timestamp DESC LIMIT {APP_QUERY_ROW_LIMIT}"
+            ),
+        };
+        let mut rows = self.query_sql_since(&sql, start).await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// One metric's samples in `[start, end]`, oldest first, at most
+    /// [`ALL_QUERY_ROW_LIMIT`] of them, the newest.
+    pub async fn query(
+        &self,
+        metric_name: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let metric_name = escape_sql_literal(metric_name);
+        // Newest first under the limit, then back to oldest first, as
+        // `query_app` does: without a limit one request returned every
+        // sample of the metric in the retention period (#2382).
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE metric_name = '{metric_name}' \
+             AND timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp DESC LIMIT {ALL_QUERY_ROW_LIMIT}"
+        );
+        let mut rows = self.query_sql_since(&sql, start).await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Every series' samples in `[start, end]`, oldest first, at most
+    /// [`ALL_QUERY_ROW_LIMIT`] of them: what `/v1/metrics?name=*` returns.
+    pub async fn query_all(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp LIMIT {ALL_QUERY_ROW_LIMIT}"
+        );
+        self.query_sql_since(&sql, start).await
+    }
+
+    /// Samples of the named metrics at or after `since`, oldest first. `relish
+    /// top` reads its CPU and memory columns this way.
+    pub async fn query_names_since(
+        &self,
+        names: &[&str],
+        since: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let names = names
+            .iter()
+            .map(|name| format!("'{}'", escape_sql_literal(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE metric_name IN ({names}) \
+             AND timestamp >= {since} ORDER BY timestamp"
+        );
+        self.query_sql_since(&sql, since).await
+    }
+
+    /// Query the average value of a metric over a time window.
+    ///
+    /// Used by the autoscaler to compute average CPU/memory utilisation.
+    /// The `app_label` filters by the `app` label in the metrics labels JSON.
+    /// Returns `None` if no data points exist in the window.
+    pub async fn query_avg(
+        &self,
+        metric_name: &str,
+        app_label: &str,
+        window_secs: u64,
+    ) -> Result<Option<f64>, MayoError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let start = now.saturating_sub(window_secs);
+
+        let metric_name = escape_sql_literal(metric_name);
+        let app_label = escape_sql_literal(app_label);
+        let sql = format!(
+            "SELECT AVG(value) as avg_val FROM metrics \
+             WHERE metric_name = '{metric_name}' \
+             AND labels LIKE '%\"{app_label}\"%' \
+             AND timestamp >= {start} AND timestamp <= {now}"
+        );
+
+        let ctx = self.session(Some(start))?;
+        let batches = collect_sql(&ctx, &sql).await?;
+
+        for batch in &batches {
+            if batch.num_rows() == 0 || batch.num_columns() == 0 {
+                continue;
+            }
+            if let Some(col) = batch.column(0).as_any().downcast_ref::<Float64Array>()
+                && !col.is_null(0)
+            {
+                return Ok(Some(col.value(0)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Every distinct metric name in the store, whatever its age.
+    pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
+        self.metric_names_since(0).await
+    }
+
+    /// The distinct metric names with a sample at or after `since`. The API
+    /// asks for the last [`METRIC_NAMES_WINDOW_SECS`]: listing every name
+    /// in the retention period read every file on each call (#2382).
+    pub async fn metric_names_since(&self, since: u64) -> Result<Vec<String>, MayoError> {
+        let ctx = self.session(Some(since))?;
+        let batches = collect_sql(
+            &ctx,
+            &format!(
+                "SELECT DISTINCT metric_name FROM metrics \
+                 WHERE timestamp >= {since} ORDER BY metric_name"
+            ),
+        )
+        .await?;
+
+        let mut names = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("column type mismatch".into()))?;
+            for i in 0..batch.num_rows() {
+                names.push(col.value(i).to_string());
+            }
+        }
+
+        Ok(names)
+    }
+
+    /// Query aggregated statistics for all metrics in a time window.
+    ///
+    /// Returns (metric_name, labels_json, min, max, sum, count) tuples,
+    /// one per distinct (metric_name, labels) combination. Used by the
+    /// rollup generator to build `NodeRollup` entries.
+    pub async fn query_window_aggregates(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(String, String, f64, f64, f64, u32)>, MayoError> {
+        let sql = format!(
+            "SELECT metric_name, labels, \
+             MIN(value) as min_val, MAX(value) as max_val, \
+             SUM(value) as sum_val, COUNT(*) as count_val \
+             FROM metrics \
+             WHERE timestamp >= {start} AND timestamp < {end} \
+             GROUP BY metric_name, labels \
+             ORDER BY metric_name, labels"
+        );
+
+        let ctx = self.session(Some(start))?;
+        #[cfg(test)]
+        QueryGate::pass(&self.query_gate).await;
+        let batches = collect_sql(&ctx, &sql).await?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
+            let labels = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
+            let mins = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("min column type mismatch".into()))?;
+            let maxs = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("max column type mismatch".into()))?;
+            let sums = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("sum column type mismatch".into()))?;
+            // COUNT(*) returns i64 in DataFusion
+            let counts = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .ok_or_else(|| MayoError::Arrow("count column type mismatch".into()))?;
+
+            for i in 0..batch.num_rows() {
+                results.push((
+                    names.value(i).to_string(),
+                    labels.value(i).to_string(),
+                    mins.value(i),
+                    maxs.value(i),
+                    sums.value(i),
+                    counts.value(i) as u32,
+                ));
+            }
+        }
+
+        Ok(results)
     }
 }
 

@@ -1250,6 +1250,78 @@ impl LogStore {
         Ok(ctx)
     }
 
+    /// What one query reads, captured now: the Parquet directory and a
+    /// copy of the unflushed lines, as a session limited to
+    /// [`LOG_SQL_MEMORY_LIMIT_BYTES`]. Take it in one statement, so the
+    /// store's read guard is dropped at the semicolon, then query it holding
+    /// nothing:
+    ///
+    /// ```ignore
+    /// let snapshot = log_store.read().await.snapshot().await?;
+    /// let entries = snapshot.query_with("web", "default", &filter).await?;
+    /// ```
+    ///
+    /// The log drain asks for the write lock once per line, and tokio's
+    /// `RwLock` is fair, so a query that held the guard stalled ingestion
+    /// and every read queued behind it (#2449).
+    pub async fn snapshot(&self) -> Result<LogSnapshot, KetchupError> {
+        Ok(LogSnapshot {
+            ctx: self
+                .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
+                .await?,
+        })
+    }
+
+    /// See [`LogSnapshot::query_sql_json_bounded`].
+    pub async fn query_sql_json_bounded(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<serde_json::Value>, KetchupError> {
+        self.snapshot().await?.query_sql_json_bounded(sql).await
+    }
+
+    /// See [`LogSnapshot::query_sql`].
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot().await?.query_sql(sql).await
+    }
+
+    /// See [`LogSnapshot::query`].
+    pub async fn query(
+        &self,
+        app: &str,
+        namespace: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+        grep: Option<&str>,
+        tail: Option<usize>,
+    ) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot()
+            .await?
+            .query(app, namespace, start, end, grep, tail)
+            .await
+    }
+
+    /// See [`LogSnapshot::query_with`].
+    pub async fn query_with(
+        &self,
+        app: &str,
+        namespace: &str,
+        filter: &LogFilter,
+    ) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot()
+            .await?
+            .query_with(app, namespace, filter)
+            .await
+    }
+}
+
+/// What [`LogStore::snapshot`] captured: the session one query runs on,
+/// independent of the store's lock.
+pub struct LogSnapshot {
+    ctx: SessionContext,
+}
+
+impl LogSnapshot {
     /// Query logs using SQL under safety bounds (OBS5).
     ///
     /// The public `/v1/logs/sql` endpoint used to hand `?q=` straight to
@@ -1267,9 +1339,7 @@ impl LogStore {
         &self,
         sql: &str,
     ) -> Result<Vec<serde_json::Value>, KetchupError> {
-        let ctx = self
-            .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
-            .await?;
+        let ctx = &self.ctx;
 
         // Reject non-read statements up front, before planning, so an error
         // message names the problem clearly.
@@ -1311,9 +1381,7 @@ impl LogStore {
     /// The query runs under [`LOG_SQL_MEMORY_LIMIT_BYTES`] of working memory
     /// and is refused after [`LOG_QUERY_DEADLINE`] (#2382).
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
-        let ctx = self
-            .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
-            .await?;
+        let ctx = &self.ctx;
         let batches = within_deadline(LOG_QUERY_DEADLINE, async {
             ctx.sql(sql)
                 .await

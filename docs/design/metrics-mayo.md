@@ -110,6 +110,8 @@ Every read a caller drives has a row cap, a deadline and, where it lists names, 
 | `/v1/metrics/rollup` (no name) | 10,000 rows |
 | every query above, plus `query_sql`, the rollup and autoscaler aggregates | `QUERY_DEADLINE` (8 s), under the fan-out's 10 s wait |
 
+Every read runs on a snapshot (#2449). `MayoStore::snapshot()` and `RollupStore::snapshot()` list the files and copy the unflushed buffer under the store's read guard, and the query methods live on the returned `MetricsSnapshot` and `RollupSnapshot`. Callers take the snapshot in one statement, so the guard is dropped before the query runs: tokio's `RwLock` is fair, and a guard held through a slow query stalls the collector's (or the aggregator's) write and every read queued behind it. The API handlers, the rollup worker and the alert check all query this way.
+
 A query past its deadline is `MayoError::QueryRejected`, which the handlers answer with a 400 and the reason: the caller's range is the problem, and narrowing it helps where retrying doesn't. `hydrate_seen_windows` at startup has no deadline; it isn't a caller's query.
 
 `tests/mayo_memory.rs` measures each path's peak heap with a counting allocator as history grows from one to four hours and fails if any grows by half. Golden snapshots recorded from the eager implementation (`src/mayo/snapshots/`) and a property test against an eager reference (`streamed_reads_match_the_eager_reader`) hold the answers identical.

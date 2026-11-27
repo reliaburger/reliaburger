@@ -905,7 +905,12 @@ pub(super) async fn logs_entries_handler(
         return Json(Vec::<LogEntry>::new()).into_response();
     };
 
-    let store = log_store.read().await;
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let store = match log_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return log_query_error(error),
+    };
     let filter = match log_filter(&query) {
         Ok(filter) => filter,
         Err(e) => return log_query_error(e),
@@ -1142,7 +1147,12 @@ pub(super) async fn logs_cross_node_handler(
             Ok(filter) => filter,
             Err(e) => return log_query_error(e),
         };
-        let store = log_store.read().await;
+        // One statement: the read guard is dropped before the query runs
+        // (#2449).
+        let store = match log_store.read().await.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return log_query_error(error),
+        };
         match store.query_with(&app, &namespace, &filter).await {
             Ok(mut entries) => {
                 let warnings = cap_entries(&mut entries, query.tail).into_iter().collect();
@@ -1205,7 +1215,12 @@ pub(super) async fn logs_sql_handler(
             .into_response();
     };
 
-    let store = log_store.read().await;
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let store = match log_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return log_query_error(error),
+    };
     // OBS5: bounded access — read-only, `logs`-table only, row- and
     // memory-capped. A rejected query is a 400, not a 500.
     match store.query_sql_json_bounded(sql).await {

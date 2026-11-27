@@ -752,7 +752,7 @@ impl ParquetTable {
     /// `index` is the store's record of each file's time range.
     pub fn new(
         schema: SchemaRef,
-        sources: Vec<ParquetSource>,
+        sources: Arc<Vec<ParquetSource>>,
         buffer: Option<RecordBatch>,
         floor: Option<u64>,
         kind: &'static str,
@@ -760,7 +760,7 @@ impl ParquetTable {
     ) -> Self {
         Self {
             schema,
-            sources: Arc::new(sources),
+            sources,
             buffer,
             floor,
             kind,
@@ -855,7 +855,7 @@ mod tests {
         let ctx = SessionContext::new();
         let table = ParquetTable::new(
             schema,
-            Vec::new(),
+            Arc::new(Vec::new()),
             None,
             None,
             "metrics",
@@ -1011,7 +1011,7 @@ mod tests {
         let ctx = SessionContext::new();
         let table = ParquetTable::new(
             Arc::clone(&schema),
-            Vec::new(),
+            Arc::new(Vec::new()),
             Some(buffer.clone()),
             None,
             "metrics",

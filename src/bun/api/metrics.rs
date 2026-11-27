@@ -49,7 +49,12 @@ pub(super) async fn metrics_query_handler(
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
 
-    let store = mayo.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let name = params.name.as_deref().unwrap_or("*");
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
@@ -130,7 +135,12 @@ pub(super) async fn metrics_summary_handler(
         return Json(serde_json::json!([])).into_response();
     };
 
-    let store = mayo.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     match store
         .metric_names_since(
             crate::mayo::types::Sample::now(0.0)
@@ -199,7 +209,12 @@ pub(super) async fn metrics_keys_handler(
         return Json(serde_json::json!({"keys": []})).into_response();
     };
 
-    let store = mayo.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     match store
         .metric_names_since(
             crate::mayo::types::Sample::now(0.0)
@@ -238,7 +253,12 @@ pub(super) async fn metrics_rollup_handler(
         return Json(Vec::<MetricsQueryRow>::new()).into_response();
     };
 
-    let store = rollup_store.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match rollup_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
@@ -292,9 +312,13 @@ pub(super) async fn metrics_owned_rollup_handler(
         )
             .into_response();
     };
-    match store
-        .read()
-        .await
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let snapshot = match store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
+    match snapshot
         .query_owned_rows(
             params.name.as_deref(),
             params.start.unwrap_or(0),
@@ -401,7 +425,12 @@ pub(super) async fn metrics_cluster_handler(
         .into_response();
     };
 
-    let store = rollup_store.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match rollup_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let result = store
         .query_owned_rows(params.name.as_deref(), start, end)
         .await;
@@ -484,9 +513,15 @@ pub(super) async fn app_metric_rows(
     // `query_app` escapes (OBS1): without that a crafted `?name=x' OR '1'='1`
     // or an app name carrying a quote would break out of the literal and drop
     // the tenant/time predicate, leaking other apps' metrics.
-    let rows = mayo
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let snapshot = mayo
         .read()
         .await
+        .snapshot()
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = snapshot
         .query_app(&format!("{namespace}/{app}"), name, start, end, per_series)
         .await
         .map_err(|error| error.to_string())?;

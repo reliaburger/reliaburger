@@ -1858,6 +1858,20 @@ let snapshot = store.read().await.snapshot_since(window_start).await;
 
 The guard that `store.read().await` returns is a temporary, and Rust drops temporaries at the end of the statement that made them. So the lock is released at that semicolon, before the query starts. Taking the lock rather than a `&MayoStore` puts that rule in the function, where a caller can't get it wrong. The snapshot is safe to read without the lock because a published Parquet file never changes; the one thing that can happen meanwhile, retention deleting an old file, could already happen during a locked query, because pruning takes only the read lock too.
 
+That fixed one caller. The audit found nine more doing the same thing: every metrics and log API handler, and the rollup worker, which held the guard through five window queries when backfilling ([#2449](https://github.com/reliaburger/reliaburger/issues/2449)). The log store's writer is the drain, which asks for the write lock once per line, so a slow `relish logs` stalled ingestion too. So the snapshot became the only way to query. `MayoStore::snapshot()` captures the file listing and a copy of the unflushed buffer and returns a `MetricsSnapshot`, and every read (`query`, `query_app`, `query_all`, `metric_names_since`, `query_window_aggregates` and the rest) is a method on the snapshot. `RollupStore::snapshot()` and `LogStore::snapshot()` do the same for rollups and logs. Each handler now starts with the same shape:
+
+```rust
+// One statement: the read guard is dropped before any query runs.
+let store = match mayo.read().await.snapshot().await {
+    Ok(snapshot) => snapshot,
+    Err(error) => return metrics_store_error(error),
+};
+```
+
+Watch out for the version that looks equivalent: `mayo.read().await.query(...).await` in a `match` scrutinee. Temporaries in a `match` scrutinee live until the end of the whole `match`, so that form holds the guard through the query *and* the arms. Splitting the snapshot into its own `let` is what makes the drop happen where you can see it. The store keeps its old query methods as one-line wrappers (`self.snapshot().await?.query(...)`) for callers that own the store outright, like tests and the startup code.
+
+How do you test "doesn't hold a lock"? You make the query wait, and try to write. A test-only `QueryGate` on the store parks every query until the test releases it, after telling the test it has started. `a_metrics_write_is_not_blocked_while_a_rollup_is_generated` starts the rollup worker, waits for its query to reach the gate, and then asks for the write lock with a 200 ms timeout; `the_metrics_query_handler_releases_the_store_before_it_queries` does the same through the HTTP router. Before the change both timed out, because the guard was still held while the query sat at the gate.
+
 Dropping the labels was worse. Node A reports 95% CPU; a second later node B reports 10%. Keep one reading per name and B's healthy number hides A's problem. So an alert is keyed on the rule *and* the series:
 
 ```rust
