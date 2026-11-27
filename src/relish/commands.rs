@@ -1569,6 +1569,7 @@ pub async fn join(
         .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
     // The node takes Raft replication only from this council, or from
     // voters it vouches for, until it has one of its own (#2397).
+    // BLOCKING-OK: relish CLI, one small file written once, nothing else on its runtime
     crate::council::admission::ExpectedCouncil::save(&dir, &enrolment.council)
         .map_err(|e| RelishError::JoinFailed(format!("failed to save the council: {e}")))?;
 

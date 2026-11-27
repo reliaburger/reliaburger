@@ -440,6 +440,7 @@ pub async fn start(
     // the node's own identity, to ask about a leader it has never heard of.
     // While it has no council of its own it expects the one `relish join`
     // saved beside its identity (#2397).
+    // BLOCKING-OK: one small file read once at startup, before any task runs on this worker
     let expected_council = match &params.identity {
         Some(identity) => crate::council::admission::ExpectedCouncil::load(identity.directory())
             .unwrap_or_else(|error| {
