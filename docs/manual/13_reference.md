@@ -74,7 +74,7 @@ Changing it:
 | `join-token revoke` | the `node_id` and how many tokens were `revoked` |
 | `identity rotate-signing-key` | the new `key_id`, the `retiring_key_id` and when it stops verifying, `retire_after` |
 | `ca rotate` | the `role`, the `stage` (`begun`, `finalised`) and the council's `message` |
-| `upgrade start` | `scope`, `target_version`, `upgrade_id`, and `already_running` with its `detail` |
+| `upgrade start` | `scope`, `target_version`, `upgrade_id`, `already_running` with its `detail`, and `left_out`: the down members it didn't include, each `node_id` and gossip `state` |
 | `upgrade rollback`, `resume`, `abort` | the `change`, and the version or upgrade it was about |
 | `council recover`, `council re-enrol` | what was restored or removed, and the epochs |
 | `decommission-node` | the retirement record |

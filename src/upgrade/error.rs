@@ -30,6 +30,29 @@ pub enum UpgradeError {
         expected: crate::compatibility::Compatibility,
     },
 
+    /// The candidate says it is another version than the one it was
+    /// labelled with (#2403). The signatures cover the bytes, not the label.
+    #[error(
+        "the binary labelled {labelled} says it is {actual}; refusing to install it as {labelled}"
+    )]
+    VersionMismatch {
+        /// The version the directive names.
+        labelled: crate::upgrade::version::BinaryVersion,
+        /// The version the binary reports.
+        actual: crate::upgrade::version::BinaryVersion,
+    },
+
+    /// The candidate doesn't say which version it is, so it predates 0.3.4
+    /// and can only be a downgrade (#2403).
+    #[error(
+        "the binary labelled {labelled} does not say which version it is, so it is older than \
+         0.3.4; installing it is a downgrade and needs --allow-downgrade"
+    )]
+    VersionUnreported {
+        /// The version the directive names.
+        labelled: crate::upgrade::version::BinaryVersion,
+    },
+
     /// The input could not be parsed as a semantic version.
     #[error("invalid version {input:?}: {reason}")]
     InvalidVersion { input: String, reason: String },

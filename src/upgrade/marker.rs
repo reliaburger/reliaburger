@@ -231,6 +231,17 @@ pub fn decide_startup(
             StartupDecision::RevertAndExecPrevious { marker }
         }
 
+        // The swap happened but a version the marker doesn't mention is
+        // running: the bytes weren't what their label said (#2403).
+        // Something unexpected runs, so put the previous version back. If
+        // that one isn't what the marker says either, the arm below
+        // archives the marker rather than loop.
+        MarkerPhase::Executed | MarkerPhase::Verifying => {
+            let mut marker = marker;
+            marker.phase = MarkerPhase::RevertPending;
+            StartupDecision::RevertAndExecPrevious { marker }
+        }
+
         // Running a version the marker doesn't mention at all.
         _ => StartupDecision::ArchiveStaleMarker {
             reason: format!(
@@ -358,9 +369,29 @@ mod tests {
         ));
     }
 
+    /// #2403: after the swap, a binary that is neither side of the upgrade
+    /// is not "a stale marker": the swap happened and something unexpected
+    /// runs. Revert, as a crash loop would.
     #[test]
-    fn version_matching_neither_side_is_archived_stale() {
-        let decision = decide_startup(Some(marker(MarkerPhase::Executed, 0)), &v("0.3.0"), MAX);
+    fn a_swapped_in_binary_of_an_unexpected_version_reverts() {
+        for phase in [MarkerPhase::Executed, MarkerPhase::Verifying] {
+            let decision = decide_startup(Some(marker(phase, 0)), &v("0.0.9"), MAX);
+            let StartupDecision::RevertAndExecPrevious { marker } = decision else {
+                panic!("phase {phase:?} gave {decision:?}");
+            };
+            assert_eq!(marker.phase, MarkerPhase::RevertPending);
+        }
+    }
+
+    #[test]
+    fn a_revert_that_lands_on_an_unexpected_version_is_archived_not_repeated() {
+        // The previous binary isn't what the marker says either: reverting
+        // again would loop, so the marker is archived and the node boots.
+        let decision = decide_startup(
+            Some(marker(MarkerPhase::RevertPending, 3)),
+            &v("0.0.9"),
+            MAX,
+        );
         assert!(matches!(
             decision,
             StartupDecision::ArchiveStaleMarker { .. }
