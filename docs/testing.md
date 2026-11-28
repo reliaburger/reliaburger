@@ -1376,7 +1376,7 @@ with `limactl stop --force`, waits 5–60 s and powers it back on with
 | I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate; the writer started again after the cut, and every start since then resumed at or past the last `ACK` read before the cut; a start between the cuts resumed at or past the previous cut's `ACK` |
 | I2 | Redis counter | Never goes backwards; the client started again after the cut, and every start since then found it at or past the last `INCR` read before the cut; a start between the cuts found it at or past the previous cut's `INCR` |
 | I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
-| I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
+| I6 | Recovery in time | Bun answered an API read within 120 s of the power-on that booted, and every workload ran within 300 s |
 | I7 | Desired = running | Each workload runs exactly once |
 
 I1 and I2 check where each workload *resumed*, not just what the file or
@@ -1388,7 +1388,11 @@ start since the previous check counts, not just the latest: a second start
 during the settle that resumed higher mustn't hide the cut's own start losing
 writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
 log is unreadable, holds none, or went below the last one read), it doesn't
-make the cut: I1 and I2 would hold whatever happened.
+make the cut: I1 and I2 would hold whatever happened. If it can't read the
+writer's file after a cut (Bun never answered), I1 is undecided
+(`"pass": null`), not a violation: the cut's line lists it under
+`undecided`, and `summary.json` lists such cuts and leaves them out of the
+bound (#2542).
 
 Two timings matter here. Just before each power-off the harness records how
 many starts each record holds, so a start between two cuts (in run 8
@@ -1409,7 +1413,8 @@ coming up with its vsock SSH forwarder spinning on `accept` (about 1 boot in
 up). The harness spots the second in the start log within about 10 s, or by
 the start timing out. That guest had booted, so its forced stop is a second
 power cut: the line records it as an extra power-off, the summary counts
-them, and the invariants after it cover both. A spinning forwarder writes
+them, and the invariants after it cover both. I6 is timed from the second
+start, the one that booted (#2542). A spinning forwarder writes
 gigabytes of log a minute, so the power-on log and Lima's `ha.stderr.log`
 keep only their first and last 25 MB.
 
