@@ -1,0 +1,25 @@
+samples 39920, Bun 4936
+ 37.08%                   idle (no runnable work)
+  0.01%    0.04% of Bun    Bun: GitOps loop
+  0.07%    0.55% of Bun    Bun: task ledger (group commit, fsync)
+ 10.59%   85.62% of Bun    Bun: task-array leader tick and node sync
+  0.00%    0.02% of Bun    Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)
+  0.05%    0.36% of Bun    Bun: Raft core and log
+  0.04%    0.28% of Bun    Bun: agent loop and supervisor
+  0.04%    0.32% of Bun    Bun: API server
+  0.03%    0.24% of Bun    Bun: metrics (Mayo)
+  0.00%    0.02% of Bun    Bun: gossip (Mustard)
+  0.00%    0.02% of Bun    Bun: service discovery (Onion)
+  0.10%    0.79% of Bun    Bun: containers (Grill)
+  0.03%    0.20% of Bun    Bun: other Reliaburger code
+  1.43%   11.53% of Bun    Bun: async runtime (scheduler, timers, parking)
+  3.69%                   helper/child: clone3 (process creation)
+  7.28%                   helper/child: execve
+  8.74%                   helper/child: exit and address-space teardown
+  7.44%                   helper/child: page faults
+ 10.61%                   helper: wait, poll, pipes and socket syscalls
+  2.18%                   helper: user space and other kernel
+  8.06%                   busybox task: user space and other kernel
+  0.02%                   relish (raw scenario spawner and bench client)
+  2.52%                   other processes and kernel threads
+other by command: ksoftirqd/ 1.24%, exe 0.49%, migration/ 0.39%, kworker/0:3-eve 0.07%, kworker/3:3-eve 0.06%, kworker/2:1-eve 0.06%, perf 0.05%, kworker/1:0-eve 0.05%, lima-guestagent 0.04%, rcu_preempt 0.03%, jbd2/vda1 0.03%, containerd 0.02%

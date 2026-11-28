@@ -67,6 +67,13 @@ cluster rolls onto it in place with `relish upgrade start v0.3.3`. The appliance
 with 0.3.3's Bun, Buildah and the console went out the same afternoon as
 `os-2026.48.0`
 ([run](https://github.com/reliaburger/reliaburger/actions/runs/46035511965)).
+The release profile, the 0.3 series' first, ran on the published binaries the
+next night against 0.2.8: in the same VM, 0.3.3 ran host jobs at 0.2.8's rate
+and shared containers 0.7% faster, with the same start lag and an idle Bun at
+1.8% of a core, so the homepage recordings' gap to 0.2.8
+([#2209](https://github.com/reliaburger/reliaburger/issues/2209)) isn't
+Reliaburger's
+([record](qualification/2026-11-28-v0.3.3-profile/README.md)).
 
 ## 0.3.2: Wyse lab fixes
 
