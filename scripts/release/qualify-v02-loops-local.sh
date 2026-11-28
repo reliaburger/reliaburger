@@ -43,7 +43,9 @@
 #                     builds included
 #   --count N         iterations for each counted lane (default 200)
 #   --vm NAME         a running Lima VM for the arm64 Linux lanes (default
-#                     reliaburger-test); repeat it to spread them over more
+#                     reliaburger-test); repeat it to spread them over more.
+#                     With --parallel it must not forward the test ports to
+#                     the Mac: lima_forwards.py prints the rule to add
 #   --manifest FILE   the lanes the record must hold (default
 #                     scripts/release/v02-loop-lanes-local.json)
 #   --evidence DIR    evidence directory (default
@@ -377,6 +379,13 @@ guest_base() {
 for vm in "${vms[@]}"; do
     status=$(limactl list --format '{{.Status}}' "$vm" 2> /dev/null || true)
     [ "$status" = Running ] || fail "Lima VM $vm isn't running (status: ${status:-missing}); start it with limactl start $vm"
+    # Side by side, the VM's lanes and the Mac's lease ports from the same
+    # ranges, and Lima forwards every guest loopback port onto the Mac's
+    # unless told not to: a guest test's port then holds a Mac node's.
+    if [ "$parallel" = true ]; then
+        limactl list --json "$vm" | python3 "$here/lima_forwards.py" check \
+            || fail "$vm would collide with the macOS lanes on the test ports; add the rule above, or run without --parallel"
+    fi
     facts=$(gsh "$vm" bash -c '
         [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
         printf "home=%s\n" "$HOME"

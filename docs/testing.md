@@ -1793,6 +1793,39 @@ leased range. The evidence (each lane's `loop.log`, `junit.xml`,
 `schedule.log` and `v02-loops-summary.md`) goes to
 `/var/tmp/reliaburger-v02-loops-SHORTSHA`, or `--evidence DIR`.
 
+**The VM must keep the test ports to itself.** Both sides lease test ports
+from the same ranges (`TEST_PORTS`, 27000–29999, and `TEST_WORKLOAD_PORTS`,
+10000–14999, in [`bun_process.rs`](../tests/support/bun_process.rs)). Each
+side keeps its leases in its own `/tmp`, so neither sees the other's. Lima's
+built-in fallback rule forwards every port a guest process binds on loopback
+to the same port on the Mac's `127.0.0.1`, TCP and UDP. So when a guest test
+binds a port, Lima's host agent holds that port on the Mac, without a lease,
+until the guest lets go. In the 0.3.4 run on 28 November, that happened to a
+Mac node's Raft port in one upgrade and to another node's API port in a
+second. Each new binary failed its three boots with "Address already in use"
+and reverted, and the upgrade paused. The host agent's log,
+`~/.lima/VM/ha.stderr.log`, shows each window as "Forwarding TCP from
+127.0.0.1:PORT" and "Port forwarding closed". With `--parallel`, the script
+refuses a VM that forwards any of these ports
+([`lima_forwards.py`](../scripts/release/lima_forwards.py)) and prints the
+rule to add to its `lima.yaml`:
+
+```yaml
+portForwards:
+- guestIP: "127.0.0.1"
+  guestPortRange: [10000, 29999]
+  proto: any
+  ignore: true
+```
+
+Don't write `guestIP: "0.0.0.0"` for this. Lima 2.2 stores that rule with
+`guestIPMustBeZero: true`, so it covers only processes that bind every
+address, and the tests' `127.0.0.1` binds still get forwarded. The rule also covers 15000–26999, the in-process suites' fixed ports, which
+the two hosts would collide on in the same way. Restart the VM after the
+edit: `limactl stop VM`, then `limactl start VM`. Nothing reaches
+`reliaburger-test` through those ports. The power-cut runs use VMs of their
+own, under their own `LIMA_HOME`.
+
 ### Latency SLOs
 
 Everything above gates internal health. A user doesn't feel an agent-loop
