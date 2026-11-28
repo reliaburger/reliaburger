@@ -665,3 +665,13 @@ fails and is retried on the next sweep. Objects land under
 the snapshot, its volume, node and creation time. Two nodes running the same
 app never overwrite each other's archives, and neither does reusing a
 snapshot name.
+
+A snapshot counts as exported only once its archive and manifest are stored
+and its receipt is written, so a power cut or a restart mid-upload just means
+the next sweep exports it again. If the destination already holds something
+at the archive's key that isn't that archive (cut short, or zeroed by a
+`file://` destination that lost data), the sweep replaces it and logs
+`replacing <key>`. On a `file://` destination it hashes an existing archive
+before trusting it; S3 and GCS store objects whole, so there it checks the
+size. A multipart upload cut off by a power cut leaves its parts on S3 until
+a lifecycle rule aborts incomplete uploads, so give the bucket one.

@@ -513,7 +513,7 @@ The review also asked an open question: does a restored volume keep its quota? I
 
 Export had subtler problems. The archive key was `<namespace>/<app>/<volume>/<name>.tar.gz`. Run two replicas of an app on two nodes, point both at the same bucket, and have their sweeps snapshot in the same second: same key, different bytes, and whichever finished second silently replaced the other. Reusing a custom name did the same thing on one node.
 
-The key now carries the node's name and the volume, and the archive itself is named by the SHA-256 of its bytes: `<ns>/<app>/<node>/<volume>/archives/sha256-<digest>.tar.gz`. Content addressing makes collisions boring. If the key already exists with the same size, it's the same archive and the upload is skipped; a different size is a refusal, never an overwrite. The human-facing details (snapshot name, creation time, node, volume) go in a JSON manifest beside it, keyed by creation time, name and digest. The test is the review's: two independent volume directories, same app, same volume, same timestamp, one in-memory store. Both archives must come back with their own bytes.
+The key now carries the node's name and the volume, and the archive itself is named by the SHA-256 of its bytes: `<ns>/<app>/<node>/<volume>/archives/sha256-<digest>.tar.gz`. Content addressing makes collisions boring. If the key already exists with the same size, it's the same archive and the upload is skipped. (A different size was a refusal at first, never an overwrite. The power-cut work below shows why that was wrong.) The human-facing details (snapshot name, creation time, node, volume) go in a JSON manifest beside it, keyed by creation time, name and digest. The test is the review's: two independent volume directories, same app, same volume, same timestamp, one in-memory store. Both archives must come back with their own bytes.
 
 Then the receipt. Remember the `uploaded: bool` that served three masters? It served them for exactly one destination. Change `upload_url` from A to B and every snapshot already sent to A looked uploaded, so B never got them. Worse, the sweep pruned *before* it uploaded, whatever the flag said, so an object-store outage longer than the retention window deleted snapshots that had never left the node. One bit wasn't enough state after all.
 
@@ -553,7 +553,29 @@ pub fn plan_interrupted_snapshot(
 
 Matching on a tuple lets one `match` cover every combination, and `_` says "any value here". The compiler checks the arms are exhaustive, so a missing case is a build error rather than a forgotten branch. A subvolume with an abandoned intent and no metadata was never acknowledged to anyone, so deleting it loses nothing. A subvolume with neither is a different story: it might predate intents, or an operator might have made it by hand, so the sweep reports it every time instead of deleting it.
 
-`IntentOwner::ThisProcess` is there because the sweep and `relish snapshot create` can run at the same time in one Bun. Without it, a sweep could find a create half-way through (intent and subvolume, no metadata yet) and delete it from under itself. So the intent records a random token drawn once per process (a `OnceLock<String>`, which initialises on first use and is read-only after that), and the sweep leaves this process's intents alone. A create that fails rewrites its intent with no owner and settles it on the spot, so a failure in a long-running Bun doesn't wait for a restart. The unit tests run the whole decision on plain directories, and `btrfs_interrupted_snapshot_is_cleaned_up_on_restart` repeats it on a loop-mounted Btrfs in `make test-linux`. The power cut itself is still #287's fixture to build.
+`IntentOwner::ThisProcess` is there because the sweep and `relish snapshot create` can run at the same time in one Bun. Without it, a sweep could find a create half-way through (intent and subvolume, no metadata yet) and delete it from under itself. So the intent records a random token drawn once per process (a `OnceLock<String>`, which initialises on first use and is read-only after that), and the sweep leaves this process's intents alone. A create that fails rewrites its intent with no owner and settles it on the spot, so a failure in a long-running Bun doesn't wait for a restart. The unit tests run the whole decision on plain directories, and `btrfs_interrupted_snapshot_is_cleaned_up_on_restart` repeats it on a loop-mounted Btrfs in `make test-linux`. The power cut itself came later, as #287's fixture (below).
+
+### A backup that isn't one
+
+The fixture arrived in 0.3.2: `qualify-storage-power-cut.sh --fixture volumes` loop-mounts a Btrfs volume in a throwaway VM, keeps a writer filling it and Bun's real sweep snapshotting, exporting and pruning it, and pulls the VM's power at a random moment. It passed 20 cuts of 20. Twice the cut landed between an archive landing and its receipt, and the next sweep did what it should: found the archive at its key, skipped the upload and wrote the receipt.
+
+Read that skip again, though. "Found the archive" meant "found an object of the right size". On S3 or GCS that's enough, because they store an object whole or not at all. A `file://` destination is a filesystem, and filesystems lose data in a particular way after a power cut: the file's size reaches the disk, and its blocks don't. You get a file of exactly the right length, full of zeros. Our `file://` store syncs every object before it returns, so our own writes can't end up like that (Chapter 15). But the destination might be a network mount that ignores the flush, or a USB disk with a lying write cache. Then the next sweep finds a zeroed archive of the right size, calls it uploaded and writes a receipt. Once the snapshot ages past retention, pruning trusts the receipt and deletes it. The only copy of the data is now a file of zeros, and everything says it's backed up.
+
+The other case was worse in a quieter way. An archive cut short at its key has the wrong size, and the wrong size was a "collision" that the sweep refused. Every sweep after that refused it again. The snapshot never shipped, so pruning held it past retention, so it held the disk too, for ever.
+
+Both rules came from forgetting what the key is. It's the SHA-256 of the archive, under this node's own prefix. Nothing else can legitimately live there. So anything at the key that isn't these exact bytes is damage, and the right response to damage is to replace it. The check is now a small function returning one of three answers:
+
+```rust
+enum ExistingArchive {
+    Absent,
+    Whole,
+    Damaged(String),
+}
+```
+
+`Absent` uploads, `Whole` skips, and `Damaged` logs why and uploads over it. A wrong size is `Damaged` on any store. A right size is `Whole` on S3 and GCS, and on a `file://` destination the sweep streams the object back and hashes it first. Why not hash everywhere? Because an idle volume produces the same archive every sweep. On S3, hashing would download every idle volume's archive every day, and pay for it. On a local disk, reading the archive back costs about what spooling it did a moment earlier.
+
+The tests reproduce each case without a power cut. One zero-fills a `file://` archive at its own size and forgets the receipt, which is the state a cut leaves. Before the fix, the sweep wrote a receipt for the zeros. One truncates an archive in an in-memory store; before the fix, the sweep refused it. A third keeps a whole archive and checks, by inode, that the sweep receipts it without uploading it again. And `an_interrupted_s3_upload_restarts_cleanly`, which `make test-s3` runs against a throwaway SeaweedFS server, cuts a real multipart upload off by its deadline. It checks that no object and no receipt are left behind, that the next sweep ships the archive whole, and that a half object left at the key is replaced rather than refused.
 
 ## A thousand jobs, fifty envelopes
 
