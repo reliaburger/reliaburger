@@ -4158,13 +4158,17 @@ rayon today, but the next one to bring it in won't be Mayo's.
 to four days apart, the profile wants the quiet host for an hour or more, and
 after 0.2.4 only 0.2.8 got one. Then 0.3.1's job demo ran 22 to 28% slower
 than 0.2.8's (#2209), and there was no profile from 0.3.0, 0.3.1 or 0.3.2 to
-say where the time went. A rule nobody keeps is worse than a smaller one,
+say where the time went. When [0.3.3's](../qualification/2026-11-28-v0.3.3-profile/README.md)
+came, it ran 0.3.3 and 0.2.8 side by side on one guest and found them equally
+fast, which points at the quickstart guest's move to Ubuntu 26.04, not at
+Reliaburger. A rule nobody keeps is worse than a smaller one,
 because it reads as if the work were done. So the rule is now every minor
 release, plus any patch release that touches the job path or follows a
 throughput regression, and a test holds it: it finds the newest `X.Y.0` in
 the release log and fails until `docs/qualification/` has a profile record
-from that series (#2488). It's ignored until the 0.3 series has its record,
-since that takes the quiet host, not a code change; the record turns it on.
+from that series (#2488). It stayed ignored until the 0.3 series had its
+record, since that took the quiet host, not a code change; the record turned
+it on.
 
 ### What the measurements do and don't show
 
