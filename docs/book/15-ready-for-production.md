@@ -1770,6 +1770,80 @@ copy on `main`, the one GitHub schedules, was still the old weekly run of `main`
 go to `main` in their own pull request, and a test holds each of them to the same rule: nightly,
 never on pull requests, and on the newest train.
 
+### What the queue waits for
+
+By the 0.3.4 train, the question had moved. Batches reach the train through integration
+pull requests, which run only the cheap checks, so the run an author really waits for is the
+merge queue's: every job but portable macOS, on the merged result. Over the 29 green code
+groups from 25 to 27 November it took a median of 36.9 minutes, with no queueing at all. The
+fast-train settings had fixed the wait for a runner. What was left was the run itself.
+
+Which job sets it? Not the one you'd guess. `benchmarks` finished last in 18 of the 29
+groups, at a median of 33.2 minutes, and its numbers gate nothing: Criterion's output is
+uploaded and nobody compares it. Its log says where the time went. `cargo bench --bench
+gossip` printed `Finished` after 20 minutes 2 seconds, with every dependency restored from
+the cache; the benchmarks themselves then ran for about six minutes, and `bench-large` for
+seven. Twenty minutes to compile one crate is the release profile doing what we asked. Back
+in [The Full Package](09-the-full-package.md) we set `codegen-units = 1` to halve the
+binaries. A Cargo *profile* is a named set of compiler settings (`dev`, `release`, `test`
+and `bench` are built in), and `bench` inherits `release`'s, so every benchmark build hands
+LLVM the whole crate as one unit, on one of the runner's four cores.
+
+Smaller binaries don't matter to a merge group. Code that builds and runs does. So on pull
+requests and merge groups the job runs
+
+```sh
+make bench CARGO="cargo --config profile.bench.package.reliaburger.codegen-units=16"
+```
+
+`--config` overrides one setting for one invocation, as if it were in `.cargo/config.toml`,
+and `profile.bench.package.reliaburger` narrows it to our own crate. That narrowing matters
+more than it looks. Cargo fingerprints every crate with its profile settings, so the obvious
+`CARGO_PROFILE_BENCH_CODEGEN_UNITS=16` would have rebuilt every dependency,
+which the cache had restored with one unit, and set for the whole job the variable would
+also have changed `rust-cache`'s key, since the action hashes every `CARGO_` variable it
+can see. The package override changes neither. On the Mac Studio, with four build jobs to
+stand in for the runner's four cores, rebuilding the crate for `cargo bench --bench gossip`
+took 10 minutes 25 seconds at one unit and 4 minutes 22 at sixteen, and Cargo recompiled
+nothing but `reliaburger`. Scaled to the runner's 20 minutes, that's about 8, which takes
+the job from a median of 33.2 minutes to about 21.5, well inside the others. The nightly and pushes still build the release
+profile, so the numbers kept from them stay comparable with the old ones, and the task-array
+job, whose gate compares against `main`'s baseline, doesn't change at all.
+
+With the benchmarks out of the way, the two privileged Linux jobs set the pace, and one of
+them had a bug of its own. The Ubuntu 26.04 job's cache step said "No cache found" in every
+run, the nightly on `main` included, and the nightly's last lines said why:
+
+```text
+/usr/bin/tar: ../../../.cargo/registry/src/.../fnv-1.0.7/lib.rs: Cannot open: Permission denied
+##[warning]Failed to save: "/usr/bin/tar" failed with error: The process '/usr/bin/tar' failed with exit code 2
+```
+
+That job runs `make test-linux` as root, so the crates Cargo unpacked under `$CARGO_HOME`
+were root's, and `rust-cache` saves as the runner, from a post step after the job's last
+one. A warning, not a failure, so nothing went red; the job just built every dependency
+cold, about four minutes of each run, for as long as it had existed. The fix is a last step
+that runs whatever happened and hands `$CARGO_HOME` and `target/` back to the runner, and
+the 24.04 job, which builds as root too, got the same step before it could hit the same
+thing. A test checks that every job using `scripts/ci/as-root` and `rust-cache` ends with
+it. Only `main` saves that cache, so the four minutes come back once this reaches `main`.
+
+Replaying the 29 groups with those two changes moves the median from 36.6 minutes to 33.4,
+and to 32.0 once `main` saves the 26.04 cache. The next floor is plain to see: the 24.04
+privileged job at 30.4 minutes and the cluster suites, which end at 29.7. Both are real work,
+the rootless proof, the OCI interruptions and the provisioned tests in one, and twenty
+minutes of multi-node clusters in the other, and splitting either costs another runner and a
+second cold build for a minute or two. That's where we stopped.
+
+The light path didn't move. Portable Linux sets every light pull request, a median of 22.4
+minutes over the 13 green ones since 24 November, and its resource log splits that into
+about 1.5 of setup, 4 building the instrumented lib tests, 3.5 building the rest, 6.4
+running the suite at eight threads, and 4.4 writing the coverage report. The suite ran at
+a load of 5 to 10 on four cores, so more threads won't help. The report merges about 70 GB
+of `.profraw` files, one per test process. Fewer, bigger profiles would shrink that, but the
+coverage owner pins the recipe, and changing it is a change to the evidence contract, not a
+CI tweak.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

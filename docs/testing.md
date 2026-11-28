@@ -374,7 +374,17 @@ merge train without the `full-ci` label runs neither: there both wait for the me
 gate nothing: they're uploaded and no job compares them. Gossip's are a
 simulated network and vary with the runner; the scheduler and policy
 benchmarks are pure CPU work on in-memory data, the kind `bench_baseline.py`
-could compare, but whether to is a maintainer decision. The task-array job compares each benchmark's mean with the
+could compare, but whether to is a maintainer decision. Because nothing
+compares them, a pull request or a merge group builds `make bench` with 16
+codegen units for the workspace crate (`cargo --config
+profile.bench.package.reliaburger.codegen-units=16`, through the job's
+`BENCH_CARGO`). The release profile's single unit made that crate a 20-minute
+compile on one core, and the job was the merge queue's last in 18 of 29 groups
+from 25 to 27 November 2026
+([#1723](https://github.com/reliaburger/reliaburger/issues/1723)). The
+dependencies keep their settings, so the cache the task-array job shares still
+matches, and the nightly and pushes build the release profile, so the numbers
+kept from them compare with earlier ones. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
 differ by tens of per cent from run to run, and on 12 October 2026 one was
@@ -586,6 +596,14 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 `linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
+
+Both jobs run cargo as root (`scripts/ci/as-root`), so what that writes under
+`$CARGO_HOME` and `target/` is root's, while `Swatinem/rust-cache` saves as the
+runner after the last step. The 26.04 job's save failed with "Permission
+denied" on every nightly (run 45997532768), so it never found a cache and built
+every dependency cold, about four minutes of each run (#1723). Each job's last
+step, whatever happened, hands both directories back to the runner
+(`RootBuildCacheTests` in `test_ci_workflow.py`).
 
 Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
 `cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
