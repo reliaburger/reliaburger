@@ -17,7 +17,7 @@ use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
     GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, InMemoryTransport,
     MAX_PIGGYBACK_UPDATES, MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, MustardNode,
-    NodeState,
+    MustardTransport, NodeState,
 };
 
 #[path = "../benches/support/gossip.rs"]
@@ -40,13 +40,17 @@ async fn observer_with_members(
     network: &InMemoryNetwork,
     cluster_size: usize,
 ) -> MustardNode<InMemoryTransport> {
+    observer_with_config(network, cluster_size, GossipConfig::default()).await
+}
+
+/// [`observer_with_members`] with its own gossip config.
+async fn observer_with_config(
+    network: &InMemoryNetwork,
+    cluster_size: usize,
+    config: GossipConfig,
+) -> MustardNode<InMemoryTransport> {
     let transport = network.register(address(0)).await;
-    let mut observer = MustardNode::new(
-        NodeId::new("n0"),
-        address(0),
-        GossipConfig::default(),
-        transport,
-    );
+    let mut observer = MustardNode::new(NodeId::new("n0"), address(0), config, transport);
 
     let updates: Vec<_> = (1..cluster_size)
         .map(|index| MembershipUpdate {
@@ -110,6 +114,96 @@ async fn one_node_handles_10k_member_protocol_state() {
     );
 }
 
+/// #2442: a node joining a 10,000-member cluster used to need on the
+/// order of 10,000 / 64 exchanges at the 10 s anti-entropy interval. A
+/// request that says it knows almost nobody is answered with pages of the
+/// whole table, so it takes ceil(10,000 / 512) exchanges, one per protocol
+/// period, to see every member.
+#[tokio::test]
+async fn a_joiner_sees_a_10k_member_cluster_in_twenty_exchanges() {
+    let cluster_size = 10_000;
+    let network = InMemoryNetwork::new();
+    let config = GossipConfig {
+        protocol_interval: std::time::Duration::from_millis(2),
+        ..GossipConfig::default()
+    };
+    let joiner = network.register(address(cluster_size + 1)).await;
+    let mut observer = observer_with_config(&network, cluster_size, config).await;
+    let mut seen = HashSet::with_capacity(cluster_size);
+    let mut exchanges = 0;
+    while seen.len() < cluster_size {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        observer
+            .handle_message(
+                address(cluster_size + 1),
+                GossipMessage::new(
+                    NodeId::new("joiner"),
+                    1,
+                    GossipPayload::Sync {
+                        entries: vec![],
+                        floors: vec![],
+                        wants_reply: true,
+                        known_members: seen.len() as u32,
+                    },
+                ),
+            )
+            .await;
+        while let Some((_, reply)) = joiner.try_recv() {
+            seen.extend(
+                reply
+                    .payload
+                    .updates()
+                    .iter()
+                    .map(|update| update.node_id.clone()),
+            );
+        }
+        exchanges += 1;
+        assert!(
+            exchanges <= 20,
+            "{exchanges} exchanges taught the joiner {} of {cluster_size} members",
+            seen.len()
+        );
+    }
+    eprintln!("a joiner saw all {cluster_size} members in {exchanges} exchanges");
+}
+
+/// `run` publishes the membership after every datagram (#2439). With
+/// 10,000 members, datagrams that change nothing must not rebuild the
+/// snapshot: nothing is sent on either watch.
+#[tokio::test]
+async fn datagrams_that_change_nothing_publish_nothing_at_10k_members() {
+    let network = InMemoryNetwork::new();
+    let mut observer = observer_with_members(&network, 10_000).await;
+    let (members, mut members_rx) = tokio::sync::watch::channel(Vec::new());
+    observer.set_membership_watch(members);
+    let (roster, mut roster_rx) = tokio::sync::watch::channel(Vec::new());
+    observer.set_roster_watch(roster);
+    observer.publish_membership();
+    assert_eq!(members_rx.borrow_and_update().len(), 10_000);
+    roster_rx.mark_unchanged();
+
+    let started = Instant::now();
+    for _ in 0..1_000 {
+        observer
+            .handle_message(
+                address(1),
+                GossipMessage::new(
+                    NodeId::new("n1"),
+                    1,
+                    GossipPayload::Ping { updates: vec![] },
+                ),
+            )
+            .await;
+        observer.publish_membership();
+    }
+    eprintln!(
+        "1,000 datagrams with the publish step at 10,000 members took {:.1?}",
+        started.elapsed()
+    );
+    assert!(!members_rx.has_changed().unwrap());
+    assert!(!roster_rx.has_changed().unwrap());
+}
+
 /// Anti-entropy must not undo the per-node bound: however large the table,
 /// one push-pull reply is at most `MAX_SYNC_DATAGRAMS` datagrams of at most
 /// `MAX_PIGGYBACK_UPDATES` entries, and successive exchanges rotate through
@@ -137,6 +231,8 @@ async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
                         entries: vec![],
                         floors: vec![],
                         wants_reply: true,
+                        // A member in steady state, not a joiner.
+                        known_members: cluster_size as u32,
                     },
                 ),
             )
@@ -165,4 +261,135 @@ async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
         );
     }
     eprintln!("{exchanges} bounded push-pull replies swept all {cluster_size} members");
+}
+
+/// How many protocol rounds a healthy node's refutation takes to reach
+/// every live member while each of them still has a correlated failure's
+/// `Dead` rumours to send (#2441).
+///
+/// `cluster_size` nodes all know each other; `dead` of them died together,
+/// so every survivor holds them `Dead` with a full broadcast budget queued.
+/// Node `h` was suspected at incarnation 1 and refutes. Each round, every
+/// survivor sends one PING to a peer chosen from `seed`, and every PING is
+/// answered with an ACK, each carrying what the sender's queue selects.
+async fn rounds_for_a_refutation_behind_a_failure_backlog(
+    cluster_size: usize,
+    dead: usize,
+    seed: u64,
+) -> Option<usize> {
+    let network = InMemoryNetwork::new();
+    let names: Vec<NodeId> = (0..cluster_size)
+        .map(|index| NodeId::new(format!("n{index}")))
+        .collect();
+    let survivors = cluster_size - dead;
+    let mut nodes = Vec::with_capacity(survivors);
+    for (index, name) in names.iter().enumerate().take(survivors) {
+        let transport = network.register(address(index)).await;
+        let mut node = MustardNode::new(
+            name.clone(),
+            address(index),
+            GossipConfig::default(),
+            transport,
+        );
+        let now = Instant::now();
+        for (peer, peer_name) in names.iter().enumerate() {
+            if peer != index {
+                node.membership.add_node(
+                    peer_name.clone(),
+                    address(peer),
+                    1,
+                    Default::default(),
+                    now,
+                );
+            }
+        }
+        for (peer, peer_name) in names.iter().enumerate().skip(survivors) {
+            node.membership.declare_dead(peer_name);
+            node.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: peer_name.clone(),
+                    address: address(peer),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                cluster_size,
+            );
+        }
+        nodes.push(node);
+    }
+    // Node 0 is `h`. Everyone holds it Suspect; it hears the claim and
+    // refutes to incarnation 2.
+    let h = names[0].clone();
+    for node in nodes.iter_mut().skip(1) {
+        node.membership.suspect(&h);
+    }
+    let claim = GossipMessage::new(
+        names[1].clone(),
+        1,
+        GossipPayload::Ping {
+            updates: vec![MembershipUpdate {
+                node_id: h.clone(),
+                address: address(0),
+                state: NodeState::Suspect,
+                incarnation: 1,
+            }],
+        },
+    );
+    nodes[0].handle_message(address(1), claim).await;
+    assert_eq!(nodes[0].incarnation, 2);
+    while nodes[1].transport.try_recv().is_some() {}
+
+    let mut state = seed;
+    for round in 1..=200 {
+        for (index, node) in nodes.iter_mut().enumerate() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut target = (state >> 33) as usize % (survivors - 1);
+            if target >= index {
+                target += 1;
+            }
+            let ping = GossipMessage::new(
+                node.node_id.clone(),
+                node.incarnation,
+                GossipPayload::Ping {
+                    updates: node.dissemination.select_updates(),
+                },
+            );
+            node.transport.send(address(target), &ping).await.unwrap();
+        }
+        // PINGs, then the ACKs they draw.
+        for _ in 0..2 {
+            for node in nodes.iter_mut() {
+                while let Some((from, message)) = node.transport.try_recv() {
+                    node.handle_message(from, message).await;
+                }
+            }
+        }
+        let everyone_heard = nodes.iter().skip(1).all(|node| {
+            node.membership
+                .get(&h)
+                .is_some_and(|member| member.state == NodeState::Alive && member.incarnation == 2)
+        });
+        if everyone_heard {
+            return Some(round);
+        }
+    }
+    None
+}
+
+/// #2441: a refutation relayed by a peer used to wait behind every queued
+/// `Dead` there, so after a correlated failure it reached the cluster only
+/// as fast as the refuting node could ping, while the suspicion timers ran.
+/// It has to beat the 5 s suspicion timeout: ten 500 ms rounds.
+#[tokio::test]
+async fn a_refutation_outruns_a_correlated_failures_backlog() {
+    for seed in [1, 2, 3] {
+        let rounds = rounds_for_a_refutation_behind_a_failure_backlog(300, 30, seed).await;
+        eprintln!("seed {seed}: refutation reached every survivor in {rounds:?} rounds");
+        assert!(
+            rounds.is_some_and(|rounds| rounds <= 10),
+            "seed {seed}: the refutation took {rounds:?} rounds, past the suspicion timeout"
+        );
+    }
 }

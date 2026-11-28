@@ -99,6 +99,7 @@ fn gossip() -> Vec<Seed> {
             expires_in_secs: 3600,
         }],
         wants_reply: true,
+        known_members: 2,
     });
     let stale = message(GossipPayload::Stale {
         held_incarnation: 4,
@@ -117,6 +118,7 @@ fn gossip() -> Vec<Seed> {
             api_address: address(9443),
             reporting_address: address(9444),
         }),
+        leader_age_ms: 0,
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
         disk_pressured: false,
         recovery_epoch: None,
