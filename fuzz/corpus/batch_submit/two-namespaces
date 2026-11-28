@@ -1,0 +1,20 @@
+{
+  "jobs": [
+    {
+      "name": "thumbnails",
+      "namespace": "media",
+      "spec": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    },
+    {
+      "name": "report",
+      "namespace": "finance",
+      "spec": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    }
+  ]
+}

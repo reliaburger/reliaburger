@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    {
+      "name": "migrate",
+      "spec": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    }
+  ]
+}

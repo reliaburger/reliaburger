@@ -1019,7 +1019,10 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
-| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `task_manifest` | `TaskManifestRequest` from JSON and `validate_submission` (`bun::task_array_api`) | `POST /v1/batch/manifest` |
+| `task_manifest_file` | `TaskManifestRequest` from TOML, the JSON relish sends, and the trial registration `--dry-run` runs | a manifest file for `relish batch submit` |
+| `task_array_submit` | `TaskArraySubmitRequest` and `validate_submission` (`bun::task_array_api`) | `relish run --batch`, as `POST /v1/batch/array` |
+| `batch_submit` | `BatchSubmitRequest` and `resolve_job_namespaces` (`bun::batch`) | `relish batch`, as `POST /v1/batch` |
 | `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
 | `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 | `api_bearer` | `sesame::auth::extract_bearer`, `authenticate` and `sesame::oidc::verify_jwt_with_keys` | any client that can reach the API, before it has authenticated |
@@ -1042,7 +1045,9 @@ request matches its route on a segment boundary and that the HTTPS redirect
 names the routed host; the TFTP target that an honest client gets the whole
 file in order whatever options it asked for; the DHCP target that no reply
 hands out an address; and the netboot targets that a client's text reaches the
-operator's terminal escaped.
+operator's terminal escaped. The manifest-file target checks that the API reads
+the same manifest relish parsed from TOML, and that a manifest registered once
+registers again as the same batch when its retry is decoded afresh.
 
 Seeds must be the same bytes every time `make fuzz-corpus-seed` runs, so a
 seed never uses a random key or nonce: the JWT and join CSR seeds are signed
@@ -1069,7 +1074,7 @@ decoder gets the next target
 | 3 | A backend's WebSocket handshake response (`wrapper::websocket::parse_handshake`) | any workload behind an ingress route | none yet |
 | 4 | Join CSRs (`sesame::ca::sign_node_csr`) | a node holding a join token | `join_csr` |
 | 4 | Pushed manifests (`pickle::api`) | a client with a registry token | `oci_manifest_push` |
-| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest` (the rest are serde derives) |
+| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest`, `task_array_submit`, `batch_submit` (the rest are serde derives) |
 | 4 | GitOps webhook body (`lettuce::webhook`) | a sender holding the webhook secret; the HMAC is checked first | none yet |
 | 5 | Raft RPC frames (`council::network`) | a council peer, over mTLS | `raft_rpc_frame` |
 | 5 | Reporting frames (`reporting::transport`) | a node, over mTLS | none yet |
@@ -1077,7 +1082,7 @@ decoder gets the next target
 | 6 | Layer tarballs and whiteouts (`grill::image::unpack_layers`) | the registry an app names, pinned by the manifest's digests | none yet: it writes a filesystem |
 | 6 | Release and OS channel metadata (`upgrade::metadata`, `os::channel`) | the release server, signed | none yet |
 | 7 | Backup files and the state inside (`council::backup`) | an operator | `council_backup`, `council_backup_state` |
-| 7 | App, node, chaos scenario TOML (`config`, `smoker`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario` |
+| 7 | App, node, chaos scenario and task-manifest TOML (`config`, `smoker`, `bun::task_array_api`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario`, `task_manifest_file` |
 | 7 | Join tokens, Kubernetes YAML for `relish import`, the source bundle | an operator, on their own machine | none: nothing remote sends them |
 
 The next targets, in order: the Prometheus text parser, the WebSocket

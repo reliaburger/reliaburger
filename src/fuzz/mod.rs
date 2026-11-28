@@ -111,6 +111,21 @@ pub const TARGETS: &[Target] = &[
         run: council_backup_state,
     },
     Target {
+        name: "task_manifest_file",
+        decoder: "bun::task_array_api::TaskManifestRequest from TOML (relish batch submit)",
+        run: task_manifest_file,
+    },
+    Target {
+        name: "task_array_submit",
+        decoder: "bun::task_array_api::TaskArraySubmitRequest (POST /v1/batch/array)",
+        run: task_array_submit,
+    },
+    Target {
+        name: "batch_submit",
+        decoder: "bun::batch::BatchSubmitRequest (POST /v1/batch)",
+        run: batch_submit,
+    },
+    Target {
         name: "api_bearer",
         decoder: "sesame::auth::authenticate and sesame::oidc::verify_jwt_with_keys",
         run: api_bearer,
@@ -506,6 +521,135 @@ pub fn council_backup_state(data: &[u8]) -> Outcome {
     let key = BackupKey::for_state(&state, std::time::UNIX_EPOCH);
     let parsed = BackupKey::parse(&key.object_name()).expect("a backup's own name parses");
     assert_eq!(parsed, key, "a backup name didn't parse back to its key");
+    Outcome::Accepted
+}
+
+/// A task-array manifest file, as `relish batch submit` reads it (#1414).
+///
+/// `task_manifest` fuzzes the JSON the API reads; this is the TOML relish
+/// reads before it sends that JSON. An accepted file must reach the API as
+/// the same manifest, and the trial registration `--dry-run` runs must not
+/// panic. A manifest it registers must register again under the same
+/// request id as the same batch, decoded afresh the way a retried request
+/// is, since `relish batch submit` retries under one idempotency key.
+pub fn task_manifest_file(data: &[u8]) -> Outcome {
+    use crate::bun::task_array_api::{
+        TaskArraySubmitRequest, TaskManifestRequest, validate_submission,
+    };
+    use crate::meat::task_array_store::{TaskArrayApplied, TaskArrayWrite, TaskArrays};
+
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Outcome::Refused;
+    };
+    let Ok(manifest) = toml::from_str::<TaskManifestRequest>(text) else {
+        return Outcome::Refused;
+    };
+    let sent = serde_json::to_vec(&manifest).expect("a parsed manifest encodes for the API");
+    let received: TaskManifestRequest =
+        serde_json::from_slice(&sent).expect("the API decodes the manifest relish sends");
+    assert_eq!(
+        as_json(&manifest, "manifest"),
+        as_json(&received, "manifest"),
+        "the API read a different manifest from the one relish parsed"
+    );
+    for cohort in &received.cohort {
+        let mut array = TaskArraySubmitRequest {
+            name: received.name.clone(),
+            namespace: Some(received.namespace.clone()),
+            template: cohort.template.clone(),
+            spec: cohort.spec.clone(),
+        };
+        let _ = validate_submission(&mut array);
+    }
+    let register = |manifest: TaskManifestRequest| TaskArrayWrite::RegisterManifest {
+        name: manifest.name,
+        namespace: manifest.namespace,
+        request_id: "fuzz".into(),
+        cohorts: manifest.cohort,
+        submitted_at_epoch_secs: 0,
+    };
+    let mut trial = TaskArrays::default();
+    let mut next = 0;
+    let mut allocate = || {
+        next += 1;
+        next
+    };
+    let Ok(first) = trial.apply(&register(manifest), &mut allocate) else {
+        return Outcome::Accepted;
+    };
+    let retried = trial
+        .apply(&register(received), &mut allocate)
+        .expect("a retried manifest is accepted again");
+    assert!(
+        matches!(first, TaskArrayApplied::Registered { .. }) && first == retried,
+        "a retried manifest registered as {retried:?}, not as {first:?}"
+    );
+    Outcome::Accepted
+}
+
+/// A task array, as `POST /v1/batch/array` reads it from `relish run
+/// --batch` (#1414).
+///
+/// An accepted request must survive a JSON round trip. Once validation has
+/// settled its namespace, the request and its template must both carry it,
+/// because admission reads one and the tasks run in the other.
+pub fn task_array_submit(data: &[u8]) -> Outcome {
+    use crate::bun::task_array_api::{TaskArraySubmitRequest, validate_submission};
+
+    let Ok(mut request) = serde_json::from_slice::<TaskArraySubmitRequest>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&request).expect("a decoded task array re-encodes");
+    let again: TaskArraySubmitRequest =
+        serde_json::from_slice(&encoded).expect("a re-encoded task array decodes");
+    assert_eq!(request, again, "a task array changed on its round trip");
+    if let Ok(namespace) = validate_submission(&mut request) {
+        assert_eq!(request.namespace.as_deref(), Some(namespace.as_str()));
+        assert_eq!(
+            request.template.namespace.as_deref(),
+            Some(namespace.as_str())
+        );
+    }
+    Outcome::Accepted
+}
+
+/// A batch of jobs, as `POST /v1/batch` reads it from `relish batch` (#1414).
+///
+/// An accepted batch must survive a JSON round trip. Once each job's
+/// namespace is resolved, the submission and the job's spec must name the
+/// same one, and no two jobs may share a name.
+pub fn batch_submit(data: &[u8]) -> Outcome {
+    use crate::bun::batch::{BatchSubmitRequest, resolve_job_namespaces};
+
+    let Ok(request) = serde_json::from_slice::<BatchSubmitRequest>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&request).expect("a decoded batch re-encodes");
+    let again: BatchSubmitRequest =
+        serde_json::from_slice(&encoded).expect("a re-encoded batch decodes");
+    assert_eq!(
+        as_json(&request, "batch"),
+        as_json(&again, "batch"),
+        "a batch changed on its round trip"
+    );
+    let Ok(jobs) = resolve_job_namespaces(request.jobs) else {
+        return Outcome::Accepted;
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for job in &jobs {
+        assert!(names.insert(&job.name), "two jobs named {:?}", job.name);
+        assert_eq!(
+            job.namespace.as_deref(),
+            job.spec.namespace.as_deref(),
+            "job {:?} resolved to two namespaces",
+            job.name
+        );
+        assert!(
+            job.namespace.is_some(),
+            "job {:?} has no namespace",
+            job.name
+        );
+    }
     Outcome::Accepted
 }
 

@@ -1,0 +1,34 @@
+# The five-minute tour's jobs step: relish batch submit burger/jobs.toml.
+# The kitchen cooks patties: each task hashes a block of memory (the cooking)
+# and prints a digest, then tells the counter, by its service name, that one
+# more patty is done. The burger's footer counts them.
+# Image jobs need rootful Linux nodes, as the laptop quickstart's VMs are.
+# Ten fast tasks in two profiles, so the step takes seconds, not minutes.
+# A chunk queues indexes; CPU and memory requests govern actual concurrency.
+# Small chunks let these few tasks spread across the nodes.
+name = "cook-patties"
+namespace = "default"
+
+[[cohort]]
+name = "small"
+count = 8
+chunk_size = 2
+max_attempts = 3
+task_timeout_secs = 30
+[cohort.template]
+image = "burger:v1"
+command = ["/burger", "batch", "small", "{index}"]
+cpu = "100m-250m"
+memory = "32Mi-64Mi"
+
+[[cohort]]
+name = "large"
+count = 2
+chunk_size = 1
+max_attempts = 3
+task_timeout_secs = 30
+[cohort.template]
+image = "burger:v1"
+command = ["/burger", "batch", "large", "{index}"]
+cpu = "1000m"
+memory = "128Mi"

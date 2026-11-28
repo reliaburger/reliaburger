@@ -11430,6 +11430,25 @@ derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a dif
 each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
 than the structs.
 
+The task-array target was only half the story, though. It decodes the JSON that
+`POST /v1/batch/manifest` reads, but `relish batch submit` starts from a TOML file, and a
+TOML parse is a different decoder with its own corner cases: dotted keys, inline tables,
+integers too big for the field. Three more targets close the gap. `task_manifest_file`
+parses the TOML as relish does, encodes it as the JSON relish sends, and checks the API
+decodes the same manifest. It then runs the trial registration `--dry-run` runs and, when
+that succeeds, registers the manifest a second time under the same request id from the
+re-decoded copy. A retry is a fresh HTTP request, decoded afresh, and it must land on the
+batch the first attempt created, not a new one or a refusal. `task_array_submit` and
+`batch_submit` cover the other two batch bodies, `POST /v1/batch/array` from `relish run
+--batch` and `POST /v1/batch` from `relish batch`. Both check what their handlers promise
+once they've settled the namespace: the request and the job it carries name the same one.
+
+`task_manifest_file` passes its allocator as `&mut allocate` rather than `allocate`.
+`TaskArrays::apply` takes `impl FnMut() -> u64` by value, which would move the closure into
+the first call and leave nothing for the retry. The standard library implements `FnMut` for
+`&mut F` whenever `F` is `FnMut`, so lending the closure works, and both calls draw ids from
+the one counter.
+
 ### Ranking what's left
 
 Twelve targets is a list, not a policy. Which decoder gets the next one? We
