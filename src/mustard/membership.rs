@@ -71,6 +71,9 @@ pub struct NodeMembership {
 /// targets.
 pub struct MembershipTable {
     members: HashMap<NodeId, NodeMembership>,
+    /// Bumped by every change to what a snapshot shows, so a publisher can
+    /// skip rebuilding one when nothing changed (#2439).
+    version: u64,
 }
 
 impl MembershipTable {
@@ -78,7 +81,23 @@ impl MembershipTable {
     pub fn new() -> Self {
         Self {
             members: HashMap::new(),
+            version: 0,
         }
+    }
+
+    /// A counter that rises with every change to what [`Self::snapshot`] or
+    /// [`Self::roster`] would show: a member's state, incarnation, address,
+    /// labels or council flags, or a member added or removed. Equal versions
+    /// mean equal snapshots, so a publisher compares this instead of
+    /// rebuilding and sorting a snapshot per received datagram. It may rise
+    /// without a visible change ([`Self::get_mut`] bumps it whatever the
+    /// caller does), never the other way round.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn touch(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Add or update a node in the membership table.
@@ -99,7 +118,18 @@ impl MembershipTable {
                 update.incarnation,
             );
 
-            if new_state != old_state || new_incarnation != old_incarnation {
+            // Only the node raises its own incarnation, so an Alive at a
+            // strictly higher one is its own newer word about itself, address
+            // included (#2475). A Suspect or Dead carries the accuser's view
+            // of the address, and an equal incarnation could be a replay
+            // (#696), so neither moves it.
+            let moved = update.state == NodeState::Alive
+                && update.incarnation > old_incarnation
+                && update.address != existing.address;
+            if moved {
+                existing.address = update.address;
+            }
+            let changed = if new_state != old_state || new_incarnation != old_incarnation {
                 if new_state != old_state {
                     existing.state_changed = now;
                 }
@@ -110,8 +140,12 @@ impl MembershipTable {
                 }
                 true
             } else {
-                false
+                moved
+            };
+            if changed {
+                self.touch();
             }
+            changed
         } else {
             // New node — only add if it's alive (don't add dead nodes we've never seen)
             if update.state == NodeState::Alive {
@@ -131,6 +165,7 @@ impl MembershipTable {
                         is_leader: false,
                     },
                 );
+                self.touch();
                 true
             } else {
                 false
@@ -161,6 +196,7 @@ impl MembershipTable {
                 if m.state == NodeState::Left {
                     return false;
                 }
+                let mut changed = m.address != address;
                 m.address = address;
                 if incarnation > m.incarnation {
                     m.incarnation = incarnation;
@@ -168,8 +204,12 @@ impl MembershipTable {
                         m.state_changed = now;
                     }
                     m.state = NodeState::Alive;
+                    changed = true;
                 }
                 m.last_ack = now;
+                if changed {
+                    self.touch();
+                }
                 false
             }
             Entry::Vacant(entry) => {
@@ -186,6 +226,7 @@ impl MembershipTable {
                     is_council: false,
                     is_leader: false,
                 });
+                self.touch();
                 true
             }
         }
@@ -200,6 +241,7 @@ impl MembershipTable {
         {
             member.state = NodeState::Suspect;
             member.state_changed = Instant::now();
+            self.touch();
             return true;
         }
         false
@@ -214,6 +256,7 @@ impl MembershipTable {
         {
             member.state = NodeState::Dead;
             member.state_changed = Instant::now();
+            self.touch();
             return true;
         }
         false
@@ -221,7 +264,11 @@ impl MembershipTable {
 
     /// Remove all Dead and Left nodes from the table unconditionally.
     pub fn reap_dead(&mut self) {
+        let before = self.members.len();
         self.members.retain(|_, m| !m.state.is_down());
+        if self.members.len() != before {
+            self.touch();
+        }
     }
 
     /// Remove Dead and Left nodes that have been down for longer than `timeout`.
@@ -230,16 +277,26 @@ impl MembershipTable {
     /// bound. Only removes nodes that have been in a terminal state long
     /// enough for all cluster members to have learned about the departure
     /// via gossip dissemination.
-    pub fn reap_expired_dead(&mut self, timeout: std::time::Duration, now: Instant) -> Vec<NodeId> {
+    ///
+    /// Returns each reaped node with the incarnation it was reaped at, which
+    /// the caller keeps as a tombstone (#2474).
+    pub fn reap_expired_dead(
+        &mut self,
+        timeout: std::time::Duration,
+        now: Instant,
+    ) -> Vec<(NodeId, u64)> {
         let mut reaped = Vec::new();
         self.members.retain(|id, m| {
             if m.state.is_down() && now.duration_since(m.state_changed) > timeout {
-                reaped.push(id.clone());
+                reaped.push((id.clone(), m.incarnation));
                 false
             } else {
                 true
             }
         });
+        if !reaped.is_empty() {
+            self.touch();
+        }
         reaped
     }
 
@@ -248,9 +305,45 @@ impl MembershipTable {
         self.members.get(node_id)
     }
 
-    /// Get a mutable reference to a node's membership record.
+    /// Get a mutable reference to a node's membership record. Counts as a
+    /// change to the [`version`](Self::version) whatever the caller does
+    /// with it, so a hot path uses a narrower method instead
+    /// ([`Self::set_labels`], [`Self::acknowledge`]).
     pub fn get_mut(&mut self, node_id: &NodeId) -> Option<&mut NodeMembership> {
-        self.members.get_mut(node_id)
+        let member = self.members.get_mut(node_id);
+        if member.is_some() {
+            self.version = self.version.wrapping_add(1);
+        }
+        member
+    }
+
+    /// Set a member's labels. Returns `true` if they changed.
+    pub fn set_labels(&mut self, node_id: &NodeId, labels: &BTreeMap<String, String>) -> bool {
+        let Some(member) = self.members.get_mut(node_id) else {
+            return false;
+        };
+        if member.labels == *labels {
+            return false;
+        }
+        member.labels = labels.clone();
+        self.touch();
+        true
+    }
+
+    /// Record an ACK from a member (directly, or through a relay): a
+    /// Suspect member is Alive again. Returns `true` if its state changed.
+    pub fn acknowledge(&mut self, node_id: &NodeId, now: Instant) -> bool {
+        let Some(member) = self.members.get_mut(node_id) else {
+            return false;
+        };
+        member.last_ack = now;
+        if member.state != NodeState::Suspect {
+            return false;
+        }
+        member.state = NodeState::Alive;
+        member.state_changed = now;
+        self.touch();
+        true
     }
 
     /// Overwrite every known member's `is_council`/`is_leader` flags from the
@@ -260,9 +353,16 @@ impl MembershipTable {
     /// cluster runtime, so the flags — always `false` before this was wired —
     /// reflect the real voter set and leader.
     pub fn set_roles(&mut self, roles: &CouncilRoles) {
+        let mut changed = false;
         for (id, member) in self.members.iter_mut() {
-            member.is_council = roles.council.contains(id);
-            member.is_leader = roles.leader.as_ref() == Some(id);
+            let is_council = roles.council.contains(id);
+            let is_leader = roles.leader.as_ref() == Some(id);
+            changed |= member.is_council != is_council || member.is_leader != is_leader;
+            member.is_council = is_council;
+            member.is_leader = is_leader;
+        }
+        if changed {
+            self.touch();
         }
     }
 
@@ -448,6 +548,51 @@ mod tests {
         table.add_node(NodeId::new("n1"), addr(9002), 1, BTreeMap::new(), now());
         assert_eq!(table.len(), 1);
         assert_eq!(table.get(&NodeId::new("n1")).unwrap().address, addr(9002));
+    }
+
+    /// #2475: a node back on a new IP under the same name used to keep its
+    /// old address on every peer it hadn't contacted directly.
+    #[test]
+    fn a_higher_incarnation_update_replaces_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        let mut update = alive_update("w7", 2);
+        update.address = addr(99);
+        assert!(table.apply_update(&update, now()));
+        assert_eq!(table.get(&NodeId::new("w7")).unwrap().address, addr(99));
+    }
+
+    /// A replayed or stale rumour at the same incarnation can't move a member.
+    #[test]
+    fn an_update_at_the_same_incarnation_keeps_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        for state in [NodeState::Alive, NodeState::Suspect] {
+            let mut update = alive_update("w7", 1);
+            update.state = state;
+            update.address = addr(99);
+            table.apply_update(&update, now());
+            assert_eq!(
+                table.get(&NodeId::new("w7")).unwrap().address,
+                addr(7),
+                "a {state:?} at the same incarnation moved the member"
+            );
+        }
+    }
+
+    /// A Suspect or Dead carries the address its accuser holds, which may be
+    /// the old one: even at a higher incarnation it doesn't move the member.
+    #[test]
+    fn a_higher_incarnation_failure_keeps_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        for (state, incarnation) in [(NodeState::Suspect, 2), (NodeState::Dead, 3)] {
+            let mut update = alive_update("w7", incarnation);
+            update.state = state;
+            update.address = addr(99);
+            assert!(table.apply_update(&update, now()));
+            assert_eq!(table.get(&NodeId::new("w7")).unwrap().address, addr(7));
+        }
     }
 
     #[test]
@@ -755,7 +900,7 @@ mod tests {
             Instant::now() - Duration::from_secs(61);
 
         let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
-        assert_eq!(reaped, vec![NodeId::new("n1")]);
+        assert_eq!(reaped, vec![(NodeId::new("n1"), 1)]);
         assert!(table.get(&NodeId::new("n1")).is_none());
     }
 
@@ -779,7 +924,7 @@ mod tests {
             Instant::now() - Duration::from_secs(61);
 
         let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
-        assert_eq!(reaped, vec![NodeId::new("n1")]);
+        assert_eq!(reaped, vec![(NodeId::new("n1"), 1)]);
     }
 
     #[test]

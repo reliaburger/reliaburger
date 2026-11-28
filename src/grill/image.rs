@@ -18,7 +18,7 @@ use super::oci_pull::retry_registry_read;
 use super::whiteout::{self, LayerEntries, LayerEntry};
 
 mod gc;
-pub use gc::RootfsGcReport;
+pub use gc::{CollectionProblem, ImageStoreStatus, RootfsGcReport};
 
 /// A parsed OCI image reference.
 ///
@@ -377,6 +377,8 @@ struct UnpackState {
     /// When the last collection pass started. Held for the whole pass, so
     /// at most one runs at a time.
     last_collection: std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// What `relish images` and `relish wtf` read about this store (#2524).
+    status: ImageStoreStatus,
 }
 
 /// Content-addressed image store on disk.
@@ -421,10 +423,13 @@ impl ImageStore {
     /// Create a new image store at the given root directory.
     pub fn new(store_root: PathBuf) -> Self {
         Self {
+            unpacking: std::sync::Arc::new(UnpackState {
+                status: ImageStoreStatus::new(store_root.clone()),
+                ..UnpackState::default()
+            }),
             store_root,
             blob_store: std::sync::Arc::new(std::sync::OnceLock::new()),
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
-            unpacking: std::sync::Arc::default(),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
         }
@@ -447,6 +452,7 @@ impl ImageStore {
     pub fn with_unpack_limits(mut self, limits: UnpackLimits) -> Self {
         self.unpacking = std::sync::Arc::new(UnpackState {
             limits,
+            status: self.unpacking.status.clone(),
             ..UnpackState::default()
         });
         self
@@ -588,7 +594,12 @@ impl ImageStore {
             // every writer on the filesystem, but only this generation's
             // lock is held meanwhile, so it delays this image alone.
             sync_filesystem(&target)?;
-            crate::sesame::identity::atomic_write(&complete, b"complete\n")?;
+            // Measured once here, so `relish images` never walks a tree.
+            let bytes = gc::tree_bytes(&target).map_err(|e| ImageError::UnpackFailed {
+                digest: "rootfs".to_string(),
+                reason: format!("failed to measure the unpacked tree: {e}"),
+            })?;
+            crate::sesame::identity::atomic_write(&complete, &gc::marker_contents(bytes))?;
             Ok::<(), ImageError>(())
         })
         .await
@@ -637,6 +648,47 @@ impl ImageStore {
         }
         *pass = Some(std::time::Instant::now());
         Some(pass)
+    }
+
+    /// This store's status handle: its unpacked sizes and how its last
+    /// collection pass went.
+    pub fn status(&self) -> ImageStoreStatus {
+        self.unpacking.status.clone()
+    }
+
+    /// Run one collection pass over `live`, the generations instances use,
+    /// and record how it went at `now` (Unix seconds) for `relish wtf`
+    /// (#2524). An `Err` live set means the caller couldn't tell which are
+    /// live: nothing is removed, and the pass counts as refused.
+    pub async fn run_collection(
+        &self,
+        live: std::io::Result<HashSet<PathBuf>>,
+        grace: Duration,
+        now: u64,
+    ) -> Option<RootfsGcReport> {
+        let live = match live {
+            Ok(live) => live,
+            Err(error) => {
+                eprintln!("warning: image collection skipped: {error}");
+                self.unpacking
+                    .status
+                    .record(Some(CollectionProblem::Refused), now);
+                return None;
+            }
+        };
+        match self.collect_rootfs_garbage(&live, grace).await {
+            Ok(report) => {
+                self.unpacking.status.record(None, now);
+                Some(report)
+            }
+            Err(error) => {
+                eprintln!("warning: image collection failed: {error}");
+                self.unpacking
+                    .status
+                    .record(Some(CollectionProblem::Failed), now);
+                None
+            }
+        }
     }
 
     /// Remove every rootfs generation whose canonical path is not in `live`,
@@ -1877,6 +1929,58 @@ mod tests {
         assert!(!b.exists());
         assert!(!b.with_extension("complete").exists());
         assert_eq!(report.generations_removed, 1);
+    }
+
+    /// #2524: `relish images` shows how much disk each image's unpacked
+    /// trees take on the node. The size is measured once, when a
+    /// generation is published, and kept in its marker.
+    #[tokio::test]
+    async fn a_published_generation_records_its_unpacked_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_a = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"12345")]);
+        let layer_b = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"1234567")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let tag_root = tmp
+            .path()
+            .join("store/rootfs/docker.io/acme/web")
+            .join(digest.replace(':', "%3A"));
+        store
+            .unpack_to(vec![layer_a], tag_root.clone())
+            .await
+            .unwrap();
+        store.unpack_to(vec![layer_b], tag_root).await.unwrap();
+        // A tag that isn't a digest has no row in `relish images` to join.
+        let tagged = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let layer_c = blob_layer(tmp.path(), "cccc", &[("bin/c", b"1")]);
+        store.unpack_to(vec![layer_c], tagged).await.unwrap();
+
+        let sizes = store.status().unpacked_sizes().await.unwrap();
+        assert_eq!(sizes, HashMap::from([(digest, 12)]));
+    }
+
+    /// #2524: `relish wtf` says when a node's image collection can't run.
+    /// A pass that can't read which generations are live removes nothing
+    /// and is recorded as refused; a later pass that works clears it.
+    #[tokio::test]
+    async fn a_refused_collection_is_recorded_until_a_pass_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let status = store.status();
+        assert_eq!(status.problem(), None);
+
+        let unreadable = Err(std::io::Error::other("bad bundle spec"));
+        store.run_collection(unreadable, Duration::ZERO, 100).await;
+        assert_eq!(status.problem(), Some((CollectionProblem::Refused, 100)));
+        // Still refused: it has been since the first one.
+        let unreadable = Err(std::io::Error::other("bad bundle spec"));
+        store.run_collection(unreadable, Duration::ZERO, 160).await;
+        assert_eq!(status.problem(), Some((CollectionProblem::Refused, 100)));
+
+        store
+            .run_collection(Ok(HashSet::new()), Duration::ZERO, 220)
+            .await;
+        assert_eq!(status.problem(), None);
     }
 
     #[tokio::test]

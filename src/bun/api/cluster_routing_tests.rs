@@ -1161,6 +1161,38 @@ async fn the_relay_keeps_the_query_string() {
     assert_eq!(listing.faults.len(), 1);
 }
 
+/// A followed event stream never ends, and the relay buffers a whole answer
+/// before it replies, so it used to hold the request until 8 MiB of events
+/// had arrived (#2393). It refuses one instead.
+#[tokio::test]
+async fn the_relay_refuses_a_followed_event_stream() {
+    let cluster = start_cluster(vec![("node-1", vec![]), ("node-2", vec![])]).await;
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay(
+            &cluster,
+            reqwest::Method::GET,
+            "/v1/nodes/node-2/relay/v1/events?follow=true",
+            Some(&cluster.operator),
+        ),
+    )
+    .await
+    .expect("the relay answers instead of buffering the stream");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("/v1/events?follow=true"), "{body}");
+
+    // A page of events is still relayed: whatever node-2 answers (this
+    // fake keeps no event store), it isn't the relay's refusal.
+    let (status, body) = relay(
+        &cluster,
+        reqwest::Method::GET,
+        "/v1/nodes/node-2/relay/v1/events?follow=false",
+        Some(&cluster.operator),
+    )
+    .await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// `default/db`, a managed-volume app whose volumes live on `homes`.
 fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
     crate::bun::diagnostics::DesiredAppEvidence {

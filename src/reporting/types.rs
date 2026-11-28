@@ -1,7 +1,8 @@
 /// State report types for the hierarchical reporting tree.
 ///
-/// A `StateReport` is sent by each worker node to its assigned council
-/// member at the configured reporting interval. It contains all runtime
+/// A `StateReport` is sent by each node to the leader at the configured
+/// reporting interval (the shipped topology is a flat star; the two-level
+/// tree is planned, #364). It contains all runtime
 /// state: running apps, resource usage, and recent events.
 use std::time::{Duration, SystemTime};
 
@@ -12,9 +13,8 @@ use crate::mayo::rollup::NodeRollup;
 use crate::meat::NodeId;
 use crate::meat::cluster_state::NodeCapabilities;
 
-/// Sent by each worker node to its assigned council member at the
-/// reporting interval. Also sent as a full report during the leader
-/// learning period.
+/// Sent by each node to the leader at the reporting interval. Also sent as
+/// a full report during the leader learning period.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReport {
     /// Identity of the reporting node.

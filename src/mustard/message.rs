@@ -235,6 +235,11 @@ pub enum GossipPayload {
         floors: Vec<SequenceFloor>,
         /// Whether the receiver should answer with its own table.
         wants_reply: bool,
+        /// How many members the sender's table holds. A peer that knows more
+        /// than a window fewer than the receiver is joining, and a request from it is
+        /// answered with a page of the whole table rather than one
+        /// anti-entropy window (#2442).
+        known_members: u32,
     },
     /// "Your datagram was no newer than what I hold for you." The answer to
     /// a datagram dropped by the freshness check, so a node that restarted
@@ -383,6 +388,12 @@ pub struct DirectoryExtension {
     pub reporting_address: SocketAddr,
     /// Best known leader, relayed epidemically; highest term wins.
     pub leader: Option<LeaderHint>,
+    /// How long ago, in milliseconds, the stamping node last heard
+    /// `leader` fresh: zero when it is the leader stamping its own hint.
+    /// A relay passes on the age it holds, so a hint nobody re-advertises
+    /// ages everywhere and expires (#2406,
+    /// [`LEADER_HINT_EXPIRY`](super::directory::LEADER_HINT_EXPIRY)).
+    pub leader_age_ms: u32,
     /// The stamping node's placement labels (zone, rack, gpu_model, …).
     /// Bounded on the way out by [`bounded_labels`] so gossip datagrams
     /// stay under the UDP budget. `BTreeMap` for a deterministic wire
@@ -709,6 +720,7 @@ mod tests {
                 entries,
                 floors: vec![],
                 wants_reply,
+                known_members: u32::MAX,
             },
         )
     }
@@ -785,6 +797,7 @@ mod tests {
                 entries: vec![],
                 floors,
                 wants_reply: false,
+                known_members: u32::MAX,
             },
         );
         msg.sequence = u64::MAX;
@@ -842,6 +855,7 @@ mod tests {
                 api_address: ipv6(9117),
                 reporting_address: ipv6(9445),
             }),
+            leader_age_ms: u32::MAX,
             labels,
             disk_pressured: true,
             recovery_epoch: Some(u64::MAX),
@@ -1020,6 +1034,7 @@ mod tests {
                 api_address: SocketAddr::from(([10, 0, 0, 1], 9117)),
                 reporting_address: SocketAddr::from(([10, 0, 0, 1], 9445)),
             }),
+            leader_age_ms: 0,
             labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
             disk_pressured: false,
             recovery_epoch: None,

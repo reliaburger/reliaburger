@@ -124,6 +124,12 @@ minutes at the default interval). The node stops its process and marks it
 `restart.never_healthy`. Restarting wouldn't help: the same probe fails the
 same way. Fix the check and apply again.
 
+An app instance that crashes is restarted after a backoff that doubles with
+each restart: 1 s, 2 s, 4 s, up to five minutes. A run of ten minutes
+forgives the earlier restarts, so the next crash waits a second again, as a
+sidecar's does. The RESTARTS column in `relish apps` still counts every
+restart over the instance's life.
+
 ## Init containers
 
 ```toml
@@ -489,7 +495,11 @@ relish delete web                # remove the app from the cluster
 `relish exec` runs its command once, with no stdin and no terminal, so
 `relish exec web sh` exits straight away: name the command you want, as in
 `relish exec web ls /data`. Relish prints the output and exits with the
-command's exit code.
+command's exit code. It returns at most 1 MiB of output, stdout first and
+then stderr. Past that the output is cut, and its last line reads
+`[output cut at 1 MiB]`; the command still runs to the end and keeps its
+exit code. For more, have the command write to a file in a volume, or pipe
+it through `head`, `tail` or `grep` inside the instance.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 

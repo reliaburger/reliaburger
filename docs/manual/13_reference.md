@@ -177,7 +177,7 @@ backups use each backend's standard credential variables.
 |------|---------|---------|
 | `--config PATH` | none (all defaults) | node config file |
 | `--listen ADDR` | `127.0.0.1:9117` | API listen address |
-| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux) |
+| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux); `apple` is accepted only to refuse it with what to run instead |
 | `--cluster` | off | form or join a cluster using `[cluster]` |
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
@@ -402,25 +402,32 @@ Fixed limits on the image directory, not settings (see `images-and-volumes`):
 ## Node config sections
 
 Every section is optional, and an unknown key is an error, so a typo fails at
-startup instead of being ignored.
+startup instead of being ignored. Two keys aren't for operators:
+`[reporting_tree] max_events_per_report` accepts only its default, `100`, and
+`[upgrades] release_keys_override` swaps the release signing keys in debug
+builds for tests and is ignored in a release build.
 
 | Section | For |
 |---------|-----|
 | `[node]` | `name` (one DNS label: 1 to 63 lowercase letters, digits and `-`, not starting or ending with `-`; default `node-<gossip_port>`), `labels` (matched by `placement`), `loop_stall_snapshot_ms` (750: when one turn of Bun's agent loop runs this long, a watchdog thread writes a snapshot of every Bun thread to the journal, starting `bun: agent loop stalled`; at most ten an hour; `0` turns it off) |
-| `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
+| `[cluster]` | `name`, `join`, ports, `council_size` (unset: the council grows to seven voters; an odd number from 1 to 7 caps it lower; only the node that bootstraps the cluster reads it), `environment` (a free-form tag such as `"production"`, descriptive only: safety gates read `[testing] safety_class`), `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
-| `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
+| `[resources]` | CPU and memory held back for the node itself: `reserved_cpu` (`"500m"`, or `"0.5"` cores), `reserved_memory` (`"512Mi"`); `gpu_enabled` (true: detect NVIDIA GPUs at startup) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
-| `[ebpf]`, `[dns]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
+| `[security]` | `master_key_path`, `bootstrap_path` (the security bootstrap that seeds a brand-new cluster), `identity_dir` (default `{storage.data}/identity`: this node's certificate, key and CA chain, written by `relish init` and `relish join`), `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `allow_insecure_cluster` (default `false`: a plaintext node whose gossip address isn't loopback also needs `true`, or `bun --cluster` refuses to bind its cluster transports; `relish init --development-plaintext` writes both keys), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
+| `[ebpf]`, `[dns]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers; `[dns] restrict_sources` (true: answer `.internal` names only to loopback and private-range clients; turn off only to debug); `[ebpf] program_dir` (unset: the programs built into `bun`; a directory overrides them, for development), `[ebpf] cgroup_path` (`/sys/fs/cgroup`: the cgroup v2 root the connect hook attaches to), `[ebpf] sweep_interval_secs` (60: how often the firewall and egress maps are reconciled with live instances; `0` turns the sweep off) |
 | `[ingress]` | `enabled` (false), `http_port` (80), `https_port` (443), `tls_cert` and `tls_key` (both or neither), `max_connections` (10,000 requests in flight, WebSockets included; past it, 503), `max_request_body_bytes` (10 MiB; past it, 413), `request_body_budget_bytes` (256 MiB shared by every body being buffered; past it, 503), `max_open_connections` (32,768 connections across both listeners; past it, the connection is closed), `max_tls_handshakes_per_source` (16 TLS handshakes in progress from one client address; past it, the connection is dropped). A request body that sends nothing for 30 s gets 408, and a response is cut after 30 s with no byte from the app (see `networking`) |
-| `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`) |
-| `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
-| `[gitops]`, `[upgrades]` | see `operations` |
-| `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`) |
+| `[images]` | registry, storage caps (`max_storage`, unlimited by default; `max_files`, 65,536 by default), pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`), `registry_bind` (`"127.0.0.1"`: the address the registry listens on; a clustered node's explicit bind must cover its advertised address), `p2p_concurrency` (4 layers fetched at once per peer-to-peer pull), `pull_through` (true: external images go through the cluster's cache, so a later pull anywhere comes from a peer), `cache_recheck_secs` (3600: how long a cached upstream image is served before Pickle checks whether its tag moved) |
+| `[metrics]` | `collection_interval_secs` (10, not 0: node and process metrics), `scrape_interval_secs` (30: static `scrape_targets`), `app_scrape_interval_secs` (10, not 0: apps that declare `metrics`), `alerts_enabled` (true: evaluate the built-in alerts), `rollup_interval_secs` (60, not 0: how often rollups go to the council), `rollup_retention_hours` (24: how long council members keep them), `export_path` (unset; a path, `file://`, `s3://` or `gs://` URL for Parquet export), and retention and storage (see `observability`) |
+| `[logs]` | retention, storage and export (see `observability`) |
+| `[alerts]` | `evaluation_interval_secs` (30, not 0: how often the alert rules run), and webhook destinations (see `observability`) |
+| `[gitops]` | see `operations` |
+| `[upgrades]` | see `operations`; `binary_dir` (unset: the directory of the running binary, which holds the versioned binaries and the `bun` symlink), `boot_grace_secs` (30: how long a new binary must stay up after it answers `/v1/version` before the upgrade counts), `gossip_rejoin_secs` (60: how long it has to rejoin gossip, in a cluster), `max_boot_attempts` (2, not 0: boots on the new version before Bun reverts) |
+| `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`), including `[testing] max_lease_seconds` (3600, at most 86400: the longest test lease this node issues) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
 | `[reporting_tree]` | `report_interval_secs` (5, not 0), `stale_report_timeout_secs` (30: more than `report_interval_secs`, at most 86400), `stale_node_grace_secs` (300, not 0: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
+| `[reconstruction]` | the learning period after a new leader is elected, when it collects state reports before it reconciles: `report_threshold_percent` (95, 1 to 100: the share of live nodes that must report to end it early), `learning_period_timeout_secs` (15, not 0: the longest it lasts), `large_cluster_timeout_secs` (30, not 0: the longest it lasts in a large cluster), `large_cluster_node_count` (5000: the node count from which a cluster is large) |
 | `[runtime]` | `stop_confirmation_timeout_secs`; `allowed_capabilities`, `allowed_sysctls` and `allowed_devices`, the runtime knobs apps may use here, which the scheduler also places by (empty: none; see `security`) |
 
 ### Shorter certificates for soak runs
@@ -487,6 +494,8 @@ way, so check the exit code before you trust it.
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
+It prints at most 1 MiB of the command's output; longer output is cut and
+ends with the line `[output cut at 1 MiB]`.
 
 ## Terminal UI keys
 

@@ -4,7 +4,8 @@ A Reliaburger cluster is the same `bun` binary on every node, started with
 `--cluster`. Membership spreads by SWIM gossip. A Raft council, embedded in the
 agent, holds the desired state and schedules work; it starts on the first node
 and grows as nodes join, up to seven voters, or to the council size the
-cluster was created with (appliance clusters default to five).
+cluster was created with (`[cluster] council_size` on the first node, an odd
+number from 1 to 7; appliance clusters default to five).
 
 The council always holds an odd number of voters: the largest odd number the
 live nodes allow, up to seven. An even council survives no more failures than

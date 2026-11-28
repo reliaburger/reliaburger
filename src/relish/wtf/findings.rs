@@ -215,6 +215,12 @@ pub const FINDINGS: &[FindingKind] = &[
         thresholds: &[],
     },
     FindingKind {
+        id: "image-collection-failing",
+        severities: WARNING,
+        meaning: "a node's image collection pass keeps failing or being refused (a container bundle whose spec it can't read), so no unpacked image is removed and each new image version takes more disk",
+        thresholds: &[],
+    },
+    FindingKind {
         id: "cert-expired",
         severities: CRITICAL,
         meaning: "a node or workload certificate is past its not-after time",

@@ -59,6 +59,22 @@ only cluster members and the node itself. That holds for ports published to
 containers too, which the node's own containers can also reach. Clients
 outside the cluster reach apps through Wrapper's ingress ports instead.
 
+The perimeter closes the whole range, including ports Bun never allocated.
+If another service on the node listens inside it (a monitoring agent on
+10050, memcached on 11211), clients outside the cluster can't reach it while
+Bun runs. Bun names each such listener in a warning when it starts. Move
+`[network] port_range` away from it, or move the service.
+
+A graceful stop (`systemctl stop`) that stops every workload also removes the
+perimeter's nftables tables. After a crash, or a stop that left something
+running, they stay, guarding the workloads' ports. To remove them by hand
+once nothing of Reliaburger's runs:
+
+```sh
+sudo nft delete table ip reliaburger_fw
+sudo nft delete table ip6 reliaburger_fw
+```
+
 Bun never publishes a workload on one of its own ports, and its own ports keep
 their usual policy inside the range. Put the API port there
 (`--listen 0.0.0.0:29117`, say) and `operator_cidrs` still reach it; put
@@ -259,11 +275,13 @@ namespaces = ["shop"]   # omit for every namespace
 A permission can only take away: the token still needs the role and scope for
 anything it does. A token with no block is governed by its role and scope
 alone, so permissions are opt-in per token. Once a token has a block, it may
-do only what the block lists:
+do only what the block lists, on every node. A node with no Raft seat gets the
+blocks from the council leader along with the tokens, so a new or changed
+block reaches it within one security refresh (five seconds):
 
 | Action | What it covers |
 |--------|----------------|
-| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and push images to their repositories, with `relish build` or any registry client (see `images-and-volumes`) |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
 | `host-exec` | jobs and process workloads that run host commands, apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`), and apps with `[runtime]` knobs (each node also lists each knob; see "Runtime knobs" below) |
@@ -711,10 +729,11 @@ the definitions the cluster keeps, with their schedules put back: scheduled
 jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
 one-off job's last run is pruned its definition goes, and so does the job
 from the audit: it won't run again, and the next submission is judged when
-it arrives. The cluster keeps no declared spec for a job, so a job pinned by
-tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
-a tag the cluster bound would be. `relish wtf` shows the same
-denials and audit findings as warnings.
+it arrives. A job is judged by the image it declared, as an app is: the
+cluster keeps that beside the digest it bound the tag to. So `report:latest`
+is judged as `report:latest` though it runs a digest, and a job pinned by tag
+and digest (`report:v1@sha256:…`) is judged by both, the way you wrote it.
+`relish wtf` shows the same denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
 only those: the counts and findings leave out everything else, so a

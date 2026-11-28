@@ -48,6 +48,9 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "task_manifest" => task_manifests(),
         "chaos_scenario" => scenario_files(),
         "council_backup_state" => council_states(),
+        "task_manifest_file" => manifest_files(),
+        "task_array_submit" => task_arrays(),
+        "batch_submit" => batches(),
         "api_bearer" => bearers(),
         "ingress_request" => ingress_requests(),
         "tftp_packet" => tftp_packets(),
@@ -99,6 +102,7 @@ fn gossip() -> Vec<Seed> {
             expires_in_secs: 3600,
         }],
         wants_reply: true,
+        known_members: 2,
     });
     let stale = message(GossipPayload::Stale {
         held_incarnation: 4,
@@ -117,6 +121,7 @@ fn gossip() -> Vec<Seed> {
             api_address: address(9443),
             reporting_address: address(9444),
         }),
+        leader_age_ms: 0,
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
         disk_pressured: false,
         recovery_epoch: None,
@@ -450,6 +455,81 @@ fn task_manifests() -> Vec<Seed> {
                 "name": "render",
                 "namespace": "media",
                 "cohort": [cohort("thumbnails", 100), cohort("posters", 3)],
+            })),
+        ),
+    ]
+}
+
+/// The manifests the examples ship for `relish batch submit`.
+fn manifest_files() -> Vec<Seed> {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    [
+        "demo/burger/jobs.toml",
+        "phase-8/container-shared-runc-array.toml",
+    ]
+    .iter()
+    .map(|relative| {
+        let name = relative.replace('/', "-");
+        let bytes = std::fs::read(examples.join(relative)).expect("the example manifest reads");
+        seed(name, bytes)
+    })
+    .collect()
+}
+
+fn task_arrays() -> Vec<Seed> {
+    vec![
+        seed(
+            "one-task",
+            json(serde_json::json!({
+                "name": "hello",
+                "template": {"runtime": "process", "exec": "/bin/true"},
+            })),
+        ),
+        seed(
+            "render",
+            json(serde_json::json!({
+                "name": "render",
+                "namespace": "media",
+                "template": {
+                    "image": "renderer:v1",
+                    "command": ["/renderer", "--frame", "{index}"],
+                    "cpu": "250m-500m",
+                    "memory": "256Mi-512Mi",
+                    "env": {"QUALITY": "high"},
+                },
+                "spec": {
+                    "count": 10000,
+                    "chunk_size": 64,
+                    "max_attempts": 3,
+                    "max_failed_indexes": 10,
+                    "task_timeout_secs": 600,
+                    "per_node_concurrency": 4,
+                },
+            })),
+        ),
+    ]
+}
+
+fn batches() -> Vec<Seed> {
+    let job = |name: &str, namespace: Option<&str>| {
+        let mut job = serde_json::json!({
+            "name": name,
+            "spec": {"runtime": "process", "exec": "/bin/true"},
+        });
+        if let Some(namespace) = namespace {
+            job["namespace"] = namespace.into();
+        }
+        job
+    };
+    vec![
+        seed(
+            "one-job",
+            json(serde_json::json!({"jobs": [job("migrate", None)]})),
+        ),
+        seed(
+            "two-namespaces",
+            json(serde_json::json!({
+                "jobs": [job("thumbnails", Some("media")), job("report", Some("finance"))],
             })),
         ),
     ]

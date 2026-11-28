@@ -91,9 +91,11 @@ class SeqCheck(unittest.TestCase):
             self.assertFalse(result["pass"], problem)
             self.assertIn(problem.split()[0], result["reason"])
 
-    def test_no_summary_means_the_writer_could_not_be_read(self):
+    def test_no_summary_means_the_writer_could_not_be_read_and_is_undecided(self):
+        # #2542: runs 35 and 38 recorded an unreachable writer as lost data.
+        # Nothing was read, so nothing can be judged either way.
         result = endurance.seq_check("error: no running instance of soak-writer\n", 1)
-        self.assertFalse(result["pass"])
+        self.assertIsNone(result["pass"])
         self.assertIn("wasn't reachable", result["reason"])
 
 
@@ -293,6 +295,17 @@ class Judging(unittest.TestCase):
             line = endurance.judge(1, {"recovery": recovery}, {"I1": self.PASS})
             self.assertEqual(line["violations"], ["I6"], recovery)
 
+    def test_an_undecided_check_is_named_apart_from_the_violations(self):
+        # #2542: a writer that couldn't be read is undecided, not lost data.
+        line = endurance.judge(1, {"recovery": {"api_seconds": 1, "settled_seconds": 1}},
+                               {"I1": {"pass": None, "reason": "no sequence summary"}, "I2": self.PASS})
+        self.assertEqual(line["violations"], [])
+        self.assertEqual(line["undecided"], ["I1"])
+
+    def test_a_check_with_no_verdict_at_all_is_still_a_violation(self):
+        line = endurance.judge(1, {"recovery": {"api_seconds": 1, "settled_seconds": 1}}, {"I1": {}})
+        self.assertEqual(line["violations"], ["I1"])
+
     def test_each_failed_check_is_named(self):
         line = endurance.judge(1, {"recovery": {"api_seconds": 1, "settled_seconds": 1}},
                                {"I1": {"pass": False}, "I7": {"pass": False}, "I2": self.PASS})
@@ -345,6 +358,18 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary["environment_events"]["lima_forwarder_retries"], 1)
         self.assertEqual(summary["topologies"]["1"]["extra_power_offs"], 1)
         self.assertEqual(summary["pooled"]["power_offs"], 3)
+        self.assertEqual(summary["verdict"], "pass")
+
+    def test_an_undecided_cut_is_listed_and_never_counts_towards_the_bound(self):
+        lines = [self.line(1), self.line(2), self.line(3)]
+        lines[1]["undecided"] = ["I1"]
+        summary = endurance.summarise(self.run_with(3), lines)
+        topology = summary["topologies"]["1"]
+        self.assertEqual(topology["cuts"], 3)
+        self.assertEqual(topology["undecided_cuts"], [{"cut": 2, "undecided": ["I1"]}])
+        self.assertAlmostEqual(topology["bound95"], endurance.bound95(2))
+        self.assertAlmostEqual(summary["pooled"]["bound95"], endurance.bound95(2))
+        self.assertEqual(summary["pooled"]["undecided"], 1)
         self.assertEqual(summary["verdict"], "pass")
 
     def test_no_cuts_is_not_a_pass(self):
@@ -437,6 +462,23 @@ class RecordAndSummaryCommands(unittest.TestCase):
             file.flush()
             self.assertEqual(self.run_endurance("seq", file.name, "--acked", "3").returncode, 0)
             self.assertEqual(self.run_endurance("seq", file.name, "--acked", "4").returncode, 1)
+
+    def test_an_unreachable_writer_is_recorded_undecided_and_the_run_goes_on(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            cut = Path(evidence, "cuts", "00001")
+            cut.mkdir(parents=True)
+            seq = cut / "seq.txt"
+            seq.write_text("Error: cannot reach the bun agent at https://127.0.0.1:31150: connection refused\n")
+            result = self.run_endurance("seq", str(seq), "--acked", "100")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            (cut / "I1.json").write_text(result.stdout)
+            for name in ("I2", "I4", "I7"):
+                (cut / f"{name}.json").write_text(json.dumps({"pass": True}))
+            detail = json.dumps({"recovery": {"api_seconds": 30, "settled_seconds": 50, "start_retries": 0}})
+            result = self.run_endurance("record", "--evidence", evidence, "--cut", "1", "--detail", detail)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            line = json.loads(Path(evidence, "cuts.jsonl").read_text())
+            self.assertEqual((line["violations"], line["undecided"]), ([], ["I1"]))
 
     def test_a_whole_file_still_fails_when_the_writer_resumed_below_the_ack(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -929,6 +971,28 @@ class HarnessShell(unittest.TestCase):
                                 "power_back || echo \"failed forwarder=$forwarder_retries\"\n")
         self.assertEqual(result.stdout.strip(), "failed forwarder=1", result.stderr)
         self.assertEqual(len([call for call in self.calls_made() if call.startswith("limactl start")]), 2)
+
+    def test_a_forced_stop_and_second_start_restart_the_recovery_clock(self):
+        # #2542: runs 39 and 48 timed I6 from the first power-on, so the
+        # forwarder's spin and the forced stop counted against Bun.
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN)
+        result = self.run_shell("powered_on_at=$(now); first=$powered_on_at\n"
+                                "power_back && echo \"moved=$(( powered_on_at > first ))\"\n", fast_clock=True)
+        self.assertEqual(result.stdout.strip(), "moved=1", result.stderr)
+
+    def test_one_start_keeps_the_power_on_time(self):
+        self.answer("instances", "[]")
+        result = self.run_shell("powered_on_at=$(now); first=$powered_on_at\n"
+                                "power_back && echo \"moved=$(( powered_on_at > first ))\"\n", fast_clock=True)
+        self.assertEqual(result.stdout.strip(), "moved=0", result.stderr)
+
+    def test_the_first_start_of_a_new_log_writes_nothing_to_stderr(self):
+        # #2542: `wc -c < LOG 2> /dev/null` opened LOG before it redirected
+        # stderr, so the first start printed "No such file or directory".
+        result = self.run_shell(f"start_vm {self.path}/power-on-new.log && echo started\n")
+        self.assertEqual(result.stdout.strip(), "started", result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_a_huge_log_keeps_its_head_and_tail(self):
         log = self.path / "ha.stderr.log"

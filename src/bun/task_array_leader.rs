@@ -39,7 +39,6 @@ use super::task_array_node::{
     ArrayAssignment, ArrayProgress, HeldChunk, NodeArrayCounters, NodeSyncRequest,
     NodeSyncResponse, TaskArrayNode,
 };
-use crate::config::types::EnvValue;
 use crate::council::types::{CouncilResponse, RaftRequest};
 use crate::meat::NodeId;
 use crate::meat::task_array::ChunkId;
@@ -572,6 +571,8 @@ pub fn task_reservation(template: &crate::config::job::JobSpec) -> crate::meat::
 pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) -> ArrayAssignment {
     let mut assignment = bare_assignment(batch_id, record);
     add_definition(&mut assignment, record);
+    // Admission judges the run as the node will see it.
+    assignment.derive_definition();
     assignment.held = held_by(record, node);
     assignment
 }
@@ -617,42 +618,14 @@ fn bare_assignment(batch_id: u64, record: &TaskArrayRecord) -> ArrayAssignment {
     }
 }
 
-/// Add the run's definition to `assignment`: its template, and the
-/// program, arguments and plain environment derived from it.
+/// Add the run's template to `assignment`. The program, arguments and
+/// environment derive from it, so the node works them out instead of being
+/// sent them as well (#2532).
 fn add_definition(assignment: &mut ArrayAssignment, record: &TaskArrayRecord) {
     let mut template = record.template.clone();
     template.namespace = Some(record.namespace.clone());
     assignment.template = Some(Box::new(template));
     assignment.template_known = false;
-    assignment.program = record.template.exec.clone().unwrap_or_else(|| {
-        if record.template.script.is_some() {
-            "/bin/sh".into()
-        } else {
-            Default::default()
-        }
-    });
-    assignment.args = record
-        .template
-        .script
-        .as_ref()
-        .map(|script| vec!["-c".into(), script.clone()])
-        .unwrap_or_else(|| record.template.command.clone().unwrap_or_default());
-    assignment.env = record
-        .template
-        .env
-        .iter()
-        .filter_map(|(key, value)| match value {
-            EnvValue::Plain(value) => Some((key.clone(), value.clone())),
-            // The owned runner decrypts the original template at execution.
-            EnvValue::Encrypted(_) => None,
-            // Validation refuses provider values in jobs (#1123).
-            EnvValue::Provider(_) => None,
-        })
-        .chain(std::iter::once((
-            "RELIABURGER_JOB_NAME".into(),
-            record.name.clone(),
-        )))
-        .collect();
 }
 
 /// The `profile` label of a run that isn't one profile of a manifest.
@@ -798,17 +771,9 @@ impl RequestPlan {
                         resources: shared.resources,
                         batch_id: shared.batch_id,
                         spec: shared.spec.clone(),
-                        program: if send {
-                            shared.program.clone()
-                        } else {
-                            Default::default()
-                        },
-                        args: if send {
-                            shared.args.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        env: if send { shared.env.clone() } else { Vec::new() },
+                        program: Default::default(),
+                        args: Vec::new(),
+                        env: Vec::new(),
                         held: run.held.get(node).cloned().unwrap_or_default(),
                         stopping: shared.stopping,
                         replay_unknown: shared.replay_unknown,
@@ -1039,6 +1004,40 @@ pub fn quota_blocked_write(
 /// Most cron occurrences the leader fires in one tick.
 pub const MAX_FIRES_PER_TICK: usize = 16;
 
+/// Parsed cron schedules, kept by the leader between ticks so each
+/// definition's expression is parsed once, not once a second (#2532). An
+/// entry is parsed again when its expression changes, and dropped when its
+/// definition goes.
+#[derive(Debug, Default)]
+pub struct CronCache {
+    /// Per definition key: the expression and what parsing it gave (`None`
+    /// for one that doesn't parse, which never matches).
+    schedules: HashMap<String, (String, Option<crate::meat::cron::CronSchedule>)>,
+    /// How many expressions this cache has parsed, for the tests.
+    parses: u64,
+}
+
+impl CronCache {
+    /// Whether `key`'s `expression` matches `at`, parsing it only if the
+    /// cache holds no parse of this exact expression.
+    fn matches(&mut self, key: &str, expression: &str, at: time::OffsetDateTime) -> bool {
+        let fresh = self
+            .schedules
+            .get(key)
+            .is_some_and(|(cached, _)| cached == expression);
+        if !fresh {
+            self.parses += 1;
+            let parsed = crate::meat::cron::CronSchedule::parse(expression).ok();
+            self.schedules
+                .insert(key.to_string(), (expression.to_string(), parsed));
+        }
+        self.schedules
+            .get(key)
+            .and_then(|(_, schedule)| schedule.as_ref())
+            .is_some_and(|schedule| schedule.matches(at))
+    }
+}
+
 /// One schedule due now: its namespace, name and definition revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueSchedule {
@@ -1058,16 +1057,27 @@ pub fn due_schedules(
     at: time::OffsetDateTime,
     minute: i64,
     cursor: Option<&str>,
+    cache: &mut CronCache,
 ) -> Vec<DueSchedule> {
+    let scheduled: HashSet<&str> = arrays
+        .jobs()
+        .definitions()
+        .filter(|(_, record)| record.definition.cron.is_some())
+        .map(|(key, _)| key)
+        .collect();
+    cache
+        .schedules
+        .retain(|key, _| scheduled.contains(key.as_str()));
     let due: Vec<DueSchedule> = arrays
         .jobs()
         .definitions()
-        .filter(|(_, record)| {
+        .filter(|(key, record)| {
             record.last_observed_minute.is_none_or(|seen| seen < minute)
-                && record.definition.cron.as_ref().is_some_and(|cron| {
-                    crate::meat::cron::CronSchedule::parse(&cron.expression)
-                        .is_ok_and(|schedule| schedule.matches(at))
-                })
+                && record
+                    .definition
+                    .cron
+                    .as_ref()
+                    .is_some_and(|cron| cache.matches(key, &cron.expression, at))
         })
         .filter_map(|(key, record)| {
             let (namespace, name) = key.split_once('/')?;
@@ -1550,6 +1560,8 @@ struct LeaderMemory {
     refused: RefusedReports,
     /// The last cron definition fired, so the next tick starts after it.
     cron_cursor: Option<String>,
+    /// Parsed cron schedules, so a tick doesn't parse every one (#2532).
+    cron: CronCache,
     /// Sync calls carried over from earlier ticks.
     calls: SyncCalls,
     /// Which run outcomes this leader has already announced.
@@ -1665,7 +1677,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
     targets
 }
 
-async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
+async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>, cron: &mut CronCache) {
     let now = state.task_arrays.cron_clock.now_epoch_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
@@ -1675,14 +1687,18 @@ async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
         return;
     };
     let after = cursor.clone();
-    let Some((observed, due)) = read_control(state, move |view| {
-        let due = due_schedules(view.arrays, at, minute, after.as_deref());
-        (view.arrays.cron_observed_minute(), due)
+    // The read owns what it touches, so the cache goes in and comes back
+    // out, as the run tracker does. A failed read starts it afresh.
+    let mut moved = std::mem::take(cron);
+    let Some((observed, due, returned)) = read_control(state, move |view| {
+        let due = due_schedules(view.arrays, at, minute, after.as_deref(), &mut moved);
+        (view.arrays.cron_observed_minute(), due, moved)
     })
     .await
     else {
         return;
     };
+    *cron = returned;
     if observed.is_none_or(|seen| minute > seen) {
         if write_task_array(state, TaskArrayWrite::CronObserve { minute })
             .await
@@ -1859,7 +1875,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         return;
     }
     super::job_apply::settle(state).await;
-    fire_due_schedules(state, &mut memory.cron_cursor).await;
+    fire_due_schedules(state, &mut memory.cron_cursor, &mut memory.cron).await;
     prune_retired_runs(state).await;
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
@@ -2155,6 +2171,7 @@ async fn sync_node(
 mod tests {
     use super::*;
     use crate::config::job::JobSpec;
+    use crate::config::types::EnvValue;
     use crate::meat::index_set::IndexRangeSet;
     use crate::meat::job_capability::JobCapabilities;
     use crate::meat::task_array::TaskArraySpec;
@@ -2495,15 +2512,57 @@ mod tests {
     #[test]
     fn due_schedules_take_turns_after_the_last_one_fired() {
         let (arrays, at) = twenty_schedules();
-        let first = due_schedules(&arrays, at, 3, None);
+        let first = due_schedules(&arrays, at, 3, None, &mut CronCache::default());
         assert_eq!(first.len(), MAX_FIRES_PER_TICK);
         assert_eq!(first[0].name, "job-00");
-        let next = due_schedules(&arrays, at, 3, Some("default/job-15"));
+        let next = due_schedules(
+            &arrays,
+            at,
+            3,
+            Some("default/job-15"),
+            &mut CronCache::default(),
+        );
         assert_eq!(
             names(&next[..6]),
             ["job-16", "job-17", "job-18", "job-19", "job-00", "job-01"]
         );
-        assert!(due_schedules(&arrays, at, 2, None).is_empty());
+        assert!(due_schedules(&arrays, at, 2, None, &mut CronCache::default()).is_empty());
+    }
+
+    /// #2532 (#2444's step 5): a definition's cron expression is parsed
+    /// once, not on every tick, and parsed again when it changes.
+    #[test]
+    fn a_cron_expression_is_parsed_once_until_it_changes() {
+        let (mut arrays, at) = twenty_schedules();
+        let mut cache = CronCache::default();
+        due_schedules(&arrays, at, 3, None, &mut cache);
+        assert_eq!(cache.parses, 20);
+        due_schedules(&arrays, at, 3, None, &mut cache);
+        due_schedules(&arrays, at, 4, None, &mut cache);
+        assert_eq!(cache.parses, 20, "the second and third ticks parsed again");
+        // A changed expression is parsed again, and only that one.
+        let mut definition = crate::meat::job::JobDefinition::from_spec(record(1, 1).template);
+        definition.cron = Some(crate::meat::job::CronPolicy {
+            expression: "*/2 * * * *".into(),
+            overlap: Default::default(),
+            missed: Default::default(),
+        });
+        arrays
+            .apply(
+                &TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Put {
+                    name: "job-00".into(),
+                    namespace: "default".into(),
+                    definition: Box::new(definition),
+                    trigger: None,
+                    now_epoch_secs: 120,
+                })),
+                || 0,
+            )
+            .unwrap();
+        let due = due_schedules(&arrays, at, 3, None, &mut cache);
+        assert_eq!(cache.parses, 21);
+        // 03:00 is not an even minute: job-00 no longer matches.
+        assert!(!names(&due).contains(&"job-00"), "{:?}", names(&due));
     }
 
     fn quota_namespaces(cpu: &str) -> BTreeMap<String, crate::config::NamespaceSpec> {
@@ -3040,6 +3099,35 @@ mod tests {
         inputs.stuck = reports.stuck();
         let writes = plan_tick_reporting(&arrays, None, &inputs, &mut Vec::new());
         assert!(requeued(&writes), "{writes:?}");
+    }
+
+    /// #2532 (#2444's step 2): the first delivery carries the template
+    /// alone. The program, arguments and environment are derived from it,
+    /// so the node works them out instead of being sent them twice.
+    #[test]
+    fn a_first_delivery_carries_the_template_without_what_derives_from_it() {
+        let arrays = running_arrays(2);
+        let a = node("a");
+        let sent = TemplatesSent::default();
+        let request =
+            RequestPlan::read(&arrays, std::slice::from_ref(&a), &sent).request_for(&a, &sent);
+        for run in &request.arrays {
+            assert!(run.template.is_some() && !run.template_known);
+            assert!(run.program.as_os_str().is_empty(), "{:?}", run.program);
+            assert!(run.args.is_empty(), "{:?}", run.args);
+            assert!(run.env.is_empty(), "{:?}", run.env);
+        }
+        // What the node works out is what the leader used to send.
+        let mut derived = request.arrays[0].clone();
+        derived.derive_definition();
+        assert_eq!(derived.program.to_str(), Some("/usr/bin/render"));
+        assert_eq!(derived.args, ["frame", "{index}"]);
+        assert!(derived.env.contains(&("PLAIN".into(), "yes".into())));
+        assert!(
+            derived
+                .env
+                .contains(&("RELIABURGER_JOB_NAME".into(), "render-1".into()))
+        );
     }
 
     /// #2444: a node is sent each run's template once. Later requests

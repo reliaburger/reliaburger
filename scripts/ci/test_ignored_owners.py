@@ -192,6 +192,24 @@ class OwnerTests(unittest.TestCase):
     def test_every_ignored_test_in_this_repository_has_an_owner(self):
         self.assertEqual(ignored_owners.owner_problems(REPO), [])
 
+    def test_no_gated_test_returns_early_when_its_variable_is_missing(self):
+        # A gated test, once selected, fails when its prerequisite is missing:
+        # an early return reports a pass that tested nothing (#2490).
+        import re
+        pattern = re.compile(
+            r'env::var\("RELIABURGER_[A-Z_]+_TESTS"\)\.is_err\(\)\s*\{[^}]*return;'
+        )
+        self.assertIsNotNone(pattern.search(
+            'if std::env::var("RELIABURGER_CLUSTER_TESTS").is_err() {\n'
+            '    eprintln!("skipping");\n    return;\n}'
+        ))
+        offenders = [
+            str(path.relative_to(REPO))
+            for path in sorted(REPO.glob("tests/*.rs")) + sorted(REPO.glob("tests/support/*.rs"))
+            if pattern.search(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [])
+
     def test_every_bound_ci_test_in_this_repository_has_a_manifest_case(self):
         self.assertEqual(ignored_owners.manifest_problems(REPO), [])
 

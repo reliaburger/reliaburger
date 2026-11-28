@@ -673,10 +673,10 @@ name = "Snapshots and scheduled backups"
 status = "beta"
 since = "0.1.0"
 summary = "Instant copy-on-write snapshots of managed volumes, on a schedule, uploaded off the node."
-restrictions = "Btrfs only; other filesystems refuse snapshot commands. Test volumes have no snapshots. The uploader hasn't been qualified under power cuts."
+restrictions = "Btrfs only; other filesystems refuse snapshot commands. Test volumes have no snapshots."
 issues = [287]
 docs = ["docs/manual/11_images-and-volumes.md#snapshots"]
-evidence = "The soak schedules snapshots and uploads them to a directory (V02 fast tier, Configuration deviations). V02 leftovers (#287, Later): the snapshot uploader under power cuts."
+evidence = "The soak schedules snapshots and uploads them to a directory (V02 fast tier, Configuration deviations). Power cuts: the uploader passed 20 of 20 on Btrfs (23 November 2026); since 0.3.4 an archive at its key that isn't the archive is replaced, never counted. #287 stays open for the V02 loop reruns."
 
 [[group.feature]]
 name = "Moving volumes between nodes"

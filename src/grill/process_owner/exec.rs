@@ -6,9 +6,18 @@ use std::time::Instant;
 
 /// Maximum encoded owner request, including its newline.
 pub(crate) const REQUEST_LIMIT: usize = 64 * 1024;
-/// Bound for JSON-escaped output and response framing.
+/// Bound for JSON-escaped output and response framing: the longest reply is
+/// [`OUTPUT_LIMIT`] bytes, each escaped to at most six, plus the cut marker.
 pub(crate) const RESPONSE_LIMIT: u64 = 6 * 1024 * 1024 + 1024;
-const OUTPUT_LIMIT: u64 = 1024 * 1024;
+/// Most output an exec returns. Past it the output is cut (#2392).
+pub(crate) const OUTPUT_LIMIT: u64 = 1024 * 1024;
+/// The line that ends an exec's output once [`OUTPUT_LIMIT`] has cut it.
+pub(crate) const CUT_MARKER: &str = "[output cut at 1 MiB]\n";
+/// Most bytes an exec helper keeps of each stream: the limit, plus one byte
+/// that proves there was more.
+const KEPT_PER_STREAM: u64 = OUTPUT_LIMIT + 1;
+/// Name prefix of an exec helper's directory inside its workload owner's.
+const HELPER_PREFIX: &str = "exec-";
 const EXEC_LIMIT: usize = 16;
 /// How long the owner lets an exec run before it retires the command itself.
 ///
@@ -20,8 +29,9 @@ const EXEC_LIMIT: usize = 16;
 pub(crate) const OWNER_EXEC_DEADLINE: Duration = Duration::from_secs(320);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn cancel(_: nix::libc::c_int) {
+extern "C" fn cancel(signal: nix::libc::c_int) {
     CANCELLED.store(true, Ordering::Relaxed);
+    super::wake(signal);
 }
 
 /// Let a retained parent request group retirement without killing its owner.
@@ -72,7 +82,7 @@ impl Execution {
         }
         socket.set_nonblocking(true)?;
         let temporary = tempfile::Builder::new()
-            .prefix("exec-")
+            .prefix(HELPER_PREFIX)
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(parent)?;
         let mut nonce = [0u8; 16];
@@ -145,10 +155,12 @@ impl Execution {
         Ok(())
     }
 
+    /// The command's output as its caller sees it: the helper kept at most
+    /// [`KEPT_PER_STREAM`] bytes of each stream, and anything past
+    /// [`OUTPUT_LIMIT`] is cut.
     fn read_output(&self) -> io::Result<String> {
-        let mut output = String::new();
-        let mut total = 0;
-        for suffix in ["stdout", "stderr"] {
+        let mut streams = [Vec::new(), Vec::new()];
+        for (suffix, bytes) in ["stdout", "stderr"].into_iter().zip(&mut streams) {
             let file = OpenOptions::new()
                 .read(true)
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -156,19 +168,10 @@ impl Execution {
             if !file.metadata()?.is_file() {
                 return Err(io::Error::other("invalid exec output file"));
             }
-            let mut bytes = Vec::new();
-            file.take(OUTPUT_LIMIT + 1 - total)
-                .read_to_end(&mut bytes)?;
-            total += bytes.len() as u64;
-            if total > OUTPUT_LIMIT {
-                return Err(io::Error::other("exec output exceeds 1 MiB limit"));
-            }
-            if !output.is_empty() && !output.ends_with('\n') && !bytes.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(&String::from_utf8_lossy(&bytes));
+            file.take(KEPT_PER_STREAM).read_to_end(bytes)?;
         }
-        Ok(output)
+        let [stdout, stderr] = streams;
+        Ok(join_output(stdout, &stderr, false))
     }
 
     fn queue_reply(&mut self, value: serde_json::Value) -> io::Result<()> {
@@ -276,6 +279,101 @@ impl Drop for Execution {
     }
 }
 
+/// Join an exec's stdout and stderr into the text its caller gets: stdout,
+/// then stderr on a line of its own, cut at [`OUTPUT_LIMIT`] bytes. Cut
+/// output, or output whose capture was already `cut`, ends with
+/// [`CUT_MARKER`], so the caller sees the start of it and knows the rest is
+/// missing (#2392).
+pub(crate) fn join_output(mut output: Vec<u8>, stderr: &[u8], cut: bool) -> String {
+    if !output.is_empty() && !output.ends_with(b"\n") && !stderr.is_empty() {
+        output.push(b'\n');
+    }
+    output.extend_from_slice(stderr);
+    let limit = OUTPUT_LIMIT as usize;
+    let cut = cut || output.len() > limit;
+    output.truncate(limit);
+    let mut output = String::from_utf8_lossy(&output).into_owned();
+    if cut {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(CUT_MARKER);
+    }
+    output
+}
+
+/// Whether `directory` is an exec helper's: one [`Execution::launch`] made
+/// inside a workload owner's directory. Its owner bounds what the command
+/// writes; a workload owner's capture is unbounded and reclaimed by Ketchup.
+pub(super) fn is_helper_directory(directory: &Path) -> bool {
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(HELPER_PREFIX))
+        && directory
+            .parent()
+            .is_some_and(|parent| parent.join("owner.json").is_file())
+}
+
+/// One output stream of an exec helper's command: a pipe the helper drains
+/// into its file, keeping the first [`KEPT_PER_STREAM`] bytes and dropping
+/// the rest (#2392). Draining on past the cap keeps the command from
+/// blocking on a full pipe; the file never grows past it, so a chatty
+/// command can't fill the node's disk.
+pub(super) struct OutputDrain {
+    /// The pipe's read end, until the command's side closes.
+    source: Option<std::io::PipeReader>,
+    file: File,
+    kept: u64,
+}
+
+impl OutputDrain {
+    /// A drain from a fresh pipe into `file`, and the write end for the
+    /// command.
+    pub(super) fn new(file: File) -> io::Result<(Self, std::io::PipeWriter)> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let (source, sink) = std::io::pipe()?;
+        // Never block the single-threaded owner on a quiet command.
+        fcntl(&source, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+        let drain = Self {
+            source: Some(source),
+            file,
+            kept: 0,
+        };
+        Ok((drain, sink))
+    }
+
+    /// The pipe to wait on while the command may still write to it.
+    pub(super) fn source(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.source.as_ref().map(AsFd::as_fd)
+    }
+
+    /// Move whatever the pipe holds now into the file, up to the cap.
+    ///
+    /// Never fails: the owner must outlive a full disk or a broken pipe.
+    /// A write that fails stops the keeping, and the rest is dropped as if
+    /// past the cap; a read that fails ends the stream.
+    pub(super) fn drain(&mut self) {
+        let mut buffer = [0u8; 64 * 1024];
+        while let Some(source) = self.source.as_mut() {
+            match source.read(&mut buffer) {
+                Ok(0) => self.source = None,
+                Ok(read) => {
+                    let room = (KEPT_PER_STREAM - self.kept).min(read as u64) as usize;
+                    self.kept = match self.file.write_all(&buffer[..room]) {
+                        Ok(()) => self.kept + room as u64,
+                        Err(_) => KEPT_PER_STREAM,
+                    };
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => self.source = None,
+            }
+        }
+    }
+}
+
 /// Progress every command without letting one stalled caller block the owner.
 pub(super) fn poll(pending: &mut Vec<Execution>, parent_stopped: bool) -> io::Result<bool> {
     let mut index = 0;
@@ -318,7 +416,7 @@ pub(crate) fn describe_helpers(parent: &Path) -> String {
             .filter_map(|entry| {
                 let name = entry.file_name().into_string().ok()?;
                 let is_directory = entry.file_type().ok()?.is_dir();
-                (is_directory && name.starts_with("exec-")).then(|| (name, entry.path()))
+                (is_directory && name.starts_with(HELPER_PREFIX)).then(|| (name, entry.path()))
             })
             .collect(),
         Err(error) => return format!("exec helpers unreadable ({error})"),

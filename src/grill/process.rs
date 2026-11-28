@@ -270,6 +270,30 @@ impl Drop for ProcessEntry {
     }
 }
 
+/// Read `stream` to its end, keeping the first exec-limit bytes, and say
+/// whether anything past them was dropped. Reading on drains the pipe, so
+/// the command never blocks on it.
+async fn read_capped(
+    stream: Option<impl tokio::io::AsyncRead + Unpin>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let limit = super::process_owner::exec::OUTPUT_LIMIT as usize;
+    let mut kept = Vec::new();
+    let mut cut = false;
+    let Some(mut stream) = stream else {
+        return Ok((kept, cut));
+    };
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((kept, cut));
+        }
+        let room = (limit - kept.len()).min(read);
+        kept.extend_from_slice(&buffer[..room]);
+        cut |= room < read;
+    }
+}
+
 use super::records::poll_adopted_process;
 
 /// Signal only an adopted process whose recorded identity still matches.
@@ -1406,30 +1430,34 @@ impl super::Grill for ProcessGrill {
         // Spawn the command directly (no namespace entry for ProcessGrill)
         // A caller's timeout drops this future (a pre-stop command's bound,
         // #1121); the command mustn't outlive it.
-        let output = Command::new(&command[0])
+        let failed = |error: std::io::Error| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("exec failed: {error}"),
+        };
+        let mut child = Command::new(&command[0])
             .args(&command[1..])
             .env_clear()
             .envs(environment)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("exec failed: {e}"),
-            })?;
-
-        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&stderr);
-        }
+            .spawn()
+            .map_err(failed)?;
+        // Keep at most the exec limit of each stream and drop the rest, so a
+        // chatty command can't fill Bun's memory (#2392).
+        let ((stdout, stdout_cut), (stderr, stderr_cut), status) = tokio::try_join!(
+            read_capped(child.stdout.take()),
+            read_capped(child.stderr.take()),
+            child.wait(),
+        )
+        .map_err(failed)?;
+        let result =
+            super::process_owner::exec::join_output(stdout, &stderr, stdout_cut || stderr_cut);
         Ok(super::ExecOutput {
             output: result,
             // A signal-killed command has no code; report a plain failure.
-            exit_code: output.status.code().unwrap_or(1),
+            exit_code: status.code().unwrap_or(1),
         })
     }
 
@@ -2352,6 +2380,39 @@ mod tests {
             "{private} leaked: {env}"
         );
         assert_eq!(resolved.unwrap().output.trim(), "found");
+    }
+
+    /// #2392: past 1 MiB an exec's output is cut, and the caller gets the
+    /// first mebibyte and a marker, not an error and nothing.
+    #[tokio::test]
+    async fn exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned() {
+        const MEBIBYTE: usize = 1024 * 1024;
+        let marker = "[output cut at 1 MiB]\n";
+        let grill = ProcessGrill::new();
+        let id = InstanceId("exec-cut-1".to_string());
+        grill.create(&id, &sleep_spec("30")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let result = grill
+            .exec(
+                &id,
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 4194304 /dev/zero | tr '\\0' 'a'".into(),
+                ],
+            )
+            .await;
+        grill.kill(&id).await.unwrap();
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, 0);
+        let output = result.output;
+        assert!(output.len() > MEBIBYTE, "{} bytes", output.len());
+        assert!(
+            output.len() <= MEBIBYTE + 1 + marker.len(),
+            "{} bytes",
+            output.len()
+        );
+        assert!(output.ends_with(marker), "not cut");
     }
 
     #[tokio::test]

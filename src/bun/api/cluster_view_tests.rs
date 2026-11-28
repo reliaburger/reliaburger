@@ -160,7 +160,7 @@ impl Setup {
             self.cmd_tx,
             None,
             None,
-            Some(Arc::new(RwLock::new(self.history))),
+            Some(Arc::new(RwLock::new(self.history.into_iter().collect()))),
             None,
             None,
             self.council,

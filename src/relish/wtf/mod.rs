@@ -17,10 +17,11 @@ pub use model::{
     AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
     CertificateObservation, ClusterEvidence, CorrelatedEvent, CouncilObservation,
     CpuThrottleObservation, DeployObservation, DiskObservation, Evidence, ExportHoldObservation,
-    FaultObservation, GitOpsObservation, IsolationObservation, LaunchFailureObservation,
-    LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-    TokenObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
+    FaultObservation, GitOpsObservation, ImageCollectionObservation, IsolationObservation,
+    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
+    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, TokenObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary,
+    WtfUnknown,
 };
 
 /// Current serialised `wtf` report contract.

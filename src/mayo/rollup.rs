@@ -102,6 +102,25 @@ pub enum QueryWarning {
     /// node's newest `limit` rows and older ones in the range are missing
     /// (#2477).
     Truncated { node_id: String, limit: usize },
+    /// A live member that should report rollups has sent none for the last
+    /// [`SILENT_AFTER_SECS`](super::query_fanout::SILENT_AFTER_SECS) of the
+    /// window, so its share of the sums is missing (#2536). `last_seen` is
+    /// the newest rollup window (unix seconds) any council member holds from
+    /// it, `None` when none holds one.
+    NodeSilent {
+        node_id: String,
+        last_seen: Option<u64>,
+    },
+}
+
+/// The newest rollup window one council member holds from one node, so a
+/// cluster query can tell a node that stopped reporting (#2536).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollupReporter {
+    /// The node that sent the rollups.
+    pub node_id: String,
+    /// Start of its newest window (unix seconds).
+    pub last_window: u64,
 }
 
 /// Result of a metrics query, including data and any warnings.

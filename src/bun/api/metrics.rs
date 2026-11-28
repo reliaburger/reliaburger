@@ -342,6 +342,58 @@ pub(super) async fn metrics_owned_rollup_handler(
     }
 }
 
+/// `GET /v1/metrics/rollup/reporters`: the newest rollup window this
+/// aggregator holds from each node (#2536). The entry node of a cluster query
+/// asks every council member, to name a node that stopped reporting.
+pub(super) async fn metrics_rollup_reporters_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(store) = &state.rollup_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no rollup store configured",
+        )
+            .into_response();
+    };
+    Json(store.read().await.reporters()).into_response()
+}
+
+/// The nodes a cluster metric query expects rollups from: the members gossip
+/// calls live, with when each joined as far as this node knows (#2536).
+/// Empty without the member table, so nobody is called silent.
+async fn expected_reporters(
+    known: Option<&crate::bun::api::KnownMembers>,
+    now: u64,
+) -> Vec<crate::mayo::query_fanout::ExpectedReporter> {
+    let Some(known) = known else {
+        return Vec::new();
+    };
+    known
+        .live_since()
+        .await
+        .into_iter()
+        .map(
+            |(node_id, joined)| crate::mayo::query_fanout::ExpectedReporter {
+                node_id: node_id.0,
+                joined: now.saturating_sub(joined.elapsed().as_secs()),
+            },
+        )
+        .collect()
+}
+
 /// Resolve the base URLs of every council aggregator (Raft voter) from the
 /// live gossip membership.
 ///
@@ -387,8 +439,12 @@ pub(super) const CLUSTER_METRICS_DEFAULT_WINDOW_SECS: u64 = 60 * 60;
 /// deduplicates worker contributions before summing, and returns the combined data
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
+///
+/// A live member whose rollups stopped reaching the council is named
+/// `QueryWarning::NodeSilent` (#2536).
 pub(super) async fn metrics_cluster_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    known: Option<axum::Extension<crate::bun::api::KnownMembers>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
@@ -404,11 +460,11 @@ pub(super) async fn metrics_cluster_handler(
     {
         return resp;
     }
-    let start = params.start.unwrap_or_else(|| {
-        crate::mayo::types::Sample::now(0.0)
-            .timestamp
-            .saturating_sub(CLUSTER_METRICS_DEFAULT_WINDOW_SECS)
-    });
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    let start = params
+        .start
+        .unwrap_or_else(|| now.saturating_sub(CLUSTER_METRICS_DEFAULT_WINDOW_SECS));
+    let expected = expected_reporters(known.as_deref(), now).await;
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
     // full-domain unsigned range like `timestamp <= u64::MAX`.
@@ -431,6 +487,8 @@ pub(super) async fn metrics_cluster_handler(
             state.cluster_http.client(),
             timeout,
             state.service_token.as_deref(),
+            &expected,
+            now,
         )
         .await;
         return Json(result).into_response();
@@ -459,7 +517,14 @@ pub(super) async fn metrics_cluster_handler(
         .await;
     match result {
         Ok(rows) => {
-            Json(crate::mayo::query_fanout::merge_owned_rollups(vec![rows])).into_response()
+            let mut answer = crate::mayo::query_fanout::merge_owned_rollups(vec![rows]);
+            let heard = rollup_store.read().await.reporters();
+            answer
+                .warnings
+                .extend(crate::mayo::query_fanout::silent_reporters(
+                    &expected, &heard, start, end, now,
+                ));
+            Json(answer).into_response()
         }
         Err(e) => metrics_store_error(e),
     }

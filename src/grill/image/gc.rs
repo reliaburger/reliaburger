@@ -8,7 +8,7 @@
 //! The functions are synchronous: [`super::ImageStore::collect_rootfs_garbage`]
 //! runs them on a blocking thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -26,6 +26,140 @@ pub struct RootfsGcReport {
     pub manifests_removed: usize,
     /// Pin metadata files no remaining pinned image refers to.
     pub metadata_removed: usize,
+}
+
+/// Why a node's last image collection pass didn't do its work (#2524).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionProblem {
+    /// The pass couldn't tell which generations instances use (a bundle's
+    /// spec it couldn't read), so it removed nothing.
+    Refused,
+    /// The pass started and failed partway, on a filesystem error.
+    Failed,
+}
+
+/// What `relish images` and `relish wtf` read about one node's image
+/// store: where it is, and whether its collection passes keep failing.
+/// Clones share one record.
+///
+/// A std mutex: it's held only to read or replace one small value, in
+/// synchronous code, never across an `.await`.
+#[derive(Debug, Clone, Default)]
+pub struct ImageStoreStatus {
+    root: Option<PathBuf>,
+    problem: std::sync::Arc<std::sync::Mutex<Option<(CollectionProblem, u64)>>>,
+}
+
+// Two handles are equal when they share one record. Needed because the
+// diagnostics' static evidence compares equal by value.
+impl PartialEq for ImageStoreStatus {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.problem, &other.problem)
+    }
+}
+
+impl Eq for ImageStoreStatus {}
+
+impl ImageStoreStatus {
+    pub(super) fn new(root: PathBuf) -> Self {
+        Self {
+            root: Some(root),
+            problem: std::sync::Arc::default(),
+        }
+    }
+
+    /// Record how a pass at `now` (Unix seconds) went: a problem starts (or
+    /// continues, keeping when it started) a record, `None` clears it.
+    pub(super) fn record(&self, problem: Option<CollectionProblem>, now: u64) {
+        let mut current = self
+            .problem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = match (problem, *current) {
+            (None, _) => None,
+            (Some(problem), Some((same, since))) if same == problem => Some((problem, since)),
+            (Some(problem), _) => Some((problem, now)),
+        };
+    }
+
+    /// The problem the passes have had since when, if the last one had one.
+    pub fn problem(&self) -> Option<(CollectionProblem, u64)> {
+        *self
+            .problem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Bytes on disk of each image unpacked here, keyed by the manifest
+    /// digest it was pulled by (`sha256:…`), every generation of it
+    /// summed. An image pulled by tag, and a generation published before
+    /// sizes were recorded, aren't counted. Reads one marker per
+    /// generation, on a blocking thread.
+    pub async fn unpacked_sizes(&self) -> io::Result<HashMap<String, u64>> {
+        let Some(root) = self.root.clone() else {
+            return Ok(HashMap::new());
+        };
+        tokio::task::spawn_blocking(move || unpacked_sizes(&root.join("rootfs")))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Total bytes of every generation whose size is recorded.
+    pub async fn unpacked_total(&self) -> io::Result<u64> {
+        Ok(self.unpacked_sizes().await?.values().sum())
+    }
+}
+
+/// The marker a published generation gets: its unpacked size on the
+/// second line, so listing sizes never walks a tree.
+pub(super) fn marker_contents(bytes: u64) -> Vec<u8> {
+    format!("complete\n{bytes}\n").into_bytes()
+}
+
+/// The size a generation's marker records, if it records one.
+fn recorded_size(generation: &Path) -> Option<u64> {
+    let marker = std::fs::read_to_string(generation.with_extension("complete")).ok()?;
+    marker.lines().nth(1)?.trim().parse().ok()
+}
+
+/// Bytes of file content under `tree`, not following symlinks.
+pub(super) fn tree_bytes(tree: &Path) -> io::Result<u64> {
+    let mut total = 0u64;
+    let mut pending = vec![tree.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                total = total.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn unpacked_sizes(rootfs: &Path) -> io::Result<HashMap<String, u64>> {
+    let mut sizes = HashMap::new();
+    for generation in generations(rootfs)? {
+        let Some(size) = recorded_size(&generation) else {
+            continue;
+        };
+        // `rootfs_path` encodes the digest's colon.
+        let Some(digest) = generation
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(|name| name.replace("%3A", ":"))
+            .filter(|name| name.starts_with("sha256:"))
+        else {
+            continue;
+        };
+        *sizes.entry(digest).or_insert(0) += size;
+    }
+    Ok(sizes)
 }
 
 /// Whether a directory name is one [`super::ImageStore::rootfs_generation_path`]

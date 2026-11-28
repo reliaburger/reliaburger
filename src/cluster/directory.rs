@@ -39,7 +39,10 @@ use crate::mustard::directory::NodeDirectory;
 /// every node holds, so a hint proves nothing about the node it names: the
 /// reporting epoch only gates anything on the leader, which is a member,
 /// and a seatless node fetches its security state only from a voter of the
-/// council it knows, over TLS bound to that voter (#2406).
+/// council it knows, over TLS bound to that voter (#2406). A forged hint
+/// nobody re-advertises also expires after
+/// [`LEADER_HINT_EXPIRY`](crate::mustard::directory::LEADER_HINT_EXPIRY), so
+/// it can't outrank the real leader on a seatless node for good.
 pub const MAX_LEADER_HINT_TERM_LEAD: u64 = 10;
 
 /// Where a [`LeaderView`] came from.
@@ -360,6 +363,21 @@ mod tests {
     fn no_leader_anywhere_resolves_to_none() {
         assert!(resolve_leader_view(None, &NodeDirectory::default(), None, 2, 1).is_none());
         assert!(resolve_leader_view(None, &NodeDirectory::default(), Some(0), 2, 1).is_none());
+    }
+
+    /// #2406: a hint with term `u64::MAX` that nobody re-advertises stops
+    /// outranking the real leader on a node outside Raft once it expires.
+    #[test]
+    fn a_node_outside_raft_does_not_follow_an_unbounded_hint_for_ever() {
+        use crate::mustard::directory::LEADER_HINT_EXPIRY;
+        use std::time::{Duration, Instant};
+        let mut directory = NodeDirectory::default();
+        let t0 = Instant::now();
+        directory.observe_hint_at(&hint("attacker", u64::MAX, 9900, 9901), Duration::ZERO, t0);
+        let later = t0 + LEADER_HINT_EXPIRY + Duration::from_secs(1);
+        directory.observe_hint_at(&hint("leader", 12, 9117, 9445), Duration::ZERO, later);
+        let view = resolve_leader_view(None, &directory, None, 0, 0).unwrap();
+        assert_eq!(view.node_id, NodeId::new("leader"));
     }
 
     // #1996: beyond the council cap a node never joins Raft. Its metrics

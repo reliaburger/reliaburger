@@ -1819,6 +1819,7 @@ async fn deleting_a_tag_untags_and_expiry_reclaims_layers() {
         retain_days: 0,
         node_id: 1,
         orphan_grace: Duration::ZERO,
+        pinned_digests: Default::default(),
     };
     let catalog = registry.state.catalog.read().await.clone();
     let nominated = gc_candidates(

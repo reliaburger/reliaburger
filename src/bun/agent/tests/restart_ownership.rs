@@ -257,6 +257,63 @@ async fn a_state_sweep_reads_in_parallel_under_one_deadline() {
     );
 }
 
+/// Past its deadline a sweep starts no more reads (#2457). It used to
+/// spawn every read still queued, each timing out at once, so a slow node
+/// got one runtime call per instance in one burst.
+#[tokio::test]
+async fn a_state_sweep_starts_no_more_than_its_limit_after_the_deadline() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 40)).await);
+    let reads = agent.plan_state_reads(|_| true);
+    assert_eq!(reads.len(), 40);
+    grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_secs(30)));
+    let before = grill.calls().len();
+
+    let sweep =
+        state_sweep::sweep_states(grill.clone(), reads, state_sweep::UnfinishedReads::new()).await;
+    // Let any read spawned at the deadline reach the runtime.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = grill.calls()[before..]
+        .iter()
+        .filter(|(operation, _)| operation == "state")
+        .count();
+    sweep.unfinished.abort_all();
+    assert!(
+        started <= state_sweep::STATE_READ_CONCURRENCY,
+        "{started} reads started"
+    );
+}
+
+/// When reads are slow, the instances one sweep had no time for go first in
+/// the next, so the tail of a long plan isn't starved sweep after sweep.
+#[tokio::test]
+async fn every_instance_is_read_within_a_few_slow_sweeps() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 40)).await);
+    let reads = agent.plan_state_reads(|_| true);
+    grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_millis(400)));
+
+    let mut seen = std::collections::HashSet::new();
+    let mut unfinished = state_sweep::UnfinishedReads::new();
+    for _ in 0..5 {
+        let sweep = state_sweep::sweep_states(grill.clone(), reads.clone(), unfinished).await;
+        for (read, observed) in &sweep.observations {
+            if *observed == state_sweep::Observed::Alive {
+                seen.insert(read.id.clone());
+            }
+        }
+        unfinished = sweep.unfinished;
+    }
+    unfinished.abort_all();
+    assert_eq!(
+        seen.len(),
+        40,
+        "only {} instances were ever read",
+        seen.len()
+    );
+}
+
 /// A read that outlasts the sweep's deadline isn't abandoned and asked
 /// again (#2085). On runc an abandoned read kept running and held the
 /// instance's lifecycle lock, so each later sweep's read queued behind it

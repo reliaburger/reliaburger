@@ -80,10 +80,28 @@ pub(super) enum Observed {
     Unknown,
 }
 
-/// Reads a sweep was still waiting for at its deadline, by instance, each
-/// with the incarnation it reads.
-pub(super) type UnfinishedReads =
-    std::collections::HashMap<InstanceId, (Incarnation, tokio::task::JoinHandle<Observed>)>;
+/// What one sweep leaves the next: the reads it was still waiting for at
+/// its deadline, by instance, each with the incarnation it reads, and the
+/// instances it had no time to start a read for.
+#[derive(Debug, Default)]
+pub(super) struct UnfinishedReads {
+    running:
+        std::collections::HashMap<InstanceId, (Incarnation, tokio::task::JoinHandle<Observed>)>,
+    not_started: std::collections::HashSet<InstanceId>,
+}
+
+impl UnfinishedReads {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel every read still running.
+    pub(super) fn abort_all(self) {
+        for (_, task) in self.running.into_values() {
+            task.abort();
+        }
+    }
+}
 
 /// Everything one sweep saw, in the order it was planned.
 #[derive(Debug)]
@@ -95,7 +113,8 @@ pub(super) struct StateSweep {
 
 /// Read every planned instance's state, [`STATE_READ_CONCURRENCY`] at a
 /// time, waiting for whatever hasn't answered only until
-/// [`STATE_SWEEP_DEADLINE`]. A read of the same incarnation that an earlier
+/// [`STATE_SWEEP_DEADLINE`]. No read starts after the deadline: those left
+/// come back `Unknown` and go first next time. A read of the same incarnation that an earlier
 /// sweep left `unfinished` is waited on again instead of started afresh;
 /// one for an instance no longer planned, or since restarted, is cancelled.
 pub(super) async fn sweep_states<G: Grill + Clone + 'static>(
@@ -104,30 +123,51 @@ pub(super) async fn sweep_states<G: Grill + Clone + 'static>(
     mut unfinished: UnfinishedReads,
 ) -> StateSweep {
     let deadline = tokio::time::Instant::now() + STATE_SWEEP_DEADLINE;
-    let reads: Vec<_> = reads
+    let mut reads: Vec<_> = reads
         .into_iter()
         .map(|read| {
             let earlier = unfinished
+                .running
                 .remove(&read.id)
                 .filter(|(incarnation, _)| *incarnation == read.incarnation)
                 .map(|(_, task)| task);
             (read, earlier)
         })
         .collect();
-    for (_, task) in unfinished.into_values() {
-        task.abort();
-    }
+    // Reads already running go first, then the instances the last sweep
+    // had no time for, so a slow runtime doesn't starve the plan's tail.
+    // `sort_by_key` is stable: within each group the plan's order stays.
+    reads.sort_by_key(|(read, earlier)| {
+        if earlier.is_some() {
+            0
+        } else if unfinished.not_started.contains(&read.id) {
+            1
+        } else {
+            2
+        }
+    });
+    unfinished.abort_all();
     let results: Vec<_> = futures_util::stream::iter(reads)
         .map(|(read, earlier)| {
             let grill = grill.clone();
             async move {
-                let mut task = earlier.unwrap_or_else(|| {
-                    let id = read.id.clone();
-                    tokio::spawn(async move { observe(&grill, &id).await })
-                });
+                let mut task = match earlier {
+                    Some(task) => task,
+                    // Past the deadline every new read would time out on
+                    // its first poll and free its slot for the next, so
+                    // the limit would hold no longer (#2457). The rest
+                    // wait for the next sweep instead.
+                    None if tokio::time::Instant::now() >= deadline => {
+                        return (read, Observed::Unknown, Pending::NotStarted);
+                    }
+                    None => {
+                        let id = read.id.clone();
+                        tokio::spawn(async move { observe(&grill, &id).await })
+                    }
+                };
                 match tokio::time::timeout_at(deadline, &mut task).await {
-                    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
-                    Err(_) => (read, Observed::Unknown, Some(task)),
+                    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), Pending::Done),
+                    Err(_) => (read, Observed::Unknown, Pending::Running(task)),
                 }
             }
         })
@@ -138,15 +178,33 @@ pub(super) async fn sweep_states<G: Grill + Clone + 'static>(
         observations: Vec::with_capacity(results.len()),
         unfinished: UnfinishedReads::new(),
     };
-    for (read, observed, task) in results {
-        if let Some(task) = task {
-            sweep
-                .unfinished
-                .insert(read.id.clone(), (read.incarnation, task));
+    for (read, observed, pending) in results {
+        match pending {
+            Pending::Done => {}
+            Pending::Running(task) => {
+                sweep
+                    .unfinished
+                    .running
+                    .insert(read.id.clone(), (read.incarnation, task));
+            }
+            Pending::NotStarted => {
+                sweep.unfinished.not_started.insert(read.id.clone());
+            }
         }
         sweep.observations.push((read, observed));
     }
     sweep
+}
+
+/// Where one planned read stands when its sweep ends.
+enum Pending {
+    /// It answered, or failed, in time.
+    Done,
+    /// It is still running; the next sweep waits on it.
+    Running(tokio::task::JoinHandle<Observed>),
+    /// The deadline came before it could start; the next sweep starts it
+    /// first.
+    NotStarted,
 }
 
 async fn observe<G: Grill>(grill: &G, id: &InstanceId) -> Observed {
@@ -203,9 +261,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let reads = self.plan_state_reads(|_| true);
         if reads.is_empty() {
-            for (_, task) in std::mem::take(&mut self.unfinished_state_reads).into_values() {
-                task.abort();
-            }
+            std::mem::take(&mut self.unfinished_state_reads).abort_all();
             return;
         }
         let grill = self.supervisor.grill().clone();

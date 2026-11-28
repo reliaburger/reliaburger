@@ -6,10 +6,11 @@
 /// least 6 (see `broadcast_count`), which is enough for O(log N)
 /// convergence across the whole cluster.
 ///
-/// The queue sends this node's own refutations first, then
+/// The queue sends urgent updates first (an `Alive` that overturns a
+/// failure claim: a refutation, or a restarted node's return), then
 /// failure-related updates (Dead, Suspect), then joins (Alive), so a
-/// falsely suspected node clears its name before anything else goes out
-/// and failures propagate faster than joins. A newer update about a node
+/// falsely suspected node's name is cleared at every hop before anything
+/// else goes out, and failures propagate faster than joins. A newer update about a node
 /// supersedes an older one still queued, which is then never sent.
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -25,8 +26,9 @@ struct QueuedUpdate {
     update: MembershipUpdate,
     /// How many more times this update should be piggybacked.
     remaining_broadcasts: u32,
-    /// Whether this is the local node refuting a claim about itself.
-    refutation: bool,
+    /// Whether this update goes ahead of everything else: an `Alive` that
+    /// overturns a failure claim (#696, #2441).
+    urgent: bool,
 }
 
 /// How SWIM ranks two updates about the same node: incarnation first, then
@@ -48,12 +50,12 @@ impl PartialEq for QueuedUpdate {
     }
 }
 
-/// Priority ordering: our own refutation first, then higher dissemination
+/// Priority ordering: urgent updates first, then higher dissemination
 /// priority, then more remaining broadcasts (fresher updates).
 impl Ord for QueuedUpdate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.refutation
-            .cmp(&other.refutation)
+        self.urgent
+            .cmp(&other.urgent)
             .then_with(|| {
                 self.update
                     .state
@@ -143,15 +145,20 @@ impl DisseminationQueue {
         self.push(update, cluster_size, false);
     }
 
-    /// Enqueue this node's own refutation (Alive about itself at a raised
-    /// incarnation). It goes out ahead of every other update, Dead and
-    /// Suspect included: a node that peers suspect has the most to lose
-    /// from waiting behind a backlog, and nobody else can clear its name.
-    pub fn enqueue_refutation(&mut self, update: MembershipUpdate, cluster_size: usize) {
+    /// Enqueue an `Alive` that overturns a failure claim, ahead of every
+    /// other update, Dead and Suspect included: a node's own refutation, or
+    /// a relayed one (a member this node held Suspect, Dead or Left, now
+    /// Alive at a higher incarnation). A node that peers suspect has the
+    /// most to lose from waiting behind a backlog, and that holds at every
+    /// hop, not only its own: a relay that queued the refutation behind a
+    /// rack failure's rumours passed it on only after the suspicion timers
+    /// had run out (#2441). A plain join stays at normal priority, or a
+    /// mass join would starve failure news.
+    pub fn enqueue_urgent(&mut self, update: MembershipUpdate, cluster_size: usize) {
         self.push(update, cluster_size, true);
     }
 
-    fn push(&mut self, update: MembershipUpdate, cluster_size: usize, refutation: bool) {
+    fn push(&mut self, update: MembershipUpdate, cluster_size: usize, urgent: bool) {
         let update_rank = rank(&update);
         // Look up before inserting, so the common case (a node we already
         // track) doesn't clone its id.
@@ -175,7 +182,7 @@ impl DisseminationQueue {
         self.queue.push(QueuedUpdate {
             update,
             remaining_broadcasts: broadcasts,
-            refutation,
+            urgent,
         });
         // Scale the trigger with the cluster: one queued update per member is
         // normal, so compacting at a flat threshold would fire constantly on a
@@ -374,7 +381,7 @@ mod tests {
         QueuedUpdate {
             update: u,
             remaining_broadcasts: 3,
-            refutation: false,
+            urgent: false,
         }
     }
 
@@ -423,10 +430,28 @@ mod tests {
         }
         let mut refutation = update("me", NodeState::Alive);
         refutation.incarnation = 2;
-        queue.enqueue_refutation(refutation.clone(), 100);
+        queue.enqueue_urgent(refutation.clone(), 100);
 
         let selected = queue.select_updates_within(usize::MAX, 1);
         assert_eq!(selected, vec![refutation]);
+    }
+
+    /// #2441: what a relay does with a refutation it hears. Before, it went
+    /// in with plain `enqueue`, behind sixteen Dead rumours that each had
+    /// 21 broadcasts left.
+    #[test]
+    fn an_alive_that_overturns_a_failure_goes_out_before_unrelated_failures() {
+        let mut queue = DisseminationQueue::new();
+        for i in 0..16 {
+            queue.enqueue(update(&format!("n{i}"), NodeState::Dead), 100);
+        }
+        queue.enqueue(update("h", NodeState::Suspect), 100);
+        let mut alive = update("h", NodeState::Alive);
+        alive.incarnation = 2;
+        queue.enqueue_urgent(alive.clone(), 100);
+
+        let selected = queue.select_updates_within(usize::MAX, MAX_PIGGYBACK_UPDATES);
+        assert_eq!(selected.first(), Some(&alive));
     }
 
     #[test]

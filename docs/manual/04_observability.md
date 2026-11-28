@@ -100,6 +100,7 @@ max_storage_mb = 2048             # default; 0 = no size cap
 
 [metrics]
 max_storage_mb = 1024             # default; 0 = no size cap
+export_path = "s3://bucket/metrics/" # optional, as for logs
 ```
 
 Both stores are capped by size as well as age. Past the cap, Bun prunes the
@@ -163,7 +164,8 @@ explains that a later export may repeat them.
 ## Metrics
 
 Every node collects its own system metrics and each workload's CPU and memory
-every 10 seconds, and keeps them for 7 days (`[metrics] retention_days`).
+every 10 seconds (`[metrics] collection_interval_secs`), and keeps them for 7
+days (`[metrics] retention_days`).
 The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
 `relish top` is a one-shot table of every workload on every node: node, app,
 namespace, state, PID, restarts, and the latest CPU and memory sample each
@@ -193,6 +195,10 @@ seconds is refused with a 400 asking for a narrower range.
 member that refuses a range (more than 200,000 node-minute contributions, or
 one minute holding more than 10,000) shows up in the answer's `warnings` as
 `QueryRefused` with its reason, not as an unresponsive node.
+A live node whose rollups haven't reached the council for five minutes is
+named as `NodeSilent`, with when its last rollup arrived (`last_seen`, or
+none): its share of the sums is missing. A node that joined in the last five
+minutes isn't expected to have reported yet.
 `/v1/metrics/app/{app}/{namespace}` (what `relish metrics` reads) asks each
 node running the app for its newest 10,000 rows in the range. A node whose
 answer reached that limit is named in `warnings` as `Truncated`, and `relish`
@@ -232,7 +238,7 @@ prove node ownership, and no automatic migration assigns them to a node.
 ### Your app's own metrics
 
 An app that serves Prometheus text declares it, and each node scrapes its own
-instances every 10 seconds. You don't install Prometheus, and the metrics port
+instances every 10 seconds (`[metrics] app_scrape_interval_secs`). You don't install Prometheus, and the metrics port
 needn't be published:
 
 ```toml
@@ -287,12 +293,13 @@ client library's `process_cpu_seconds_total`, keep their names.
 There's no PromQL. You read metrics through `relish metrics`, the dashboards
 and the API. For something that isn't an app on the cluster, such as a node
 exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
-`url`; they're scraped every 30 seconds.
+`url`; they're scraped every 30 seconds (`[metrics] scrape_interval_secs`).
 
 ### Alerts
 
 Each node evaluates four built-in rules against its own metrics every 30
-seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
+seconds (`[alerts] evaluation_interval_secs`; `[metrics] alerts_enabled = false`
+turns them off): CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 (critical); memory above 70% for 10 minutes and disk above 80% for 5 minutes
 (warning). An idle node raises nothing: low CPU is spare capacity, not a fault.
 The rules read only the node's own series, never one with an `app` label. A

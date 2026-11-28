@@ -1,5 +1,9 @@
 # Wrapper: Built-In Ingress Proxy
 
+**Status:** Partly shipped (see the v1 contract note below).
+**Reconciled against:** not reconciled
+**Sketches:** ACME in §5.3 and §8.2, the keys marked planned in §6.1, §13
+
 > **Current v1 contract (2026-07-22):** Wrapper supports plain HTTP,
 > `tls = "cluster"` using the Sesame Ingress CA, and `tls = "explicit"`
 > using the certificate/key configured on the node. Omitting `tls` means

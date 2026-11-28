@@ -131,6 +131,17 @@ pub const CHECKS: &[CheckKind] = &[
         manual: "observability",
     },
     CheckKind {
+        id: "images",
+        findings: &["image-collection-failing"],
+        sources: &["image_collection"],
+        tests: "Asks every node whether its last image collection pass failed or was \
+                refused. A node that can't collect never removes an unpacked image, so each \
+                one is a warning. With every pass working there's no row; how full the \
+                images filesystem is, the disks check says.",
+        docs: "11_images-and-volumes.md#unpacked-images",
+        manual: "images-and-volumes",
+    },
+    CheckKind {
         id: "certificates",
         findings: &["cert-expired", "cert-expiring"],
         sources: &["certificates", "certificate_rotation"],

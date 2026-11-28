@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::grill::image::ImageReference;
-use crate::pickle::types::{Digest, ManifestCatalog};
+use crate::pickle::types::{Digest, LayerDescriptor, ManifestCatalog};
 use crate::pickle::upstream::{UpstreamRegistry, cached_repository};
 
 /// How long an apply waits for an upstream registry to name a tag's digest
@@ -65,6 +65,15 @@ pub enum BindError {
         "{image} doesn't exist or isn't visible to this node: {reason}; check its name and tag"
     )]
     NoSuchImage { image: String, reason: String },
+    /// A layer of the image uses a compression no node can unpack (#2528).
+    #[error(
+        "{image}: layer {layer} has media type {media_type}, which no node can unpack; rebuild the image with gzip, zstd or uncompressed layers"
+    )]
+    Unpackable {
+        image: String,
+        layer: String,
+        media_type: String,
+    },
     /// The node's upstream trust rules don't allow the image (F03 U2).
     #[error(transparent)]
     NotAllowed(#[from] crate::pickle::trust::UpstreamRefused),
@@ -145,6 +154,32 @@ pub async fn bind_image(
         (true, false) => BindError::NoSuchImage { image, reason },
         (false, _) => BindError::Unresolved { image, reason },
     })
+}
+
+/// The layers of the image `reference` pins, when the catalogue holds it.
+/// For a multi-platform image, the layers of every platform it catalogues;
+/// entries with no platform, or an `unknown` one (build attestations), are
+/// not images anyone runs and are left out.
+fn catalogued_layers(reference: &str, catalog: &ManifestCatalog) -> Option<Vec<LayerDescriptor>> {
+    let (_, digest) = reference.split_once('@')?;
+    let manifest = catalog.get_manifest(digest)?;
+    if !manifest.is_index() {
+        return Some(manifest.layers.clone());
+    }
+    Some(
+        manifest
+            .layers
+            .iter()
+            .filter(|entry| {
+                entry
+                    .platform
+                    .as_deref()
+                    .is_some_and(|platform| !platform.starts_with("unknown"))
+            })
+            .filter_map(|entry| catalog.get_manifest(entry.digest.as_str()))
+            .flat_map(|platform| platform.layers.iter().cloned())
+            .collect(),
+    )
 }
 
 /// Whether an image name leaves out its registry (`burger`, `team/burger`),
@@ -274,6 +309,61 @@ impl ImageBinder {
         bind_image(image, catalog, Some(upstream)).await
     }
 
+    /// Refuse an image with a layer no node can unpack, naming its media
+    /// type, before anything is scheduled (#2528). A pull would refuse it
+    /// anyway, but only on the node, after the apply had said yes.
+    ///
+    /// The layers come from the catalogue when it holds the image (a
+    /// Pickle image, or the pull-through cache's copy), which costs no
+    /// request. Otherwise this asks the registry for the manifest: one more
+    /// request per distinct image an apply binds. A registry that doesn't
+    /// answer in [`UPSTREAM_BIND_TIMEOUT`] leaves the check to the pull,
+    /// rather than fail an apply the binding itself allowed.
+    async fn check_layers(
+        &self,
+        image: &str,
+        binding: &Binding,
+        catalog: &ManifestCatalog,
+    ) -> Result<(), BindError> {
+        let reference = match binding {
+            Binding::Bound { reference, .. } => reference.as_str(),
+            Binding::AlreadyBound => image,
+        };
+        let layers = match catalogued_layers(reference, catalog) {
+            Some(layers) => layers,
+            None => match self.upstream_layers(reference).await {
+                Some(layers) => layers,
+                None => return Ok(()),
+            },
+        };
+        match layers.into_iter().find(|layer| {
+            !crate::grill::oci_pull::LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str())
+        }) {
+            Some(layer) => Err(BindError::Unpackable {
+                image: image.to_string(),
+                layer: layer.digest.as_str().to_string(),
+                media_type: layer.media_type,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The layers of `reference`'s platform manifest for this node, from its
+    /// registry. `None` when the registry doesn't say in time.
+    async fn upstream_layers(&self, reference: &str) -> Option<Vec<LayerDescriptor>> {
+        let parsed = ImageReference::parse(reference).ok()?;
+        let upstream = if crate::grill::image::is_loopback_registry(&parsed.registry) {
+            self.loopback.as_ref()
+        } else {
+            self.remote.as_ref()
+        };
+        tokio::time::timeout(UPSTREAM_BIND_TIMEOUT, upstream.fetch_manifest(&parsed))
+            .await
+            .ok()?
+            .ok()
+            .map(|manifest| manifest.layers)
+    }
+
     /// Bind every image `config` names, in place: each app's image, its
     /// init containers' and each job's. A tag named twice is resolved once,
     /// so every workload in one apply that names it runs the same bytes.
@@ -344,6 +434,7 @@ impl ImageBinder {
                 Some(binding) => binding.clone(),
                 None => {
                     let binding = self.bind(image, catalog).await?;
+                    self.check_layers(image, &binding, catalog).await?;
                     resolved.insert(image.to_string(), binding.clone());
                     binding
                 }
@@ -389,7 +480,13 @@ impl UpstreamRegistry for FixedUpstream {
         _image: &'a ImageReference,
     ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamManifest>
     {
-        unimplemented!("binding only asks for the digest")
+        // No manifest: apply's layer check (#2528) is skipped, as it is
+        // for a registry that won't answer.
+        Box::pin(async {
+            Err(crate::pickle::types::PickleError::ReplicationFailed(
+                "no manifest".into(),
+            ))
+        })
     }
 
     fn fetch_root<'a>(
@@ -432,7 +529,13 @@ impl UpstreamRegistry for MissingUpstream {
         _image: &'a ImageReference,
     ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamManifest>
     {
-        unimplemented!("binding only asks for the digest")
+        // No manifest: apply's layer check (#2528) is skipped, as it is
+        // for a registry that won't answer.
+        Box::pin(async {
+            Err(crate::pickle::types::PickleError::ReplicationFailed(
+                "no manifest".into(),
+            ))
+        })
     }
 
     fn fetch_root<'a>(
@@ -449,6 +552,67 @@ impl UpstreamRegistry for MissingUpstream {
     ) -> crate::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
         unimplemented!("binding only asks for the digest")
     }
+}
+
+/// An upstream that names `sha256:…07` for every tag and whose manifest
+/// has a gzip layer and one of the given media type, for the layer check at
+/// apply (#2528) here and in the apply routes.
+#[cfg(test)]
+pub(crate) struct LayeredUpstream(pub &'static str);
+
+#[cfg(test)]
+impl UpstreamRegistry for LayeredUpstream {
+    fn head_manifest_digest<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, Digest> {
+        Box::pin(async { Ok(test_digest(7)) })
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamManifest>
+    {
+        let layer = |i: u64, media_type: &str| LayerDescriptor {
+            digest: test_digest(i),
+            size: 10,
+            media_type: media_type.into(),
+            platform: None,
+        };
+        let manifest = crate::pickle::upstream::UpstreamManifest {
+            digest: test_digest(7),
+            manifest_bytes: Vec::new(),
+            config: layer(8, "application/vnd.oci.image.config.v1+json"),
+            config_bytes: Vec::new(),
+            layers: vec![
+                layer(9, "application/vnd.oci.image.layer.v1.tar+gzip"),
+                layer(10, self.0),
+            ],
+        };
+        Box::pin(async move { Ok(manifest) })
+    }
+
+    fn fetch_root<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamRoot> {
+        unimplemented!("binding reads the platform manifest")
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+        _layer: &'a LayerDescriptor,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
+        unimplemented!("binding reads no blob")
+    }
+}
+
+#[cfg(test)]
+fn test_digest(i: u64) -> Digest {
+    // A test helper: every string formatted here is a valid digest.
+    Digest::new(&format!("sha256:{i:064x}")).unwrap()
 }
 
 #[cfg(test)]
@@ -524,7 +688,11 @@ mod tests {
             &'a self,
             _image: &'a ImageReference,
         ) -> UpstreamFuture<'a, UpstreamManifest> {
-            unimplemented!("binding only asks for the digest")
+            Box::pin(async {
+                Err(crate::pickle::types::PickleError::ReplicationFailed(
+                    "no manifest".into(),
+                ))
+            })
         }
 
         fn fetch_root<'a>(
@@ -863,7 +1031,11 @@ command = ["migrate"]
             &'a self,
             _image: &'a ImageReference,
         ) -> UpstreamFuture<'a, UpstreamManifest> {
-            unimplemented!("binding only asks for the digest")
+            Box::pin(async {
+                Err(crate::pickle::types::PickleError::ReplicationFailed(
+                    "no manifest".into(),
+                ))
+            })
         }
 
         fn fetch_root<'a>(
@@ -979,5 +1151,74 @@ command = ["migrate"]
         let (_, bound, source) = bound_to(binding);
         assert_eq!(bound, digest(10));
         assert_eq!(source, BindSource::Upstream);
+    }
+
+    // -- #2528: a layer no node can unpack is refused at apply ---------------
+
+    const LZ4_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+lz4";
+
+    fn layer(i: u64, media_type: &str) -> LayerDescriptor {
+        LayerDescriptor {
+            digest: digest(i),
+            size: 10,
+            media_type: media_type.into(),
+            platform: None,
+        }
+    }
+
+    fn app_config(image: &str) -> crate::config::Config {
+        toml::from_str(&format!("[app.web]\nimage = \"{image}\"\n")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upstream_image_with_a_layer_no_node_can_unpack_is_refused_by_name() {
+        let binder = ImageBinder::with_upstream(std::sync::Arc::new(LayeredUpstream(LZ4_LAYER)));
+        let mut config = app_config("ghcr.io/acme/web:1");
+        let error = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BindError::Unpackable { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(LZ4_LAYER), "{message}");
+        assert!(message.contains("ghcr.io/acme/web:1"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_image_whose_layers_all_unpack_binds() {
+        let zstd = "application/vnd.oci.image.layer.v1.tar+zstd";
+        let binder = ImageBinder::with_upstream(std::sync::Arc::new(LayeredUpstream(zstd)));
+        let mut config = app_config("ghcr.io/acme/web:1");
+        let applied = binder
+            .bind_config(&mut config, &ManifestCatalog::default())
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pickle_image_with_a_layer_no_node_can_unpack_is_refused_from_the_catalogue() {
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: ImageManifest {
+                digest: digest(5),
+                config: layer(1005, "application/vnd.oci.image.config.v1+json"),
+                layers: vec![layer(11, LZ4_LAYER)],
+                repository: "team/web".into(),
+                tags: BTreeSet::new(),
+                total_size: 20,
+                pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                pushed_by: 1,
+                signature: None,
+            },
+            tag: "v2".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        // A registry that's down: the catalogue alone decides.
+        let binder = ImageBinder::with_upstream(std::sync::Arc::new(Registry(None)));
+        let mut config = app_config("localhost:5050/team/web:v2");
+        let error = binder.bind_config(&mut config, &catalog).await.unwrap_err();
+        assert!(error.to_string().contains(LZ4_LAYER), "{error}");
     }
 }

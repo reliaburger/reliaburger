@@ -2,7 +2,9 @@
 
 **Component:** Pickle (image registry)
 **Whitepaper Section:** 12
-**Status:** Implemented (durability and expiry as of 0.2.1)
+**Status:** Partly shipped. Push, pull, peer-to-peer distribution, durability and expiry ship (durability and expiry as of 0.2.1).
+**Reconciled against:** not reconciled
+**Sketches:** §4, §5.7, §5.8 except §5.8.1, the `PickleConfig` listing in §6, §8.1, the range-split downloads in §9.3
 
 ---
 
@@ -78,9 +80,15 @@ exercises the declined cross-repository mount. oras and buildah are not tested. 
 are whatever the runner image ships; the gate logs them.
 
 **Write admission.** At most four write requests (`POST`, `PATCH`, `PUT`, `DELETE`) run at
-once. A fifth waits up to 60 seconds for a slot, with its body unread, and only then gets
+once. A fifth waits up to six minutes for a slot, with its body unread, and only then gets
 429 with `Retry-After: 1`. Refusing at once broke `docker push`: docker 29 with the
 containerd image store uploads every blob of an image in parallel and doesn't retry a 429.
+The wait is longer than a slot can be held (an upload may take five minutes, then it is
+verified and stored), so a layer queued behind four slow but live uploads still gets its
+turn; until 0.3.4 it gave up after 60 seconds (#2466). The internal storage routes other
+nodes call (`/copies/` and the heal loop's `/replicas/`, which can hold a request for five
+minutes) queue for four slots of their own, so heal work never takes a client's slot. A
+queued request costs an open connection, not memory.
 
 **Token scope.** A token created with `--apps` or `--namespaces` is also held to its
 scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the
@@ -314,6 +322,8 @@ Image manifests are small (typically < 10KB) and must be consistent across the c
 
 This ensures that tag resolution (which digest does `myapp:v1.4.2` point to?) is always consistent, even during concurrent pushes. Layer location data is updated asynchronously via the reporting tree but committed to Raft periodically to survive leader elections.
 
+As shipped, the tables live in `ManifestCatalog` (`src/pickle/types.rs`) as vectors of pairs: manifests, tags keyed `repository:tag`, and blob holders. Lookups are linear scans, which is cheap at the sizes a cluster reaches but grows with a CI system that tags every build. GC builds a holder lookup once per sweep (`ManifestCatalog::holder_index`), and a push keeps one copy of the catalogue for rollback and writes `catalog.json` as compact JSON (#2427). Re-typing the tables as `BTreeMap`s changes the stored format and is left for a format-changing release, with tag retention (tagged images never expire today).
+
 ### 3.5 Layer Storage on Disk
 
 Layer blobs are the bulk of image data (megabytes to gigabytes) and are too large for Raft. They live on each node's local filesystem in the content-addressed blob store. Layer transfer between nodes uses a direct node-to-node HTTP streaming protocol over mTLS, outside the Raft consensus path.
@@ -323,6 +333,8 @@ Layer blobs are the bulk of image data (megabytes to gigabytes) and are too larg
 ## 4. Data Structures
 
 ### 4.1 Core Structs
+
+> **Original sketch; most of these types are not in the tree.** `ManifestMetadata`, `PeerLocation`, `ReplicationState`, `LayerReplicationStatus`, `ReplicationHealth`, `GcPolicy`, `GcSweepState`, `GcCandidate`, `SpareReason`, `ExternalRegistry` and `ReplicationRequest` were never written. The shipped types are in `src/pickle/types.rs` (`Digest`, `ImageManifest`, `LayerDescriptor`, `ManifestCatalog`, `ManifestCommit`, `GcReport`, ...), `src/pickle/gc.rs` (`GcConfig`, `GcCandidates`) and `src/config/node.rs` (`ImagesSection`, `ExternalRegistrySection`). `GcPolicy::retain_tags` in particular describes retain-by-tag-count, which isn't shipped (§6).
 
 ```rust
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -593,6 +605,8 @@ pub enum ReplicationResult {
 
 ### 4.2 Raft State Machine Entries
 
+> **Original sketch; `PickleRaftCommand` is not in the tree.** The shipped commands are variants of `RaftRequest` in `src/council/types.rs`: `ManifestCommit`, `UpdateLayerLocations`, `GcReport`, `DeleteTag`, `AttachSignature`, `ConfirmImageCopy` and `ExpireManifest`.
+
 ```rust
 /// Commands proposed to the Raft state machine for Pickle operations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -824,6 +838,7 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
 4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle re-checks the upstream registry lazily: there's no background task. When a pull hits a cached tag older than `[images] cache_recheck_secs` (default 3600), Pickle asks upstream for the tag's digest; if it has changed, the new manifest and any new layers are pulled and cached. If upstream can't be reached, the stale copy is served. Since F03 U1 this matters less: an apply binds each tag to a digest (`redis:7-alpine@sha256:…`), so pulls ask for the digest and a moved tag changes nothing until the next apply. A fresh fill of a bound reference also records the image under the tag it carries, so an apply while upstream is down can bind the tag from the cache.
 
 5. **Binding at apply.** The node that handles `POST /v1/apply` (the leader, on a cluster), the GitOps runner, and a standalone node's apply resolve each tag through `pickle::binding::ImageBinder`: Pickle's catalogue for a Pickle image, otherwise a manifest `HEAD` upstream (20 s), otherwise the cached tag. With none of those the apply fails rather than store an unbound tag. A reference that already carries a digest is left alone, which is why a rollback restores the digest that ran. Bun attaches a binder only when its runtime pulls images. ProcessGrill pulls none: it refuses image apps (#914), so there's nothing to bind.
+   Once bound, each distinct image's layer media types are checked (#2528): from the catalogue when it holds the image, otherwise from the platform manifest upstream (20 s). A layer that isn't a plain, gzip or zstd tar fails the apply with the type named, before anything is scheduled; a registry that doesn't answer leaves the refusal to the pull.
 
 ```rust
 /// Pull-through cache resolution for an external image reference.
@@ -885,7 +900,8 @@ An accepted expiry removes the manifest and drops the holder records of every bl
 [1] Nominate: walk the local blob store. Skip blobs that a manifest protects:
     tagged, running here (an instance's pinned digest), or untagged for less
     than gc_retain_days. Skip untracked blobs younger than the orphan grace
-    (an hour: an upload mid-push). Skip blobs this node holds alone.
+    (an hour: an upload mid-push), and the binaries of an active rolling
+    upgrade, however old (#2419). Skip blobs this node holds alone.
     Council members nominate against the Raft catalogue; a worker, whose
     local view only knows its own pushes, nominates freely.
 
@@ -893,7 +909,10 @@ An accepted expiry removes the manifest and drops the holder records of every bl
     The state machine refuses every digest any catalogued manifest still
     references, and approves a tracked blob only while another node also
     holds it, removing this node from its holder set. Untracked blobs are
-    approved as orphans.
+    approved as orphans, except the binaries of `active_upgrade` (the
+    `reliaburger-bun` blobs nodes fetch when their turn comes), which are
+    struck from the report while the upgrade is active, paused included.
+    Completing or aborting the upgrade clears the pin.
 
 [3] Delete only the approved blobs, re-checking each against the live
     reference set first (a push may have re-referenced one since).
@@ -913,12 +932,12 @@ publishers made (see "Upstream images: cosign `.sig` signatures" below).
 
 **Keyless signing (build jobs):**
 
-When a build job with `build = true` pushes an image, the signing flow is:
+When `relish build` pushes an image (§5.8.1), the signing flow is:
 
 ```
-[1] Build job completes, pushes image to Pickle via Unix socket.
+[1] The build runner uploads the OCI layout to Pickle with the service token.
 
-[2] Bun intercepts the push completion.
+[2] The build runner signs what it uploaded.
 
 [3] The node uses a persistent, per-namespace build-signer identity
     (`spiffe://<cluster>/ns/<namespace>/job/build-signer`), a leaf
@@ -1073,9 +1092,27 @@ By the time Meat schedules a new replica on a node, the image may already be cac
 
 ### 5.8 Build Job Integration
 
-Build jobs interact with Pickle through a scoped access model:
+Builds reach Pickle through `relish build` (§5.8.1). One rule from the original design survives:
 
-1. **`pickle://` URI scheme.** Build jobs reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint. A `[build.*]` that declares a `namespace` must name a repository in it (`pickle://<namespace>/api:v1.4.3`); see the registry authorisation section above.
+1. **`pickle://` URI scheme.** Builds reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint. A `[build.*]` that declares a `namespace` must name a repository in it (`pickle://<namespace>/api:v1.4.3`); see the registry authorisation section above.
+
+#### 5.8.1 `relish build` as shipped
+
+The shipped path is `relish build` (`[build.*]` sections), not the socket in §5.8.2. The CLI uploads the context tarball to Pickle as a bare blob, and a node with Buildah builds it (`src/bun/build_runner.rs`):
+
+1. **Build and export** under a node-wide build lock, on Buildah storage the node owns (`--root <storage.data>/buildah/root`, `--runroot <storage.data>/buildah/run`). One platform: `buildah bud -t`, then `buildah push … oci:<dir>:<tag>`. Several (the default is `linux/amd64` + `linux/arm64`): `buildah bud --manifest`, then `buildah manifest push --all … oci:<dir>:<tag>`. Plain `buildah push` of a manifest list exports only the builder's own platform.
+2. **Prune**, still under the lock and whatever the outcome: `buildah rm --all`, `buildah manifest rm` (or `rmi --force`) of the build's own tag, `buildah rmi --prune`. Named base images stay cached; if the storage root is still over `[images] build_cache_max_bytes` (default 100 GiB, 2 GiB on quickstart nodes, 0 keeps nothing), `buildah rmi --all --force`. Failures are logged, never fatal. The lock is what makes `rm --all` safe: builds on one node run one at a time.
+3. **Check platforms.** First drop any variant an index entry's architecture doesn't have (`pickle::build::drop_foreign_platform_variants`): Buildah 1.33 on arm64 copies the `FROM --platform=$BUILDPLATFORM` stage's `v8` onto every platform, so its index says `linux/amd64/v8`, which `relish images` would show and an amd64 Docker or containerd client wouldn't match. The index is rewritten in the layout (new digest); the platform manifests, and so their digests and signatures, are untouched. Then a multi-platform build whose layout lacks a requested `os/arch` fails (`BuildError::MissingPlatforms`).
+4. **Upload** (`pickle::build::upload_oci_layout`) with the service-token bearer: every blob, then each platform manifest `PUT` by digest, then the top manifest `PUT` by tag. Platform manifests become catalogue entries in the same repository, so a node can resolve them by digest and GC pins their layers. When Pickle accepts an index it records each entry's platform in the catalogue (`LayerDescriptor::platform`, optional), so `relish images` can show one row per image with its platforms without reading the index blob. An index entry that names no platform (OCI makes it optional) lists as `unknown`. The field changes both the catalogue Raft stores and the listings nodes exchange, so it moved `compatibility::CURRENT` to protocol 28, state 47.
+5. **Sign** the top manifest and every platform manifest with the namespace's build signer (§5.6). Deploys verify the tag's manifest (the index) and pin its digest; the index names each platform manifest by digest, so its signature covers the pulled platform. Signing the platform manifests as well makes a reference pinned to one platform's digest verify too. Under `require_signatures`, a signing failure fails the build.
+
+Build steps that use the network get Buildah's netavark bridge (`podman0`, `10.88.0.0/16`) and its own iptables-nft rules. These coexist with Reliaburger's tables: the perimeter firewall uses its own `reliaburger_fw` tables with an `accept`-policy `input` hook, container NAT masquerades `10.0.0.0/8` (covering Buildah's range), and every Reliaburger container has a `/32` route, so a node whose container subnet falls inside `10.88.0.0/16` still routes correctly.
+
+#### 5.8.2 Deferred design: scoped build socket
+
+> **Status: planned, not implemented.** No job field named `build`, `build_push_to`, `source` or `trigger` is parsed: `relish apply` refuses the job below with `unknown field build`, and nothing mounts a registry socket into any container. Registry write access today is §8.1.
+
+The original design gave build jobs a scoped socket instead of the registry API:
 
 2. **Scoped Unix socket.** When a job has `build = true`, Bun mounts a Unix socket into the job container that provides write access to the local Pickle registry. This socket:
    - Is scoped to the repositories listed in `build_push_to` (e.g., `build_push_to = ["api"]` allows pushing only to `pickle://api:*`).
@@ -1101,17 +1138,6 @@ run_before = ["app.api"]
 
 The Unix socket approach avoids granting the build container network access to the registry API (which would allow pushing to any repository). The socket is intercepted by Bun, which enforces the `build_push_to` scope before forwarding the request to the local Pickle store.
 
-#### 5.8.1 `relish build` as shipped
-
-The shipped path is `relish build` (`[build.*]` sections), not the socket above. The CLI uploads the context tarball to Pickle as a bare blob, and a node with Buildah builds it (`src/bun/build_runner.rs`):
-
-1. **Build and export** under a node-wide build lock, on Buildah storage the node owns (`--root <storage.data>/buildah/root`, `--runroot <storage.data>/buildah/run`). One platform: `buildah bud -t`, then `buildah push … oci:<dir>:<tag>`. Several (the default is `linux/amd64` + `linux/arm64`): `buildah bud --manifest`, then `buildah manifest push --all … oci:<dir>:<tag>`. Plain `buildah push` of a manifest list exports only the builder's own platform.
-2. **Prune**, still under the lock and whatever the outcome: `buildah rm --all`, `buildah manifest rm` (or `rmi --force`) of the build's own tag, `buildah rmi --prune`. Named base images stay cached; if the storage root is still over `[images] build_cache_max_bytes` (default 100 GiB, 2 GiB on quickstart nodes, 0 keeps nothing), `buildah rmi --all --force`. Failures are logged, never fatal. The lock is what makes `rm --all` safe: builds on one node run one at a time.
-3. **Check platforms.** First drop any variant an index entry's architecture doesn't have (`pickle::build::drop_foreign_platform_variants`): Buildah 1.33 on arm64 copies the `FROM --platform=$BUILDPLATFORM` stage's `v8` onto every platform, so its index says `linux/amd64/v8`, which `relish images` would show and an amd64 Docker or containerd client wouldn't match. The index is rewritten in the layout (new digest); the platform manifests, and so their digests and signatures, are untouched. Then a multi-platform build whose layout lacks a requested `os/arch` fails (`BuildError::MissingPlatforms`).
-4. **Upload** (`pickle::build::upload_oci_layout`) with the service-token bearer: every blob, then each platform manifest `PUT` by digest, then the top manifest `PUT` by tag. Platform manifests become catalogue entries in the same repository, so a node can resolve them by digest and GC pins their layers. When Pickle accepts an index it records each entry's platform in the catalogue (`LayerDescriptor::platform`, optional), so `relish images` can show one row per image with its platforms without reading the index blob. An index entry that names no platform (OCI makes it optional) lists as `unknown`. The field changes both the catalogue Raft stores and the listings nodes exchange, so it moved `compatibility::CURRENT` to protocol 28, state 47.
-5. **Sign** the top manifest and every platform manifest with the namespace's build signer (§5.6). Deploys verify the tag's manifest (the index) and pin its digest; the index names each platform manifest by digest, so its signature covers the pulled platform. Signing the platform manifests as well makes a reference pinned to one platform's digest verify too. Under `require_signatures`, a signing failure fails the build.
-
-Build steps that use the network get Buildah's netavark bridge (`podman0`, `10.88.0.0/16`) and its own iptables-nft rules. These coexist with Reliaburger's tables: the perimeter firewall uses its own `reliaburger_fw` tables with an `accept`-policy `input` hook, container NAT masquerades `10.0.0.0/8` (covering Buildah's range), and every Reliaburger container has a `/32` route, so a node whose container subnet falls inside `10.88.0.0/16` still routes correctly.
 
 ---
 
@@ -1123,7 +1149,7 @@ All Pickle configuration lives in the `[images]` section of `node.toml`:
 [images]
 # Maximum disk space for the Pickle blob store on this node. Writes that
 # would exceed it are refused with 413 (§7.4); expiry is what frees space.
-max_storage = "50Gi"
+max_storage = "0"   # Default: 0, unlimited. For example "50Gi" caps it.
 
 # Target number of layer copies across the cluster, INCLUDING the pushing
 # node. The leader-only heal loop replicates toward this target in the
@@ -1162,7 +1188,7 @@ require_signatures = false
 > (retain-N-tags-per-repo) and `pre_pull` (§5.7 proactive distribution) are
 > **planned — not yet implemented**, and are not parsed today.
 
-**Corresponding Rust config struct:**
+**Corresponding Rust config struct (original sketch):** the shipped struct is `ImagesSection` in `src/config/node.rs`, which keeps `max_storage` as a string (`"0"` by default) and adds `max_files`, the registry and build settings, mirrors and the trust policy. `PickleConfig` below was never written.
 
 ```rust
 #[derive(Clone, Debug, Deserialize)]
@@ -1235,6 +1261,8 @@ Everything here counts **effective holders**: the nodes recorded as holding a bl
 
 **Recovery:** Expiry bounds growth: superseded and deleted tags leave after `gc_retain_days`, and the next GC tick frees their blobs. Lower `gc_retain_days`, delete tags you don't need, or raise `max_storage`.
 
+The store also caps its payload files at `[images] max_files` (default 65,536), with or without a byte limit, because a byte ceiling can't bound empty uploads or tiny receipts. Each pushed blob is two files, the blob and its receipt. Hitting the cap is a separate error, `PickleError::StorageFileLimitExceeded`, also `413`, whose message names the count and the setting (#2431). The same recovery applies, or raise `max_files`.
+
 ### 7.5 GC Race Conditions
 
 **Scenario:** Two nodes each hold one of the two copies of an unreferenced blob and both nominate it.
@@ -1253,13 +1281,17 @@ Everything here counts **effective holders**: the nodes recorded as holding a bl
 
 ## 8. Security Considerations
 
-### 8.1 Scoped Registry Access (`build_push_to`)
+### 8.1 Registry Write Access
 
-Build jobs are granted write access to Pickle only through a Unix socket mounted by Bun. This socket is:
+Nothing reaches the registry through a socket; every write is an HTTP request to the registry port, and §1.2 decides who may make it:
 
-- **Repository-scoped:** The `build_push_to` field limits which repositories the job can push to. A job with `build_push_to = ["api"]` can't push to `pickle://admin-tools:*`. Bun enforces this at the socket interception layer before the request reaches the Pickle store.
-- **Write-only for builds:** The socket allows OCI push operations (blob upload, manifest push) but doesn't expose pull operations for other images. A compromised build container can't exfiltrate images from the registry.
-- **Not mounted into non-build containers:** Only containers with `build = true` receive the Unix socket. Regular app containers have no mechanism to push to Pickle.
+- **Tokens and roles.** A push authenticates with an API token, as a bearer or (over TLS) a Basic password. It needs the `deployer` role or above; the internal service token that replication and the build runner use is accepted too.
+- **Token scope.** A token made with `--apps` or `--namespaces` may write only to repositories named `<namespace>/<app>` inside its scope (`check_repository_scope`, `src/pickle/registry_auth.rs`), and a scoped token may not write a bare name at all.
+- **Permission blocks.** A token with a `[permission]` block may push only where the block grants `deploy` on the repository's app; a bare name needs a cluster-wide grant (`check_repository_permission`, #2398). Reads are outside blocks.
+- **Build destinations.** `relish build` uploads the source as a bare blob, and `/v1/build` checks the destination against the same scope and permission rules before a node builds. A `[build.*]` with a `namespace` must push into that namespace.
+- **Build signing.** Build output is signed by the namespace's build signer (§5.6). There is deliberately no key to configure: the signer is a code-signing identity the council mints from the cluster's Workload CA, so the trust policy accepts it by construction (`src/config/node.rs` explains why).
+
+Any container that holds a deployer token and can reach the registry port can push. There is no confinement of build containers beyond that: the socket design that would have provided it is deferred (§5.8.2).
 
 ### 8.2 Image Signing Enforcement
 
@@ -1440,7 +1472,7 @@ Test: build job pushes to pickle:// and app deploys from it
 ```
 Test: build job auto-signs image
   - Enable require_signatures = true.
-  - Run build job with build = true.
+  - Run `relish build` for an app in the namespace.
   - Verify image has keyless signature in Raft.
   - Verify signature identity matches build job's SPIFFE ID.
   - Deploy app — verify Meat schedules it (signed).
@@ -1538,7 +1570,7 @@ Traditional container registries (Docker Hub, GitHub Container Registry, Amazon 
 
 **Reference:** [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
 
-Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) should work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. docker, podman, skopeo and crane are exercised end to end with CA verification by `tests/suite/registry_standard_clients.rs` (§1.2, "Tested clients"); buildah and oras are not. Tag `DELETE` exists (§5.5). Not implemented: manifest `DELETE` by digest, blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
+Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) should work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. docker, podman, skopeo and crane are exercised end to end with CA verification by `tests/suite/registry_standard_clients.rs` (§1.2, "Tested clients"); buildah and oras are not. Repository names and tags follow the spec's grammar: a request naming anything else is refused with 400 `NAME_INVALID` or `TAG_INVALID` before it is authorised or stored, and the catalogue drops a commit that fails the same check. The cluster's own `_buildcontext` scratch repository and `cache/` copies (whose upstream host may carry a port) are accepted by rule. Tag `DELETE` exists (§5.5). Not implemented: manifest `DELETE` by digest, blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API, the catalogue endpoint, `Range` requests on blob `GET` (a blob is always served whole, with 200), upload status (`GET` on an upload session answers 405, so a client can't ask how much of an interrupted upload arrived) and `Content-Range` checking on `PATCH` (a chunk sent twice is appended twice, and the upload fails only at the final digest check).
 
 ---
 

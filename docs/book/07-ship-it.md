@@ -193,31 +193,38 @@ The original plan was to commit deploy state to Raft at every phase transition, 
 
 The wired cluster path ended up keeping no deploy state in Raft at all. Each node rolls its own share, and the leader reads progress from the nodes' reports (more on that at the end of the chapter). What it does keep in Raft is small: the last ten specs of each app that rolled out everywhere, and the spec whose rollout failed.
 
-Finished deploys move into a per-app history on each node, so `relish history` and the API can show what shipped when. We don't keep it forever. An app that deploys fifty times a day, or a bad version the reconciler retries every five minutes, would grow it without bound. `record_deploy_history` in `src/bun/agent/deploy_ops.rs` caps it:
+Finished deploys move into a per-app history on each node, so `relish history` and the API can show what shipped when. We don't keep it forever. An app that deploys fifty times a day, or a bad version the reconciler retries every five minutes, would grow it without bound. `DeployHistory` in `src/bun/agent/deploy_ops.rs` caps it, by app and by number of apps:
 
 ```rust
-pub(crate) fn record_deploy_history(
-    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
-    entry: crate::meat::deploy_types::DeployHistoryEntry,
-) {
-    let app_id = entry.app_id.clone();
-    history.push(entry);
-    let kept = history
-        .iter()
-        .filter(|entry| entry.app_id == app_id)
-        .count();
-    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
-    history.retain(|entry| {
-        if excess > 0 && entry.app_id == app_id {
-            excess -= 1;
-            return false;
-        }
-        true
-    });
+pub struct DeployHistory {
+    apps: std::collections::HashMap<crate::meat::types::AppId, AppHistory>,
+    /// Writes so far, to tell which app was written longest ago.
+    writes: u64,
+}
+
+pub(crate) fn record(&mut self, entry: crate::meat::deploy_types::DeployHistoryEntry) {
+    self.writes += 1;
+    let app = self.apps.entry(entry.app_id.clone()).or_default();
+    app.last_write = self.writes;
+    app.entries.push_back(entry);
+    while app.entries.len() > DEPLOY_HISTORY_PER_APP {
+        app.entries.pop_front();
+    }
+    if self.apps.len() > DEPLOY_HISTORY_APPS
+        && let Some(oldest) = self
+            .apps
+            .iter()
+            .min_by_key(|(_, app)| app.last_write)
+            .map(|(id, _)| id.clone())
+    {
+        self.apps.remove(&oldest);
+    }
 }
 ```
 
-`retain` keeps the elements its closure says yes to, in order, like Python's `[e for e in history if keep(e)]` but in place. The closure is `FnMut`: it captures `excess` by mutable reference and counts it down, so it drops exactly the app's oldest surplus entries and keeps everyone else's. `DEPLOY_HISTORY_PER_APP` is fifty.
+Each app's entries sit in a `VecDeque`, a ring buffer: `push_back` adds at one end and `pop_front` drops the oldest from the other, both in constant time, where removing the first element of a `Vec` shifts every other one along. `entry(...).or_default()` is the `HashMap` entry API: it finds the app's slot, or inserts an empty `AppHistory` (built by its derived `Default`) and hands back a mutable reference to it either way, with one lookup. `DEPLOY_HISTORY_PER_APP` is fifty and `DEPLOY_HISTORY_APPS` a thousand.
+
+The history used to be one `Vec` for every app, trimmed with `retain` for the app just written (#2428). Every write walked the whole vector twice under the lock that readers share, and nothing ever dropped an app: a node serving a preview environment per pull request kept fifty specs for every name it had seen until Bun restarted. Now a write touches its own app's entries, and the app written longest ago goes when a new one takes the count past a thousand. Only a new app can do that, so the scan of the apps, never of their entries, runs at most once per new app. A retired app keeps its history until then: a node can't tell an app that was deleted from one that moved to another node, and `relish history` merges every node's records, so a moved app's history on its old node is still part of the story.
 
 For a long time there was no cap. The agent's history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed it. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now the history is capped on each node, and the rollback source moved to the council (see the end of the chapter).
 

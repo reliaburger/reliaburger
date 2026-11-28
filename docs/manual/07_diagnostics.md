@@ -25,7 +25,10 @@ authentication and authorisation check, so an exec through the relay needs
 the same Deployer role and `exec` permission as one sent straight to the
 node. The relay builds the target's path one segment at a time and refuses a
 path that would need any percent-encoding, and a node-only route on the
-target refuses a relayed request.
+target refuses a relayed request. A relayed request ends within 30 seconds,
+body included, or answers 504, and the relay refuses a followed event stream
+(`v1/events?follow=true`) with 400: `/v1/events?follow=true` on the node
+you're connected to already follows every node.
 
 ```sh
 relish wtf                       # diagnose the whole cluster: one row per check
@@ -59,7 +62,8 @@ Summary: 1 critical, 2 warning, 1 unknown, 2 OK
 
 A check that had nothing to look at gives no row: `gitops` without a GitOps
 configuration, `policies` without a policy, `os` on nodes that aren't
-appliances. `exports` and `rollouts` show up only when something is wrong.
+appliances. `exports`, `images` and `rollouts` show up only when something is
+wrong.
 
 `--short` prints the counts and then only what isn't OK, each finding with its
 `next:` step. When everything is OK, it's the counts line alone, which suits a
@@ -236,6 +240,7 @@ means, the numbers that decide it and the line of code that does (see
 | `active-faults` | warning | Smoker faults are active |
 | `disk-high` | warning, critical | A filesystem is 85% full (critical at 95%) |
 | `export-failing` | warning | A node can't export its logs or metrics, so their caps and retention are on hold |
+| `image-collection-failing` | warning | A node's image collection keeps failing or being refused, so it removes no unpacked image |
 | `cert-expired` | critical | A certificate has expired |
 | `cert-expiring` | warning | A certificate expires within 14 days without healthy rotation |
 | `registry-lost-images` | critical | No live node holds every layer of an image |

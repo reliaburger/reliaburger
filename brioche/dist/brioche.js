@@ -248,6 +248,10 @@
         }
     }
 
+    // The newest lines a live log view keeps. A page left open on a busy
+    // app would otherwise grow until the browser kills the tab (#2433).
+    var MAX_LOG_LINES = 2000;
+
     function initLogStream(el) {
         if (el._eventsource) return;
         var url = el.getAttribute("data-log-stream");
@@ -257,12 +261,17 @@
         el._eventsource = source;
 
         source.onmessage = function (event) {
+            // Follow the tail only if the reader is already there, so they
+            // can scroll back while lines arrive.
+            var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 4;
             var line = document.createElement("div");
             line.className = "log-line";
             line.textContent = event.data;
             el.appendChild(line);
-            // Auto-scroll to bottom.
-            el.scrollTop = el.scrollHeight;
+            while (el.childElementCount > MAX_LOG_LINES) {
+                el.removeChild(el.firstChild);
+            }
+            if (atBottom) el.scrollTop = el.scrollHeight;
         };
 
         source.onerror = function () {

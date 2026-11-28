@@ -2,9 +2,11 @@
 
 Design document for the Mustard gossip protocol and the Raft consensus layer in Reliaburger. Covers cluster membership, failure detection, leader election, state reconstruction, and catastrophic recovery.
 
-**Status:** Draft
+**Status:** Partly shipped. Gossip, the Raft council and state reconstruction ship; nodes report straight to the leader, not through the two-level tree in §3.5.
+**Reconciled against:** not reconciled (§4.3 to §4.5 checked against 0.3.4 on 27 November 2026, #2510; §7.6, #2518)
+**Sketches:** the reporting tree in §3.5 and §9.4, the recovery-candidate list in §3.2, §4.5 and §5.5, pre-vote in §5.2, gossip key rotation in §8.1
 **Whitepaper reference:** Section 8 (Leader Election & State Management)
-**Last updated:** 2026-02-16
+**Last updated:** 2026-11-27
 
 ---
 
@@ -115,7 +117,7 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 **Byte budget.** A datagram is at most 1,400 bytes (`MAX_DATAGRAM_BYTES`). A probe is built header first, then the sender's directory extension (§4.1), then piggybacked updates in priority order until the next one doesn't fit; the rest stay queued with their broadcast counts untouched. `MAX_PIGGYBACK_UPDATES` (8) caps the count, but the byte budget is what bounds the size, so a node with 63-byte names, IPv6 addresses and a full label set sends fewer updates per probe instead of oversized datagrams the transport refuses. The budget is measured from the encoded message, not computed from constants, so a field added to the header or extension later is accounted for automatically. In the worst case (16 labels using the whole 512-byte label budget, plus the ten-byte job capability summary) a PING still carries one update; a PING-REQ or relayed ACK may carry none, and anti-entropy, which sends no extension, makes up the difference. If an extension alone would not fit, the probe goes without it. A failed send is counted and logged at most every ten seconds, never discarded.
 
-**Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
+**Refutation first.** The dissemination queue sends urgent updates ahead of everything else, then Dead/Left, Suspect and Alive about others. An urgent update is an `Alive` that overturns a failure claim: this node's own refutation (Alive about itself at a raised incarnation), and, at every other hop, a member this node held Suspect, Dead or Left that a rumour (or, unless it left, a datagram from the member itself) now says is Alive at a higher incarnation (#2441). Before the relays ranked it so, a refutation re-queued behind each relay's backlog after a correlated failure and spread only as fast as the refuting node could ping; a seeded 300-node simulation (`a_refutation_outruns_a_correlated_failures_backlog` in `tests/gossip_10k.rs`) had it reach 29 survivors in 20 rounds. A plain join (an unknown member turning up Alive) stays at normal priority, so a mass join can't starve failure news. A direct probe of a target this node holds Suspect carries the claim, as an ACK does, so the target can refute straight away. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
 
 **Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 82 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
@@ -137,6 +139,7 @@ Node A                                   Node B (random live peer)
 - **Merge.** Each entry goes through the same `apply_update`/`resolve_conflict` path as a piggybacked update (incarnation first, then `Dead`/`Left` > `Suspect` > `Alive`), so a stale table can never resurrect a dead node or undo a refutation, and an entry about ourselves in `Suspect`/`Dead`/`Left` triggers the usual refutation. An unknown member is only added when `Alive`. Entries that change the table are re-queued for piggybacking.
 - **Floors.** After its entries, each side sends the sequence floors it keeps for reaped members (§8.1), in datagrams of their own: at most `MAX_PIGGYBACK_UPDATES` per datagram and `MAX_SYNC_FLOORS` (16) per exchange, rotating through a larger set like the table.
 - **Bounds.** Sync rides the existing authenticated UDP transport (the message HMAC covers the entries). A datagram carries at most `MAX_PIGGYBACK_UPDATES` (8) entries and no directory extension, which stays under 1,400 bytes even with 63-byte names and IPv6 addresses. `[node] name` is held to one DNS label (63 bytes) at start-up, and the datagrams are built by bytes as well as by count (`sync_datagrams`), so a peer with a longer name, which no valid config produces, costs an extra datagram instead of making every sync too large to send (#2394). One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (8) datagrams, so `MAX_SYNC_ENTRIES` (64) entries. A table that fits goes whole every time. A larger one goes as a rotating window over the table sorted by node id, so a 10,000-member table is covered in 157 exchanges, and `tests/gossip_10k.rs` pins both the per-exchange cap and the sweep.
+- **Join pages (#2442).** Every `Sync` datagram says how many members its sender knows (`known_members`). A request from a peer that knows more than a window fewer members than we do is a joiner's, and it's answered with a page of the whole table sorted by node id: up to `MAX_JOIN_SYNC_DATAGRAMS` (64) datagrams, 512 entries, about 90 KB, which a default UDP receive buffer takes as one burst. The answering node keeps a cursor per joiner (at most 64 joiners, the one served longest ago forgotten first), so the next page carries on where the last stopped, and serves a joiner at most one page per half protocol period, so a peer repeating its request can't turn each datagram into a page. The joiner, while each exchange teaches it at least a window of new members, syncs again on its next cycle with the same peer instead of waiting `push_pull_interval`. A joiner therefore sees a 10,000-member cluster in 20 exchanges, about ten seconds (`a_joiner_sees_a_10k_member_cluster_in_twenty_exchanges`), where one 64-entry window per 10 s took on the order of N/64 exchanges and many minutes. A member in steady state still gets the 64-entry window.
 - **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered, plus up to four of sequence floors, §8.1), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
 - **Loss.** Only the first datagram asks for a reply, and a reply never asks for one, so an exchange is one push and one pull. A lost datagram costs that part of one exchange; the next interval tries again.
 
@@ -155,7 +158,7 @@ The Raft consensus group operates independently from Mustard but depends on it f
 1. **Leader discovery.** When a new Raft leader is elected, the leader announces itself via Mustard gossip so all 10,000 nodes learn the leader identity without Raft having to communicate with them.
 2. **Council member replacement.** When a council member departs, the leader uses Mustard's membership list to find a suitable replacement.
 
-**How a node resolves the leader** (`src/cluster/directory.rs`, `resolve_leader`). The leader stamps a `LeaderHint` (its id, term, recovery epoch and endpoints) on its gossip, and every node relays the newest one it has seen, ordered by recovery epoch and then term. A Raft member (voter or learner) trusts its own metrics, and takes a hint over them only when the hint is newer and its term is at most ten above the member's own (`MAX_LEADER_HINT_TERM_LEAD`), so an absurd term can't carry a member's reporting epoch away. The bound applies only to a hint from the recovery epoch the member's own term belongs to (`NodeDirectory::local_recovery_epoch`, from its fence): a fenced voter of a replaced council still holds its old term, which says nothing about the new council's term line. A node outside the Raft membership never hears AppendEntries and stays at term 0, so that bound would lose it the leader from the cluster's eleventh election on; it takes the hint as it is ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)). Gossip is HMAC-authenticated with the cluster key, but every node holds that key, so a hint proves nothing about the node it names. The reporting epoch only gates anything on the leader, which is a member, and a seatless node fetches its security state only from a hinted leader that is a voter of the council it knows, over TLS bound to that voter (#2406, `docs/design/security-sesame.md`). **Limit:** a forged hint with a huge term still outranks the real one on a seatless node until it restarts, so it can stall that node's reporting; hints don't expire yet.
+**How a node resolves the leader** (`src/cluster/directory.rs`, `resolve_leader`). The leader stamps a `LeaderHint` (its id, term, recovery epoch and endpoints) on its gossip, and every node relays the newest one it has seen, ordered by recovery epoch and then term. A Raft member (voter or learner) trusts its own metrics, and takes a hint over them only when the hint is newer and its term is at most ten above the member's own (`MAX_LEADER_HINT_TERM_LEAD`), so an absurd term can't carry a member's reporting epoch away. The bound applies only to a hint from the recovery epoch the member's own term belongs to (`NodeDirectory::local_recovery_epoch`, from its fence): a fenced voter of a replaced council still holds its old term, which says nothing about the new council's term line. A node outside the Raft membership never hears AppendEntries and stays at term 0, so that bound would lose it the leader from the cluster's eleventh election on; it takes the hint as it is ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)). Gossip is HMAC-authenticated with the cluster key, but every node holds that key, so a hint proves nothing about the node it names. The reporting epoch only gates anything on the leader, which is a member, and a seatless node fetches its security state only from a hinted leader that is a voter of the council it knows, over TLS bound to that voter (#2406, `docs/design/security-sesame.md`). Hints expire (#2406): each directory extension carries `leader_age_ms`, how long ago its stamping node last heard its hint fresh (0 for the leader's own), and a node keeps the freshest age it hears for its current hint. A hint not heard fresh for `LEADER_HINT_EXPIRY` (60 s) is dropped, and a copy that old isn't adopted, so a forged hint with a huge term that nobody re-advertises stops outranking the real one everywhere a minute after the last forged datagram. **Limit:** a compromised node that keeps re-signing its forged hint keeps it alive for as long as it does so, which stalls a seatless node's reporting, not its security state.
 
 A recovery (`relish council recover`) starts a fresh term line at a new recovery epoch, so a term only compares within one epoch. Each node's gossip directory holds a recovery floor, the newest epoch its own recovery fence knows (`FenceSnapshot::newest_known_epoch`). It never adopts a hint from below the floor and drops one when the floor rises, so the replaced council's hint, still relayed by survivors, can't outrank the recovered leader. The leader-target maintainer keys the reporting epoch on `(recovery_epoch, term)`: the node's own Raft metrics always set it, even downwards, and a gossip hint only moves it forward. Before this, an old council's higher term could raise a recovered leader's reporting epoch for good, and the scheduler skips every pass while that epoch differs from the leader's term ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 
@@ -374,6 +377,9 @@ enum GossipPayload {
         entries: Vec<MembershipUpdate>,
         floors: Vec<SequenceFloor>,
         wants_reply: bool,
+        /// How many members the sender knows: a joiner's request is
+        /// answered with a page of the whole table (§3.2, "Join pages").
+        known_members: u32,
     },
     /// The answer to a datagram dropped as no fresher than what the
     /// sender holds (§8.1): the receiver refutes past `held_incarnation`
@@ -464,72 +470,34 @@ struct ResourceSummary {
 
 ### 4.3 Raft Entries
 
+The Raft log is openraft's, and each entry's payload is a `RaftRequest` (`src/council/types.rs`): one variant per kind of change to the council's state machine. A few of them, to give the shape:
+
 ```rust
-/// A single entry in the Raft log.
-#[derive(Serialize, Deserialize)]
-struct RaftEntry {
-    term: u64,
-    index: u64,
-    payload: RaftPayload,
-}
-
-#[derive(Serialize, Deserialize)]
-enum RaftPayload {
-    /// An app spec was created or updated.
-    AppSpec {
-        app_name: String,
-        spec: AppSpec,
-        /// SHA-256 of the serialised spec for cheap equality checks.
-        spec_hash: [u8; 32],
-    },
-    /// An app was deleted.
-    AppDelete {
-        app_name: String,
-    },
-    /// A scheduling decision was made by Meat.
-    SchedulingDecision {
-        app_name: String,
-        placements: Vec<Placement>,
-    },
-    /// A secret was created or updated.
-    SecretSet {
-        name: String,
-        /// Encrypted with the council's shared key (age encryption).
-        encrypted_value: Vec<u8>,
-    },
-    /// A secret was deleted.
-    SecretDelete {
-        name: String,
-    },
-    /// Cluster configuration change.
-    ConfigChange {
-        key: String,
-        value: toml::Value,
-    },
-    /// Raft membership change.
-    CouncilChange(CouncilChange),
-    /// No-op entry used for leader commit confirmation.
-    Noop,
-}
-
-#[derive(Serialize, Deserialize)]
-enum CouncilChange {
-    AddMember { node_id: NodeId, address: SocketAddr },
-    RemoveMember { node_id: NodeId },
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Placement {
-    node_id: NodeId,
-    instance_id: u32,
+pub enum RaftRequest {
+    /// Create or update an app.
+    AppSpec { app_id: AppId, spec: Box<AppSpec> },
+    /// Delete an app.
+    AppDelete { app_id: AppId },
+    /// Record a scheduling decision.
+    SchedulingDecision(SchedulingDecision),
+    /// Set a cluster configuration key.
+    ConfigSet { key: String, value: String },
+    // ... several dozen more: registry manifests and GC reports, GitOps
+    // state, join and API tokens, the security state, council size,
+    // jobs, and a no-op.
 }
 ```
 
+To add a command, add a variant there and handle it in the state machine (`src/council/state_machine.rs`); the enum is the list, and this document doesn't repeat it. An earlier draft of this section sketched a `RaftEntry`/`RaftPayload` pair with `SecretSet`, `SecretDelete`, `ConfigChange` and `CouncilChange` variants; none of those types was built. Council membership changes go through openraft's own membership API, not a log payload of ours.
+
 ### 4.4 State Reports (Reporting Tree)
 
+The types below follow `src/reporting/types.rs`, which is the reference; the listing is abridged.
+
 ```rust
-/// Sent by each worker node to its assigned council member at the reporting interval.
-/// Also sent as a full report during the leader learning period.
+/// Sent by each node to the leader at the reporting interval (the shipped
+/// flat star, §3.5). Also sent as a full report during the leader
+/// learning period.
 #[derive(Serialize, Deserialize)]
 struct StateReport {
     node_id: NodeId,
@@ -539,10 +507,19 @@ struct StateReport {
     running_apps: Vec<RunningApp>,
     /// Cached desired-state specs this node was last assigned.
     cached_specs: Vec<CachedSpec>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, which the leader reads rollout progress from.
+    rollouts: Vec<RolloutReport>,
     /// Current resource usage.
     resource_usage: ResourceUsage,
+    /// Capacity that task attempts and reusable executors hold.
+    job_reservations: JobReservations,
+    /// Apps this node was asked to run but couldn't fit.
+    capacity_refusals: Vec<CapacityRefusal>,
     /// Recent event log (bounded to last N events).
     event_log: Vec<NodeEvent>,
+    /// Whether this node can run image builds.
+    has_buildah: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -608,6 +585,8 @@ enum EventKind {
 
 ### 4.5 Council Member and Recovery Candidate
 
+> **Status: planned, not implemented.** None of these four types exists in the tree. The council's members are openraft's membership config, read through Raft metrics, and the pre-seeded recovery-candidate list is the proposal in §5.5, as §3.2 says. What ships for council loss is `relish council recover` (§5.5).
+
 ```rust
 /// Council member record, maintained by the leader and replicated via Raft.
 #[derive(Serialize, Deserialize, Clone)]
@@ -662,7 +641,7 @@ struct EncryptedRecoveryCandidateList {
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
 | Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
-| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
+| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange; a join page is at most 64 datagrams (512 entries) |
 | Raft (AppendEntries, Vote, InstallSnapshot, CouncilVoters) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
 | Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
@@ -690,7 +669,10 @@ Two separate things are called "join", and they are not the same step.
    There is NO TCP JOIN message.
 3. On its next cycle N has a live peer and its first anti-entropy
    push-pull is due: it pushes its table to the seed and pulls the
-   seed's (bounded, see §3.2), so it learns the cluster in one exchange.
+   seed's. A table of up to 512 members comes back whole in that
+   exchange; a larger one comes a 512-entry page per exchange, one
+   exchange per cycle with the same seed, until N has caught up (§3.2,
+   "Join pages"): 20 exchanges at 10,000 members.
 4. N runs the SWIM protocol period loop:
    - Each period: pick a random node, PING it (UDP)
    - Piggyback own ALIVE state on all messages
@@ -754,6 +736,10 @@ Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `reli
        │         if node re-appears:
        └──────────────────┘
 ```
+
+REMOVED is gossip's view, and the next paragraph says what it still remembers. The API still lists a reaped member for 24 hours (`KNOWN_MEMBER_RETENTION`, `src/bun/api.rs`), which is what `relish nodes` shows for a node that went away.
+
+**Tombstones (#2474).** REMOVED isn't quite forgetting. A node keeps the incarnation it reaped a member at, as a tombstone beside the member's sequence floor (§8.1), so it shares the floor's 24-hour retention and its bound of 1,024 entries. A rumour that the member is `Alive` at or below that incarnation is dropped, so a peer that missed the death (one that was cut off, or one the rotating sync window never showed the `Dead`) can't re-add it on every node. A rumour at a higher incarnation is a real return and passes, and so does the member's own fresh datagram, which clears the floor and the tombstone with it. A restarted member that the floor answers with `Stale` is told the tombstone's incarnation, so it refutes past both. Tombstones aren't shared in anti-entropy: a node that never reaped the member itself has none, and can still take one stale `Alive` about it, which it probes and declares dead again on its own.
 
 **Suspicion subprotocol.** When a node is marked SUSPECT, the suspecting node begins a suspicion timer. During this period, any node can forward evidence that the suspect is alive (an ACK received from the suspect). If the suspect itself learns it is suspected (via piggybacked updates), it increments its incarnation number and broadcasts an ALIVE message, which overrides the SUSPECT state. It refutes only a claim at or above its own incarnation: one below has already lost to its own record, and refuting it would only spread a needless bump. Only if the suspicion timer expires without refutation does the node transition to DEAD. This prevents false positives from transient network blips.
 
@@ -1251,9 +1237,9 @@ If split-brain somehow occurs (bug, Byzantine failure), the leader with the high
 
 UDP is unreliable. Mustard handles this through redundancy:
 
-- Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
+- Each membership update is piggybacked on multiple messages (a dissemination count of `3 * ceil(log2(N))`, minimum 6, as in §3.2, ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
-- The suspicion subprotocol prevents premature failure declarations from transient loss.
+- The suspicion subprotocol prevents premature failure declarations from transient loss. A refutation goes ahead of every queued failure rumour at every hop (§3.2, "Refutation first"), so it reaches the cluster within the suspicion timeout even behind a correlated failure's backlog.
 - A periodic push-pull exchange of membership tables between random node pairs (§3.2, "Anti-entropy push-pull") is the consistency backstop. It runs over the same UDP transport, not TCP.
 
 At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increases by less than one additional protocol period (~500ms).
@@ -1268,9 +1254,9 @@ When the node has a cluster master key (`[security] master_key_path`, produced b
 
 A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
 
-**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it usually rises across restarts ("Restarts" below covers a clock that went backwards). A receiver keeps the freshest `(incarnation, sequence)` it has accepted from each sender, compared incarnation first, and drops any message no fresher before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
+**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it usually rises across restarts ("Restarts" below covers a clock that went backwards). A receiver keeps the freshest `(incarnation, sequence)` it has accepted from each sender, compared incarnation first, and drops any message no fresher before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A member's address moves only on a fresh datagram from the member, or on an `Alive` rumour about it at a strictly higher incarnation (#2475): only the member raises its own incarnation, so that's its own newer word about itself. A rumour at an equal incarnation could be a replay, and a `Suspect` or `Dead` carries the address its accuser holds, so neither moves the address. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
 
-**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its freshest accepted `(incarnation, sequence)` becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender no fresher than the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is heard straight away, whatever its clock says (see "Restarts" below); its first fresher datagram turns the floor back into an ordinary per-sender record. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own record for such a member to the freshest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
+**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its freshest accepted `(incarnation, sequence)` becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender no fresher than the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is heard straight away, whatever its clock says (see "Restarts" below); its first fresher datagram turns the floor back into an ordinary per-sender record. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own record for such a member to the freshest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A reaped member's floor also carries its tombstone, the incarnation it was reaped at (§5.1). A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
 
 **Datagrams in our own name.** A node drops any datagram whose `sender` is itself, before anything is applied. It keeps no sequence for itself to check such a datagram against, and nothing in one can be news: applying it could only move the node's own address or roll its own directory entry back. The only legitimate case is a seed list that names the node's own address, and a reply from itself tells it nothing.
 
@@ -1279,6 +1265,8 @@ A node started without a master key (single-node and pre-security configurations
 Peers can hold different incarnations for the old run: one that heard it last at 3 and another at 5. The restarted node refutes past each answer in turn, so it can sit briefly between them. While it does (at 4, say), the peer it refuted for holds 4, and a recording from the old run at incarnation 5 is fresher there than the node's own datagrams: the replay window is open again for that peer until the node's datagram to the other peer draws its answer and the node refutes past 5. So the window is bounded by one `Stale` round trip per disagreeing peer, and only after a restart.
 
 The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error (and at most one `Stale` answer a second, which changes nothing at the sender).
+
+**What a holder of the gossip key can't do: overflow an incarnation (#2395).** Every member holds the gossip key, so the HMAC stops outsiders, not a buggy or compromised member. Incarnations start at 1 and rise by one per refutation or restart, so a node drops any incarnation from the wire above `MAX_INCARNATION` (`u64::MAX / 2`): a datagram's own, a piggybacked or synced update's, a `Stale` answer's `held_incarnation`, and a floor's. Each refusal is counted and logged at most once every 10 s. Without the ceiling, one `Dead` claim at `u64::MAX` overflowed `refute`: a debug build panicked the gossip task, and a release build wrapped the node's incarnation to 0, so its refutation lost to the claim on every peer and the node stayed dead until reaped. `refute` also saturates at the ceiling, so nothing wraps. What's left is milder: a claim at exactly the ceiling burns the node's headroom, since it can't out-rank it, and the node stays `Dead` to its peers. That needs the same compromised member, and it's recovered by restarting the node under a new name; we don't add more machinery for it.
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
@@ -1311,6 +1299,7 @@ All reporting connections use mTLS via Sesame's Node CA. In the shipped flat sta
 | Convergence time | O(log N) protocol periods | Each protocol period, each node probes one random peer and piggybacks updates. Information spreads like an epidemic. |
 | Per-node network overhead | O(1) | Each node sends/receives a constant number of messages per protocol period regardless of cluster size. |
 | Bandwidth per node | ~3 KB/s at 10,000 nodes | 1 PING + 1 ACK per protocol period (500ms), ~1400 bytes each. Plus occasional PING-REQ. |
+| CPU per received datagram | Independent of N when nothing changed | `run` republishes the membership after every datagram, but only when the table's version or the council roles moved since the last publish (#2439). A change still costs O(N log N): a snapshot, a digest and a sort, on the active and the roster watch. Before the version check every datagram paid that, 813 µs at 1,000 members and 12.8 ms at 10,000 with five labels each, against about 210 ns at either size after it (`gossip_publish_after_datagram` in `benches/gossip.rs`). |
 | Membership table memory | ~256 bytes per node | NodeMembership struct. At 10,000 nodes: ~2.5 MB total per node. |
 
 ### 9.2 Leader Election Performance

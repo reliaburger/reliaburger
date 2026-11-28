@@ -321,6 +321,23 @@ pub struct Compatibility {
 /// `AppSpec` and `SidecarSpec` carry `pids`, a process and thread limit, and
 /// refuse unknown fields, so the app spec on the wire and in the replicated
 /// desired state changes (#2386).
+/// An `ArrayAssignment` that carries a `template` no longer carries
+/// `program`, `args` or `env`; the node derives them from the template, so
+/// an older node would read the run as a host job with an empty binary
+/// (#2532).
+/// `SecurityView`, the body of `/v1/cluster/security-view`, carries a
+/// required `permissions` map, the leader's `[permission]` blocks, so a node
+/// with no Raft seat can enforce them; old and new nodes can't read each
+/// other's view (#2538).
+/// Jobs keep their declared spec for the policy audit:
+/// `JobDefinition::declared_image`, `DeploymentRecord::declared_images` and
+/// the `declared_images` on `TaskArrayWrite::RegisterJobs` and `DeployBegin`
+/// are new. `JobDefinition` and `DeploymentRecord` refuse unknown fields, so
+/// an older replica can't read them (#1322).
+/// Gossip `Sync` carries the sender's member count, so joiners get pages of
+/// the table (#2442).
+/// The gossip directory extension carries the leader hint's age, so a hint
+/// nobody re-advertises expires (#2406).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

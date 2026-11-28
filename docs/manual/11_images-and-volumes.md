@@ -53,7 +53,12 @@ media types (`application/vnd.oci.image.layer.v1.tar`, `…tar+gzip`,
 so images BuildKit builds with `compression=zstd` run as they are. A pull
 refuses any other layer type before downloading it, naming the type, for
 example `layer sha256:… has media type application/vnd.oci.image.layer.v1.tar+bzip2,
-which no node can unpack`. Foreign (non-distributable) layers aren't supported.
+which no node can unpack`. `relish apply` refuses such an image too, before
+anything is scheduled, with the same message: it reads the layers from
+Pickle's catalogue when the image is there, and otherwise asks the registry
+for the manifest. If the registry doesn't answer in time, the apply goes
+ahead and the pull refuses the image on the node instead. Foreign
+(non-distributable) layers aren't supported.
 
 Layers stream to disk as they arrive, so a large image doesn't need its
 size in memory, and a slow link isn't a problem while bytes keep coming: an
@@ -133,8 +138,13 @@ one that names none runs where its app does.
 ## Storage ceiling
 
 `[images] max_storage` bounds each node's compressed CAS blob, temporary upload
-and repository authority receipt payload bytes. The store also allows at most
-65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
+and repository authority receipt payload bytes. `[images] max_files` (default
+65,536) caps the payload files the store holds, with or without `max_storage`:
+each pushed blob is two files (the blob and its receipt), and an upload in
+progress is one more. A write over that cap is refused with HTTP 413 and
+`image store holds 65536 files, the limit set by [images] max_files`, so you
+can tell it from the byte limit. Raise it, or delete tags you don't need and
+let expiry and GC free the files. Registry pushes, peer replication,
 upstream cache fills and runtime image pulls share this ceiling. An upload chunk
 that would exceed it is refused before writing, with HTTP 413 from the registry.
 A pull checks the sizes the image's manifest gives before it downloads
@@ -221,6 +231,14 @@ grill: image collection removed 3 generation(s), 0 partial tree(s), 3 manifest(s
 An image that's collected and needed again later is pulled and unpacked
 again, from the blob store if its layers are still there.
 
+`relish images` shows how much disk each image's unpacked copies take on the
+node you asked, in its UNPACKED column (`-` for an image that node hasn't
+unpacked). `relish wtf` warns with `image-collection-failing` when a node's
+last collection failed, or was refused because the node couldn't read one of
+its container bundles' specs and so couldn't tell which images are in use:
+such a node removes nothing until a pass works. A nearly full image
+filesystem is the `disk-high` finding on the `images` domain.
+
 ### What bounds disk use on a node
 
 | What | Bounded by |
@@ -253,7 +271,8 @@ and the leader takes them only from a node that shows its cluster certificate.
 That's how it knows which node is asking, so one node can't claim another's
 copies. There's no token-only way in.
 
-A plaintext cluster (`[security] require_mtls = false`, which only
+A plaintext cluster (`[security] require_mtls = false`, with
+`allow_insecure_cluster = true` off loopback, which only
 `relish init --development-plaintext` or a hand-written config sets up) has no
 certificates, so it has no cluster registry.
 Pushes, `relish build`, `relish images`, and pulls of images Pickle would
@@ -377,10 +396,30 @@ docker push NODE:5050/api:v1
 docker pull NODE:5050/api:v1
 ```
 
+Repository names and tags follow the OCI grammar: lowercase letters and
+digits in `/`-separated parts joined by `.`, `_`, `__` or `-`, and tags of up
+to 128 letters, digits, `_`, `.` and `-` that don't start with `.` or `-`.
+Anything else is refused with 400 `NAME_INVALID` or `TAG_INVALID`.
+
 podman takes the same `login`, `push` and `pull`. skopeo takes the token as
 `--creds push:"$TOKEN"` (or `--src-creds` and `--dest-creds` on a `copy`),
 and crane as `crane auth login NODE:5050 -u push -p "$TOKEN"`. Apps refer to
 the image by its bare name, `api:v1`.
+
+### Push limits
+
+Each upload request may carry at most 512 MiB and must arrive within
+5 minutes. A bigger request is refused with 413 and a slower one with 408, and
+the client reports the push as failed. A layer over 512 MiB has to be sent in
+several `PATCH` chunks, but docker, podman, skopeo and crane each send a layer
+in one request, and we haven't found a setting in any of them that splits it.
+`relish build` uploads each blob in one request too. So keep every layer under
+512 MiB: split a large `COPY` or `RUN` into several steps.
+
+At most four write requests run at once on a node. Clients push layers in
+parallel, so a fifth waits for a free slot, for up to 6 minutes, longer than
+an upload may take, and only then gets 429. Copies between nodes have slots of
+their own and never take one of these.
 
 CI runs all four against a Pickle TLS listener:
 docker, podman and skopeo as the Ubuntu runner image ships them, and a pinned
@@ -400,6 +439,15 @@ applies to a `relish build` destination. From a routable registry a scoped
 token pulls only its own namespaces' images (a loopback registry serves reads
 to anyone on the node, token or not), and `relish images` lists only those.
 Unscoped tokens push and pull anything, as before.
+
+A `[permission]` block (see `security`) narrows pushes further. Pushing an
+image is a deploy of its app, so a token with a block may push only to
+`<namespace>/<app>` repositories whose app the block grants `deploy` on. A
+bare name like `api:v1` names no namespace, so only a block granting `deploy`
+on `apps = ["*"]` with no `namespaces` may push it. The registry refuses
+anything else with 403 `DENIED`, the answer `relish build` gives for the same
+push. Pulls aren't part of a block: there's no pull action, so a token with a
+block pulls whatever its role and scope allow.
 
 ### Trusting the cluster CA
 
@@ -665,3 +713,13 @@ fails and is retried on the next sweep. Objects land under
 the snapshot, its volume, node and creation time. Two nodes running the same
 app never overwrite each other's archives, and neither does reusing a
 snapshot name.
+
+A snapshot counts as exported only once its archive and manifest are stored
+and its receipt is written, so a power cut or a restart mid-upload just means
+the next sweep exports it again. If the destination already holds something
+at the archive's key that isn't that archive (cut short, or zeroed by a
+`file://` destination that lost data), the sweep replaces it and logs
+`replacing <key>`. On a `file://` destination it hashes an existing archive
+before trusting it; S3 and GCS store objects whole, so there it checks the
+size. A multipart upload cut off by a power cut leaves its parts on S3 until
+a lifecycle rule aborts incomplete uploads, so give the bucket one.
