@@ -1,0 +1,14 @@
+samples 39901, Bun 116
+ 99.54%                   idle (no runnable work)
+  0.01%    1.72% of Bun    Bun: task-array leader tick and node sync
+  0.00%    0.86% of Bun    Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)
+  0.00%    0.86% of Bun    Bun: Raft core and log
+  0.02%    7.76% of Bun    Bun: agent loop and supervisor
+  0.03%   10.34% of Bun    Bun: API server
+  0.05%   15.52% of Bun    Bun: metrics (Mayo)
+  0.01%    1.72% of Bun    Bun: service discovery (Onion)
+  0.09%   29.31% of Bun    Bun: containers (Grill)
+  0.04%   12.07% of Bun    Bun: other Reliaburger code
+  0.06%   19.83% of Bun    Bun: async runtime (scheduler, timers, parking)
+  0.17%                   other processes and kernel threads
+other by command: lima-guestagent 0.07%, exe 0.05%, containerd 0.02%, rcu_preempt 0.01%, multipathd 0.01%, vmstat 0.01%, jbd2/vda1 0.00%, kworker/3:3-mm_ 0.00%, kworker/u8:1-ev 0.00%, rootlesskit 0.00%

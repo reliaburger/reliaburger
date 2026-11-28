@@ -2228,13 +2228,12 @@ the real `curl … | sh` install against it on every host we advertise.
    "every release" until November 2026, and with releases two to four days
    apart six of the eight releases after 0.2.4 went without one, so #2209
    (0.3.1's jobs 22 to 28% slower than 0.2.8's) had no profile to answer it
+   until [0.3.3's](qualification/2026-11-28-v0.3.3-profile/README.md)
    ([#2488](https://github.com/reliaburger/reliaburger/issues/2488)). The
    closure record says which: the profile's record, or why there is none.
    `the_newest_minor_release_has_a_profile_record` in
    `tests/suite/website.rs` fails while the newest minor series in the
-   [release log](release-log.md) has no `-vX.Y.*-profile` record; it's
-   ignored until the 0.3 series has one, and that record removes the
-   `#[ignore]`. The
+   [release log](release-log.md) has no `-vX.Y.*-profile` record. The
    staging pre-release is gone by now, so point it at the published release:
 
    ```sh

@@ -1624,7 +1624,6 @@ fn the_release_testing_section_shows_the_installed_release() {
 /// `docs/qualification/*-vX.Y.*-profile` record, from any release of that
 /// series, so a skipped profile shows up before the next minor release.
 #[test]
-#[ignore = "fails until the 0.3 series has a profile record (qualify-profile.sh on the quiet host), #2488"]
 fn the_newest_minor_release_has_a_profile_record() {
     let log = read("docs/release-log.md");
     let (major, minor, _) = log
