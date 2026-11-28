@@ -5402,8 +5402,8 @@ as unfair then, and the case passes whenever the coin tosses go its way.
 
 A 0.3.0 soak pulse failed `deploy_from_cluster_registry` with nothing but
 "case exceeded its deadline" after 300 s ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
-The app had been committed, the status polls were bounded at 5 s each, and
-the reason carried no note from a wait that was still polling. What was left
+The app had been committed, Bun answered status reads within 5 s, and the
+reason carried no note from a wait that was still polling. What was left
 was the step after them: a `busybox wget` run inside the container through
 `exec_in_workload`. Forty attempts to reproduce it passed, so we still don't
 know that the exec hung. We do know that if it had, nobody could have said
@@ -5570,7 +5570,78 @@ records the way `Execution::launch` does, around a real `sleep`, and checks
 the line names the phase, the command and, on Linux, `(sleep) S`; a second
 Linux test checks it follows a shell's child as well, since `runc exec` runs
 its command as a grandchild. We still can't make an exec wedge on purpose,
-so #2128 stays open until the next one tells us where.
+so the exec reading stays a reading until the next one tells us where.
+
+### The first round of a wait
+
+For 0.3.4 we went over #2128 once more, this time asking whether the image
+work had fixed it by accident. That release streams layers to disk, locks
+each image generation on its own instead of the whole node, and queues
+registry writers. A slow-fsync fault is exactly what makes a node-wide unpack
+lock and its `syncfs` hurt, so it was worth asking. The answer is no, and
+the reason is the same note we leaned on above. An instance stuck pulling or
+unpacking shows up in `/v1/status` as `pending` or `preparing`, and Bun
+answers that read within 5 s however busy its agent is. The wait would have
+polled again and again and left a note saying so. There was no note, so the
+case was past the pull, or stuck before the first poll came back.
+
+That second half is where the earlier write-up was too generous. "The status
+polls were bounded at 5 s each" was true of the server's own reads, not of
+the test kit's requests. `nodes()` and `status()` used the `relish` client's
+300 s request timeout, the same length as the case. A wait writes its note
+after a round of reads finishes, so a first round that never finished left no
+note either. The forwarder's one held request fits that reading as well as
+it fits the exec. It's still a bug either way: one request that never answers,
+on one pooled connection, could spend the whole case on a question that the
+next request would have answered in milliseconds.
+
+So each round of a wait's reads now gets a bound of its own:
+
+```rust
+async fn poll_round<T, F>(&self, round: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let bound = POLL_ROUND_BOUND.min(self.deadline.remaining() / 4);
+    tokio::time::timeout(bound, round)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "a status read did not answer within {} ms",
+                bound.as_millis()
+            ))
+        })
+}
+```
+
+`POLL_ROUND_BOUND` is 10 s, or a quarter of what the case has left, so a
+round that hangs always leaves time for more. `Duration` divides by an
+integer with plain `/`. `tokio::time::timeout` gives back `Err(Elapsed)` when
+the bound runs out, and `unwrap_or_else` turns that into the same kind of
+error a failed read returns, so the wait's loop treats a hung round like any
+other failed one: it records the note and asks again. Running out drops the
+request's future, and with it the request's connection, so the next round
+asks on a fresh one. A hang that was the connection's ends there. A hang that
+was Bun's doesn't, but now the case's error reads "waiting for registry-web to
+reach 1 running replica(s) cluster-wide; … a status read did not answer within
+10000 ms" instead of "case exceeded its deadline". The wait also stops once
+its sleep has used up what's left, instead of starting one more round: a
+round with no time at all can only report the deadline, and that would
+replace the note saying what the last real round saw. `wait_for`, the
+single-node wait, takes the same bound.
+
+`a_status_read_that_never_answers_is_retried_within_the_case` serves a node
+whose first `/v1/status` never answers and whose second says `running`, and
+checks the wait passes inside the case's 8 s. Before the change it ran into
+the case deadline. `a_wait_whose_reads_never_answer_says_so` serves a node
+list that never answers and checks the wait's own error, with the hung read
+in it, comes back before the deadline does.
+
+That leaves no step in `deploy_from_cluster_registry` that can stall without
+naming itself: staging, the apply, every round of the wait and the exec each
+have a bound shorter than the case and a message of their own. We still
+haven't seen why the 0.3.0 pulse stalled, and we've stopped pretending a
+fourth reading of the same logs will tell us. A repeat will.
 
 ### Busy isn't dead
 
