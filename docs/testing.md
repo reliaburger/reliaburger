@@ -220,7 +220,7 @@ ignored by default and run by their own targets and CI jobs
 | Feature demos | [`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) (roll forward, roll back, a bad version rolled back and marked `RolloutFailed`) and [`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) (a `file://` repository synced, an app deleted from it, a hand-applied app left alone) run to completion on a one-node cluster each starts through [`lib.sh`](../scripts/demo/lib.sh); a step that doesn't do what it says fails the demo, and each must print the resource readout and summary [`resources.py`](../scripts/demo/resources.py) samples ([`test_demo_resources.py`](../scripts/ci/test_demo_resources.py) covers its parsing and arithmetic). [`test_demo_scripts.py`](../scripts/ci/test_demo_scripts.py) checks on every run that they stop on the first error and swallow nothing | [`tests/demos.rs`](../tests/demos.rs) | `make test-cluster`; by hand `make rollout-demo`, `make gitops-demo` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
-| S3 object storage | Logs export to an S3 bucket, and a council backup goes up, lists, prunes and restores, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
+| S3 object storage | Logs export to an S3 bucket, a council backup goes up, lists, prunes and restores, and an interrupted volume-snapshot upload restarts cleanly, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs), [`src/bun/snapshot_worker.rs`](../src/bun/snapshot_worker.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, policy evaluation per app for 10 to 1,000 policies, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
@@ -435,8 +435,10 @@ in the `Makefile` isn't run by any workflow.
 
 ### S3 in CI
 
-`make test-s3` exports logs to an S3 bucket and round-trips a council backup
-through it: put, list, prune and restore by key. Until 0.2.6 it needed AWS
+`make test-s3` exports logs to an S3 bucket, round-trips a council backup
+through it (put, list, prune and restore by key), and cuts a volume
+snapshot's multipart upload off by its deadline to check that the next sweep
+ships the archive whole. Until 0.2.6 it needed AWS
 credentials and a real bucket, which the qualification Mac didn't have, so
 0.2.5 shipped without it (#1534). Now
 [`scripts/test-s3.sh`](../scripts/test-s3.sh) finds a bucket one of three ways:
