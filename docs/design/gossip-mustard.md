@@ -2,7 +2,9 @@
 
 Design document for the Mustard gossip protocol and the Raft consensus layer in Reliaburger. Covers cluster membership, failure detection, leader election, state reconstruction, and catastrophic recovery.
 
-**Status:** Reconciled with the code for 0.3.4 (§4.3 to §4.5 on 27 November 2026, #2510). Sections that describe something not built say so: the two-level reporting tree (§3.5), the recovery-candidate list (§3.2, §4.5, §5.5) and gossip key rotation (§8.1).
+**Status:** Partly shipped. Gossip, the Raft council and state reconstruction ship; nodes report straight to the leader, not through the two-level tree in §3.5.
+**Reconciled against:** not reconciled (§4.3 to §4.5 checked against 0.3.4 on 27 November 2026, #2510; §7.6, #2518)
+**Sketches:** the reporting tree in §3.5 and §9.4, the recovery-candidate list in §3.2, §4.5 and §5.5, pre-vote in §5.2, gossip key rotation in §8.1
 **Whitepaper reference:** Section 8 (Leader Election & State Management)
 **Last updated:** 2026-11-27
 
@@ -1235,7 +1237,7 @@ If split-brain somehow occurs (bug, Byzantine failure), the leader with the high
 
 UDP is unreliable. Mustard handles this through redundancy:
 
-- Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
+- Each membership update is piggybacked on multiple messages (a dissemination count of `3 * ceil(log2(N))`, minimum 6, as in §3.2, ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
 - The suspicion subprotocol prevents premature failure declarations from transient loss. A refutation goes ahead of every queued failure rumour at every hop (§3.2, "Refutation first"), so it reaches the cluster within the suspicion timeout even behind a correlated failure's backlog.
 - A periodic push-pull exchange of membership tables between random node pairs (§3.2, "Anti-entropy push-pull") is the consistency backstop. It runs over the same UDP transport, not TCP.

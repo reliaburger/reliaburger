@@ -271,7 +271,8 @@ and the leader takes them only from a node that shows its cluster certificate.
 That's how it knows which node is asking, so one node can't claim another's
 copies. There's no token-only way in.
 
-A plaintext cluster (`[security] require_mtls = false`, which only
+A plaintext cluster (`[security] require_mtls = false`, with
+`allow_insecure_cluster = true` off loopback, which only
 `relish init --development-plaintext` or a hand-written config sets up) has no
 certificates, so it has no cluster registry.
 Pushes, `relish build`, `relish images`, and pulls of images Pickle would

@@ -2,7 +2,9 @@
 
 **Component:** Pickle (image registry)
 **Whitepaper Section:** 12
-**Status:** Implemented (durability and expiry as of 0.2.1). §4.1 and §4.2 are the original sketch, not the types in the tree; §5.8.2 (a scoped build socket) and the `PickleConfig` sketch in §6 are deferred design. Each is labelled where it starts.
+**Status:** Partly shipped. Push, pull, peer-to-peer distribution, durability and expiry ship (durability and expiry as of 0.2.1).
+**Reconciled against:** not reconciled
+**Sketches:** §4, §5.7, §5.8 except §5.8.1, the `PickleConfig` listing in §6, §8.1, the range-split downloads in §9.3
 
 ---
 

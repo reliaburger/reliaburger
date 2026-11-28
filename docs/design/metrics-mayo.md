@@ -2,7 +2,9 @@
 
 **Component:** Mayo (Metrics store + Built-In Alerts)
 **Binary:** Embedded in Bun (the single-node agent)
-**Status:** Design (this document reconciled against the shipped code)
+**Status:** Partly shipped. Collection, Parquet storage, rollups and the four built-in node alerts ship; the sections marked planned don't.
+**Reconciled against:** not reconciled at a named release; an earlier pass reconciled it with the shipped code, and §10.3 was checked against 0.3.4 (#2515)
+**Sketches:** tiered retention in §3.2, §3.4, §4.4, §5.3, §5.8, the planned tests in §10.3
 **Whitepaper Reference:** Section 15
 
 ---
@@ -637,15 +639,12 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 
 - Verify that an alert with `for = "5m"` transitions from `Inactive` -> `Pending` -> `Firing` after exactly 5 minutes of continuous threshold breach.
 - Verify that a momentary dip below threshold during the `for` period resets the alert to `Inactive`.
-- Verify that per-app suppression (`cpu.idle = false`) prevents the alert from firing for the suppressed app but not for other apps.
-- Verify that per-app threshold tuning (`memory.low = { threshold = 95 }`) uses the overridden value.
 
 **Integration tests:**
 
-- Deploy a test app that consumes 90% of its memory limit. Verify that the `memory.low` alert fires within the expected timeframe (default: 5 minutes).
-- Deploy a test app that triggers an OOM kill. Verify that the `oom.kill` alert fires immediately (no `for` duration on OOM).
 - Configure a webhook notification destination. Trigger an alert. Verify that the webhook receives the expected JSON payload with correct labels, severity, and timestamps.
-- Configure a per-app suppression. Verify that the suppressed alert does not fire for the suppressed app, does not produce a webhook notification, and is not visible in `relish alerts`.
+
+**Planned, with custom alert rules (#1773).** The shipped rules are four fixed node rules (`default_rules` in `src/mayo/alert.rs`) with no per-app overrides, so these tests wait for that work: per-app suppression and threshold tuning, a per-app memory alert, an OOM-kill alert with no `for` duration, and a command that lists active alerts.
 
 ### 10.4 Prometheus Compatibility Tests
 

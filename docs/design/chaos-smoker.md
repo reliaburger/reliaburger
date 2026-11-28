@@ -1,5 +1,9 @@
 # Smoker -- Fault Injection Engine
 
+**Status:** Partly shipped (see the implementation status note below).
+**Reconciled against:** not reconciled
+**Sketches:** bandwidth faults; §13
+
 Design document for the Smoker subsystem of Reliaburger. Smoker provides built-in chaos engineering capabilities using eBPF for network faults and cgroups for resource faults. It adds no new binaries, processes, or network components -- it activates latent capabilities in the eBPF programs and cgroup controls that Bun and Onion already manage.
 
 Sourced from whitepaper section 18 (Fault Injection).

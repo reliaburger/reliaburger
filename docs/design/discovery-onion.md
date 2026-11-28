@@ -3,7 +3,9 @@
 **Component:** Onion
 **Subsystem:** Service discovery, namespace firewall enforcement
 **Whitepaper reference:** Section 10 (Service Discovery), Section 11.3 (Network Security)
-**Status:** Design. **DNS is served in userspace, not in the kernel** (see the note below and book chapter 3). The connect-rewrite half is in-kernel eBPF as described; the in-kernel DNS listings in §§3–4 are the *original* design we abandoned, kept for teaching and clearly marked.
+**Status:** Partly shipped. **DNS is served in userspace, not in the kernel** (see the note below and book chapter 3). The connect-rewrite half is in-kernel eBPF as described; the in-kernel DNS listings in §§3–4 are the *original* design we abandoned, kept for teaching and clearly marked.
+**Reconciled against:** not reconciled
+**Sketches:** the in-kernel DNS listings in §3 and §4, §13
 
 ---
 

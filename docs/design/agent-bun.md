@@ -2,7 +2,9 @@
 
 **Component:** Bun (per-node agent/daemon), Grill (container runtime interface)
 **Scope:** Container lifecycle, process workload isolation, node configuration (`node.toml`), self-upgrade mechanism
-**Status:** Draft
+**Status:** Partly shipped. The container runtime, health checks, node config and self-upgrade ship; the isolation stack for process workloads is planned.
+**Reconciled against:** not reconciled (§4 and §6.1 checked against 0.3.4, #2506)
+**Sketches:** §4.3, §5.2 steps 7–12, the OOM detection in §5.4, the process-workload boundary in §8.2, §8.3, §8.4
 **Source:** Whitepaper sections 5 (Core Concepts), 17 (Process Workloads), 7 (Cluster Architecture), 9 (Networking), 11 (Security), 13 (Deployments), 18 (Fault Injection), 6 (Node Configuration), 20 (Self-Upgrades), 19 (Testing)
 
 ---
@@ -398,6 +400,11 @@ HealthChecker (periodic per workload)
 
 ### 4.1 Core Types
 
+A simplified listing, trimmed to fields that exist. The real types carry more
+fields and serde attributes: `AppSpec` and its helpers are in
+`src/config/app.rs` and `src/config/types.rs`, and `DeployStrategy` is in
+`src/meat/deploy_types.rs`.
+
 ```rust
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -425,45 +432,25 @@ pub struct WorkloadId {
 pub struct AppSpec {
     pub name: String,
     pub namespace: String,
-    pub workload_source: WorkloadSource,
+    pub image: Option<String>,               // a container workload
+    pub exec: Option<PathBuf>,                // or a host binary
+    pub script: Option<String>,               // or an inline script
+    pub command: Vec<String>,
     pub port: Option<u16>,
     pub health: Option<HealthSpec>,
-    pub cpu: ResourceRange,
-    pub memory: ResourceRange,
+    pub cpu: Option<ResourceRange>,
+    pub memory: Option<ResourceRange>,
     pub gpu: Option<u32>,
-    pub env: HashMap<String, EnvValue>,
-    pub config_files: Vec<ConfigFileSpec>,
-    pub volume: Option<VolumeSpec>,
-    pub init_containers: Vec<InitContainerSpec>,
+    pub env: BTreeMap<String, EnvValue>,
+    pub config_file: Vec<ConfigFileSpec>,
+    pub volumes: Vec<VolumeSpec>,
+    pub init: Vec<InitContainerSpec>,
     pub sidecar: Vec<SidecarSpec>,           // #1120
-    pub allow_paths: Vec<MountPath>,
-    pub capabilities: Vec<String>,
-    pub capture: bool,
-    pub deploy: DeploySpec,
-    pub firewall: FirewallSpec,
-    pub egress: EgressSpec,
+    pub deploy: Option<DeploySpec>,
+    pub firewall: Option<FirewallSpec>,
+    pub egress: Option<EgressSpec>,
     pub autoscale: Option<AutoscaleSpec>,
-    pub placement: PlacementSpec,
-}
-
-/// Determines whether this workload runs as a container or a process.
-#[derive(Debug, Clone)]
-pub enum WorkloadSource {
-    /// Container workload: pull and run an OCI image.
-    Image {
-        image: String,
-        command: Option<Vec<String>>,
-    },
-    /// Process workload: run a pre-installed binary from the host.
-    Exec {
-        binary: PathBuf,
-        args: Vec<String>,
-    },
-    /// Process workload: run an inline script written to a temp file.
-    Script {
-        content: String,
-        interpreter: Option<String>, // inferred from shebang if absent
-    },
+    pub placement: Option<PlacementSpec>,
 }
 
 /// A resource range like "100m-500m" for CPU or "128Mi-512Mi" for memory.
@@ -519,34 +506,23 @@ pub enum HealthStatus {
 pub enum EnvValue {
     Plain(String),
     Encrypted(String), // ENC[AGE:...] -- decrypted at injection time
+    Provider(SecretReference), // PROVIDER[name:path] -- resolved on the node
 }
 
 /// A config file to mount into the workload's filesystem.
 #[derive(Debug, Clone)]
 pub struct ConfigFileSpec {
-    pub path: PathBuf,        // mount path inside the container
-    pub content: ConfigFileSource,
+    pub path: PathBuf,           // mount path inside the container
+    pub content: Option<String>, // inline content
+    pub source: Option<String>,  // or a source path
 }
 
-#[derive(Debug, Clone)]
-pub enum ConfigFileSource {
-    Inline(String),
-    GitRef(String),           // relative path within the git repo
-}
-
-/// A local persistent volume.
+/// A local persistent volume, or a host path mounted into the workload.
 #[derive(Debug, Clone)]
 pub struct VolumeSpec {
-    pub path: PathBuf,        // mount path inside the container
-    pub size: u64,            // bytes
-    pub snapshot: Option<SnapshotSchedule>,
-}
-
-/// An additional host path to mount into a process workload.
-#[derive(Debug, Clone)]
-pub struct MountPath {
-    pub host_path: PathBuf,
-    pub read_write: bool,     // false = read-only (default)
+    pub path: PathBuf,           // mount path inside the container
+    pub source: Option<PathBuf>, // a host path; unset means a managed volume
+    pub size: Option<String>,    // e.g. "10Gi"
 }
 
 /// Init container specification.
@@ -570,6 +546,7 @@ pub struct DeploySpec {
 #[derive(Debug, Clone, Copy)]
 pub enum DeployStrategy {
     Rolling,
+    BlueGreen,
 }
 
 /// Firewall rules for this app.
@@ -588,16 +565,19 @@ pub struct EgressSpec {
 #[derive(Debug, Clone)]
 pub struct AutoscaleSpec {
     pub metric: String,
-    pub target: u32,
+    pub target: String,       // e.g. "70%"
     pub min: u32,
     pub max: u32,
+    pub evaluation_window: Option<String>,
+    pub cooldown: Option<String>,
+    pub scale_down_threshold: Option<f64>,
 }
 
 /// Placement constraints.
 #[derive(Debug, Clone)]
 pub struct PlacementSpec {
-    pub required: HashMap<String, String>,
-    pub preferred: HashMap<String, String>,
+    pub required: Vec<String>,  // "key=value" node labels
+    pub preferred: Vec<String>,
 }
 ```
 
@@ -722,6 +702,14 @@ pub enum ContainerState {
 
 ### 4.3 Process Workload Types
 
+> **Status: planned, not implemented.** None of these types is in the tree:
+> the namespace, seccomp and capability stack for host processes is the
+> planned isolation work in §5.2 and §8.3. Today `ProcessGrill`
+> (`src/grill/process.rs`) runs an allowlisted binary or script directly on
+> the host, in its own process group. `[process_workloads] mount_isolation`
+> isn't built yet (#360): a node that sets it refuses host workloads rather
+> than run them without it.
+
 ```rust
 /// A process workload -- either a long-running app or a job.
 #[derive(Debug, Clone)]
@@ -756,11 +744,11 @@ pub struct IsolationConfig {
     pub cpu: ResourceRange,
     pub memory: ResourceRange,
     pub gpu_devices: Vec<GpuDevice>,
-    pub pid_namespace: bool,       // always true
-    pub network_namespace: bool,   // always true
-    pub mount_namespace: bool,     // always true
-    pub uts_namespace: bool,       // always true
-    pub user_namespace: bool,      // always false for process workloads
+    pub pid_namespace: bool,
+    pub network_namespace: bool,
+    pub mount_namespace: bool,
+    pub uts_namespace: bool,
+    pub user_namespace: bool,
     pub seccomp_profile: SeccompProfile,
     pub capabilities: Vec<LinuxCapability>,
     pub run_as_user: String,       // "burger" (never root)
@@ -813,183 +801,47 @@ pub enum LinuxCapability {
 
 ### 4.4 Node Configuration
 
-```rust
-/// The complete parsed representation of /etc/reliaburger/node.toml.
-/// Every field has a sensible default; the minimal config is just
-/// `[cluster] join = ["addr:port"]`.
-#[derive(Debug, Clone)]
-pub struct NodeConfig {
-    pub node: NodeIdentity,
-    pub cluster: ClusterConfig,
-    pub storage: StoragePaths,
-    pub resources: ResourceReservation,
-    pub network: NetworkConfig,
-    pub images: ImageConfig,
-    pub logs: LogConfig,
-    pub metrics: MetricsConfig,
-    pub ingress: IngressConfig,
-    pub process_workloads: ProcessWorkloadConfig,
-    pub upgrades: UpgradeConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct NodeIdentity {
-    /// Node name. Default: hostname.
-    pub name: String,
-    /// Arbitrary key-value labels for placement constraints.
-    /// `gpu = "true"` and `gpu_model = "<model>"` are added
-    /// automatically by GPU detection (`/dev/nvidia0` + `nvidia-smi`).
-    pub labels: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClusterConfig {
-    /// Addresses of existing cluster members to join.
-    /// Empty for the first node (`relish init`).
-    pub join: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct StoragePaths {
-    pub data: PathBuf,     // default: /var/lib/reliaburger/data
-    pub images: PathBuf,   // default: /var/lib/reliaburger/images
-    pub logs: PathBuf,     // default: /var/lib/reliaburger/logs
-    pub metrics: PathBuf,  // default: /var/lib/reliaburger/metrics
-    pub volumes: PathBuf,  // default: /var/lib/reliaburger/volumes
-}
-
-#[derive(Debug, Clone)]
-pub struct ResourceReservation {
-    /// CPU reserved for system + Bun overhead. Not allocatable to workloads.
-    pub reserved_cpu: u64,       // default: 500 millicores
-    /// Memory reserved for system + Bun overhead.
-    pub reserved_memory: u64,    // default: 512 MiB
-    /// Disk reserved for system.
-    pub reserved_disk: u64,      // default: 10 GiB
-    /// Whether to auto-detect GPUs (via `/dev/nvidia0` + `nvidia-smi`).
-    pub gpu_enabled: bool,       // default: true
-}
-
-#[derive(Debug, Clone)]
-pub struct NetworkConfig {
-    /// IP address this node advertises to the cluster.
-    /// Default: auto-detected from the default route interface.
-    pub advertise_address: Option<IpAddr>,
-    /// Ephemeral port range for container port mapping.
-    pub port_range: PortRange,   // default: 10000..32767 (end exclusive)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PortRange {
-    pub start: u16,
-    pub end: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct ImageConfig {
-    pub max_storage: u64,        // default: 50 GiB
-    pub redundancy: u32,         // default: 2
-    pub gc_retain_tags: u32,     // default: 10
-    pub gc_retain_days: u32,     // default: 30
-    pub pre_pull: bool,          // default: true
-    pub external_registries: Vec<ExternalRegistry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExternalRegistry {
-    pub host: String,
-    pub username: Option<String>,
-    pub password_secret: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LogConfig {
-    pub retention_days: u32,              // default: 7
-    pub compressed_retention_days: u32,   // default: 30
-    pub max_storage: u64,                 // default: 20 GiB
-}
-
-#[derive(Debug, Clone)]
-pub struct MetricsConfig {
-    pub collection_interval: Duration,    // default: 10s
-    pub retention_full: Duration,         // default: 24h
-    pub retention_1m: Duration,           // default: 7d
-    pub retention_1h: Duration,           // default: 90d
-    pub max_storage: u64,                 // default: 5 GiB
-}
-
-#[derive(Debug, Clone)]
-pub struct IngressConfig {
-    pub enabled: bool,                    // default: false
-    pub http_port: u16,                   // default: 80
-    pub https_port: u16,                  // default: 443
-    pub tls_cert: Option<PathBuf>,         // operator-supplied PEM chain
-    pub tls_key: Option<PathBuf>,          // operator-supplied PEM key
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessWorkloadConfig {
-    /// Explicit list of binaries permitted to run as process workloads.
-    /// When empty, process workloads are disabled on this node.
-    pub allowed_binaries: Vec<String>,
-    /// Whether glob patterns are permitted in allowed_binaries.
-    /// Default: false. Glob patterns in allowed_binaries are rejected
-    /// with an error unless this is true.
-    pub allow_globs: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpgradeConfig {
-    /// External Ed25519 signing key for dual-signature verification.
-    /// Required for network-based upgrades. Air-gapped (--binary)
-    /// upgrades work without this.
-    pub external_signing_key: Option<String>,
-    /// Number of previous binary versions to retain on disk.
-    pub retain_versions: u32,   // default: 3
-}
-```
+`NodeConfig` (`src/config/node.rs`) is the parsed `node.toml`: one
+`*Section` struct per table, each with `deny_unknown_fields`, so a key Bun
+doesn't know stops it at startup. §6.1 lists every key with its default, and
+the manual's "Node config sections" reference is the operator's copy. We
+don't keep a third listing here, because the first one drifted.
 
 ### 4.5 On-Disk Formats
 
-**Binary versioning layout:**
+**Binary versioning layout** (`src/upgrade/store.rs`), in `[upgrades]
+binary_dir`, which defaults to the directory of the running binary:
 
 ```
-/usr/local/bin/
-  reliaburger                  -> reliaburger-v1.4.0  (symlink)
-  reliaburger-v1.3.2           (previous version, kept for rollback)
-  reliaburger-v1.4.0           (current version)
-  reliaburger-v1.4.0.sig       (detached Ed25519 signature)
+{binary_dir}/
+  bun                          -> bun-v0.4.0  (symlink)
+  bun-v0.3.4                   (previous version, kept for rollback)
+  bun-v0.4.0                   (current version)
+  bun-v0.4.0.sig               (signature envelope)
 ```
 
-**Volume layout (Btrfs):**
+**Volume snapshots (Btrfs only)** (`src/grill/snapshot.rs`), next to the
+volumes they capture:
 
 ```
-/var/lib/reliaburger/volumes/
-  {namespace}/
-    {app_name}/
-      current/                  (Btrfs subvolume, mounted into workload)
-      snapshots/
-        {app}-{timestamp}/      (Btrfs snapshot, read-only)
+{volumes_dir}/.snapshots/{namespace}/{app}/{volume-slug}/
+  {name}                       (read-only Btrfs subvolume)
+  {name}.meta.json             (metadata)
+  {name}.pending               (intent file, only while a snapshot is made)
 ```
 
-**Volume layout (ext4/xfs fallback):**
+On any other filesystem the snapshot commands fail with an error: there's
+no directory-copy fallback, because a slow copy pretending to be a snapshot
+would be worse than an honest refusal.
+
+**Workload identity mount** (per instance, read-only bind mount):
 
 ```
-/var/lib/reliaburger/volumes/
-  {namespace}/
-    {app_name}/
-      current/                  (loop-mounted sparse file, size-limited)
-      snapshots/
-        {app}-{timestamp}/      (directory copy)
-```
-
-**Workload identity mount (tmpfs, per workload):**
-
-```
-/var/run/reliaburger/identity/
+/run/reliaburger/identity/
   cert.pem                      (X.509 certificate, SPIFFE SAN)
   key.pem                       (private key)
   ca.pem                        (CA trust chain)
+  bundle.pem                    (certificate and CA chain together)
   token                         (JWT with workload claims)
 ```
 
@@ -1008,9 +860,9 @@ pub struct UpgradeConfig {
 
 The leader acknowledges with `Ack`. Nothing travels down this connection: placements come from `GET /v1/placements/{node}`, and a node reports a failed rollout step with `POST /v1/rollouts/failed`, both on the HTTP API.
 
-**Bun <-> eBPF kernel maps:** Direct memory-mapped access via `libbpf` file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
+**Bun <-> eBPF kernel maps:** the `aya` crate loads the programs and holds the map file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
 
-**Bun <-> nftables:** Netlink socket via the `nft` library or direct `nftnl` bindings. Rules are expressed as nftables objects and committed atomically.
+**Bun <-> nftables:** Bun runs the `nft` command, one `nft -f` transaction per change, so each rule set is committed atomically.
 
 ### 4.7 Liveness, Readiness and Task Ownership
 
@@ -1148,7 +1000,7 @@ before their Phase 15 cases can use this contract.
 
 **Start a process workload:**
 
-1. Receive `AppSpec` from WorkloadSupervisor. Verify `WorkloadSource` is `Exec` or `Script`.
+1. Receive `AppSpec` from WorkloadSupervisor. Verify it sets `exec` or `script`, not `image`.
 2. Transition to `Pending`.
 3. **Admission (deny-by-default):** Before anything is allocated, the WorkloadSupervisor refuses a workload this node can't honour. Host execution is **deny-by-default**: an `Exec` binary runs only if its absolute path appears in `node.toml`'s `[process_workloads] allowed_binaries`, and a `Script` runs only if the interpreter (`/bin/sh`) is allowlisted too — a script is just host execution of the shell, so an empty allowlist refuses it exactly like an un-listed binary. An empty or absent allowlist therefore denies every host workload, not allows it. (Container workloads via runc/apple are unaffected; the allowlist gates only ProcessGrill host execution.) The refusal is a `DeployFailed` error surfaced to the caller, not a silent drop. Mount isolation is enforced here too: if the config asks for it on a node that can't provide it (a non-Linux host), the deploy is refused rather than run with a host process that can see every workload's volumes.
 4. **Write inline script (Script only):** Write the script content to a temporary file in a Bun-managed temp directory (outside any workload's mount namespace). Mark it executable (`chmod 0755`). Compute and record the SHA-256 hash for the event log.
@@ -1541,7 +1393,7 @@ The table below covers the common keys, not all of them. The [manual's node conf
 | `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | table of `start` and `end` (end exclusive); `start` must be below `end` | Ephemeral port range for container port mapping. |
 | `[images]` | `max_storage` | `"0"` | resource string (bytes), `"0"` is unlimited | Maximum disk space for Pickle image layers. |
 | `[images]` | `redundancy` | `2` | integer | Number of copies of each pushed layer, the pusher's included. |
-| `[images]` | `gc_retain_days` | `7` | days | Keep images accessed within this many days. |
+| `[images]` | `gc_retain_days` | `7` | days | Expire an image this many days after its last tag moved or was deleted, unless an app or job pins it. |
 | `[images]` | `external_registries` | `[]` | list of registry objects | External OCI registries for pulling images not in Pickle. |
 | `[images]` | `mirrors` | `{}` | map of upstream host to mirror `host[:port]` | Registries tried first for digest-pinned images; the upstream is the fallback. |
 | `[logs]` | `retention_days` | `7` | days | Days to keep log files. |
@@ -1948,9 +1800,8 @@ Unit tests cover individual components in isolation using mocked dependencies.
 
 **ProcessManager unit tests:**
 
-- Binary allowlist validation (exact match, glob match, glob rejection when `allow_globs = false`)
-- Mount namespace construction (default visible paths, blocked paths, `allow_paths` with `:rw` suffix)
-- Isolation config derivation from `AppSpec`
+- Binary allowlist validation (exact absolute-path match; there are no glob patterns)
+- Planned with the isolation stack (§4.3): mount namespace construction and isolation config derivation from `AppSpec`
 
 **HealthChecker unit tests:**
 
@@ -1963,7 +1814,7 @@ Unit tests cover individual components in isolation using mocked dependencies.
 
 - TOML parsing with all defaults
 - TOML parsing with all fields specified
-- Validation errors (invalid port range, glob without `allow_globs`, non-absolute paths)
+- Validation errors (invalid port range, non-absolute paths)
 - Auto-detection fallbacks (hostname, advertise address)
 
 **UpgradeManager unit tests:**

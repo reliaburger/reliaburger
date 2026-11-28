@@ -1,5 +1,9 @@
 # Meat: The Reliaburger Scheduler
 
+**Status:** Partly shipped.
+**Reconciled against:** not reconciled (§4 and the scoring in §3 checked against 0.3.4, #2515, #2518)
+**Sketches:** the §4 listings marked as sketches, the dedicated CPU budget in §1, the `[scheduler]` section in §6
+
 ## 1. Overview
 
 Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, granting job tasks to workers in chunks, releasing rollouts node by node, enforcing namespace resource quotas, and driving autoscaling reactions.
@@ -107,12 +111,12 @@ Meat uses a four-phase placement pipeline for App scheduling:
 
 The filter checks every node against one `WorkloadRequirements` value built from the spec, and so do daemon placement and the leader's check that a committed placement still holds (`meat::filter::node_can_run`), so the three can't disagree.
 
-**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better) decides:
+**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better; 15 of those points can't be reached until #1214, so 75 is the real top) decides:
 
 - **Bin-packing score (weight 50):** Prefer nodes fuller in both CPU and memory after placing this workload, evenly. This maximises density (see Bin-Packing Algorithm below).
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
-- **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
-- **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
+- **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise). The scoring is wired but inert: no node reports its cached images yet, so the leader passes an empty set for every node and every node scores 0 here (#1214).
+- **Node stability score (weight 5):** Prefer nodes the leader has known longer, full marks at 24h. Nodes don't report their uptime: the leader uses the time since its own gossip table first saw the node (`first_seen`), so the age restarts at zero for every node when the leader restarts or a new leader takes over, and council members can disagree. It only breaks ties worth 5 points.
 
 Spread was once a weight (60, scored on whether a node ran the App at all). That beat bin-packing only against a node with no replica: once every candidate ran one, the busier node took every replacement (#346). The replica count is now the first sort key, so no weight can outvote it.
 
@@ -178,6 +182,9 @@ All types are Rust structs using `serde` for serialisation (Raft log entries and
 
 ### Core Scheduling Types
 
+Original sketch, in part: `JobId` is not in the tree. `NodeId`, `AppId` and `Resources` are in `src/meat/types.rs`.
+
+<!-- sketch -->
 ```rust
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -224,6 +231,9 @@ pub struct ResourceRange {
 
 ### Placement and Constraints
 
+Original sketch; these types are not in the tree. Placement is `PlacementSpec` in `src/config/app.rs`, with `required` and `preferred` as lists of `key=value` labels, and the replica mode is the `Replicas` enum in `src/config/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// Placement constraints for an App or Job.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -250,6 +260,9 @@ pub enum ReplicaMode {
 
 ### App and Job Specs
 
+Original sketch, in part: `WorkloadSource` and `InitContainer` are not in the tree. The shipped `AppSpec`, `JobSpec` and `InitContainerSpec` are in `src/config/app.rs` and `src/config/job.rs`; a workload names its source with the `image`, `exec` or `script` field.
+
+<!-- sketch -->
 ```rust
 /// Workload source: either a container image or a host process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -442,8 +455,12 @@ pub struct NodeCapacity {
     /// Timestamp of the last state report received.
     pub last_report: Instant,
     /// Set of image references available in the local Pickle cache.
+    /// Planned (#1214): nothing reports it, so the leader's
+    /// `SchedulerNodeState.cached_images` is always empty.
     pub cached_images: HashSet<String>,
-    /// Node uptime since last Bun restart.
+    /// Planned: a reported uptime. The leader's
+    /// `SchedulerNodeState.uptime_secs` is how long its own gossip table has
+    /// known the node instead.
     pub uptime: Duration,
     /// Whether process workloads are enabled (allowlist configured).
     pub process_workloads_enabled: bool,
@@ -569,6 +586,9 @@ pub struct AppRollouts {
 
 ### Autoscaler State
 
+Original sketch; `MetricSample` is not in the tree, and the shipped `AutoscaleState` in `src/meat/autoscaler.rs` keeps only the baseline and current replica counts and the last scale event.
+
+<!-- sketch -->
 ```rust
 /// Runtime state for the autoscaler for a single App.
 #[derive(Clone, Debug)]
@@ -605,7 +625,7 @@ When an App spec with `replicas = 3` is submitted:
 1. The API validates the spec (schema, permissions) before committing it; Meat checks the namespace quota in its scheduling pass (§5.6).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
-   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5).
+   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5; image locality scores 0 everywhere until #1214).
    - **Select:** Pick the highest-scoring node.
    - **Commit:** Reserve resources on the selected node in the cluster state cache, then commit the `SchedulingDecision` to the Raft log.
 3. After all replicas are committed, the decisions are disseminated to target Bun agents.

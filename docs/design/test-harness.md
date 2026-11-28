@@ -1,5 +1,9 @@
 # Test harness
 
+**Status:** Shipped. A process document: the suites and gates the project runs today.
+**Reconciled against:** not reconciled
+**Sketches:** none
+
 The test count used to answer the wrong question. It mixed portable correctness tests,
 tests that returned successfully without running, privileged Linux checks, hour-long scale
 simulations and Criterion benchmarks into one reassuring number. A green line could mean

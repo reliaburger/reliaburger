@@ -1,5 +1,9 @@
 # Sesame -- Security, PKI & Identity
 
+**Status:** Partly shipped. The CA hierarchy, node mTLS, join tokens, workload identity and API tokens ship; the sections under Sketches are planned.
+**Reconciled against:** not reconciled
+**Sketches:** TPM attestation in §5.2, the target key split in §3.2, §4.8, §5.6, root rotation in §5.8, §5.12, §6.6
+
 ## 1. Overview
 
 Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log entries are encrypted at rest under a key derived from the cluster master key; the Raft snapshot is not (§5.6).

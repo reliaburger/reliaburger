@@ -11,7 +11,9 @@ The new binary adopts running workloads without restarting them, and one that
 crash-loops on boot reverts to the previous version by itself, even one that
 exits before it has read its config. It counts each start, and after
 `[upgrades] max_boot_attempts` + 1 failed starts it puts the previous version
-back. Adopted
+back. A new binary must also stay up for `[upgrades] boot_grace_secs` (30)
+once it answers `/v1/version`, and in a cluster rejoin gossip within
+`[upgrades] gossip_rejoin_secs` (60), or the node reverts. Adopted
 replicas stay on their node: while a restarted bun's subsystems are still in
 their first start, the leader keeps that node's placements and places nothing
 new there. (Up to 0.2.3, a bun restart in a multi-node cluster could move its
