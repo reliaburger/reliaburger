@@ -453,6 +453,12 @@ and before anything cleans up.
   the runner cancelled at its deadline stays open, so a timeout reads
   `case exceeded its 300000 ms deadline during step "exec in registry-web"`
   rather than just the deadline. Name a step for what it waits on.
+- **Bounded poll rounds.** Each round of a wait helper's reads (`nodes()`
+  and every node's `status()`) gets 10 s, or a quarter of the case's
+  remaining budget when that's less. A round that runs out counts as a
+  failed read: the wait records it in its note ("a status read did not
+  answer within … ms") and asks again on a fresh connection, so one
+  request that never answers can't spend the whole case (#2128).
 - **The soak harness.** `record_failure` runs before the caller's own
   cleanup (fault clear, settle). A `relish test` check passes its JSON
   report too: the bundle keeps it as `test-report.json`, writes the failing

@@ -283,6 +283,12 @@ fn millis(duration: Duration) -> u64 {
 /// a case's budget, so a wedged exec leaves time to report it (#2128).
 const WORKLOAD_EXEC_BOUND: Duration = Duration::from_secs(60);
 
+/// The longest one round of a wait's status reads may take. A read held
+/// on a dead pooled connection otherwise waits out the client's 300 s
+/// request timeout, which is a whole case (#2128). Dropping it closes that
+/// connection, so the next round asks on a fresh one.
+const POLL_ROUND_BOUND: Duration = Duration::from_secs(10);
+
 /// How much sooner than the test kit's wait the agent is asked to give up,
 /// so its named `504` crosses the network before the test kit stops waiting.
 const EXEC_ANSWER_MARGIN: Duration = Duration::from_secs(5);
@@ -378,6 +384,25 @@ impl TestContext {
             .map_err(|error| error.to_string())?;
         self.trace.end_step(sequence).await;
         Ok(output)
+    }
+
+    /// Run one round of a wait's reads under [`POLL_ROUND_BOUND`], or a
+    /// quarter of what the case has left when that's less, so a read that
+    /// never answers leaves time to ask again. A round that runs out says
+    /// so, for the wait's note.
+    async fn poll_round<T, F>(&self, round: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        let bound = POLL_ROUND_BOUND.min(self.deadline.remaining() / 4);
+        tokio::time::timeout(bound, round)
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "a status read did not answer within {} ms",
+                    bound.as_millis()
+                ))
+            })
     }
 
     /// Run one exec on `client` under the test kit's exec bound, asking the
@@ -790,7 +815,7 @@ impl TestContext {
             .await;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            let last_error = match self.cluster_instances(app).await {
+            let last_error = match self.poll_round(self.cluster_instances(app)).await {
                 Ok(instances) => {
                     last = instances;
                     if predicate(&last) {
@@ -811,8 +836,13 @@ impl TestContext {
             if self.deadline.remaining().is_zero() {
                 return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
-            self.trace.record_wait(waiting).await;
+            self.trace.record_wait(waiting.clone()).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
+            // A round started with nothing left only reports the deadline,
+            // which would replace the note saying what the last round saw.
+            if self.deadline.remaining().is_zero() {
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
+            }
         }
     }
 
@@ -1022,7 +1052,13 @@ impl TestContext {
             .await;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            if let Ok(Ok(all)) = self.deadline.run("status poll", self.client.status()).await {
+            let read = self.poll_round(async {
+                self.client
+                    .status()
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            if let Ok(all) = read.await {
                 last = all
                     .into_iter()
                     .filter(|instance| {
@@ -2027,6 +2063,68 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// #2128: one status read that never answers, as a request held on a
+    /// pooled connection did in the 0.3.0 final, costs one bounded round,
+    /// not the case. The wait notes it and asks again, and the next read
+    /// finds the replica running.
+    #[tokio::test]
+    async fn a_status_read_that_never_answers_is_retried_within_the_case() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        let instances = serde_json::json!([{
+            "id": "web-0", "app_name": "web", "namespace": "rbtest-wait",
+            "state": "running", "restart_count": 0, "host_port": null, "pid": null
+        }]);
+        let router = axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                axum::routing::get(|| async {
+                    axum::Json(Vec::<crate::bun::agent::NodeStatus>::new())
+                }),
+            )
+            .route(
+                "/v1/status",
+                axum::routing::get(move || {
+                    let instances = instances.clone();
+                    let first = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    async move {
+                        if first {
+                            std::future::pending::<()>().await;
+                        }
+                        axum::Json(instances)
+                    }
+                }),
+            );
+        let (base, server) = serve(router).await;
+        let mut context = context("rbtest-wait");
+        context.client = BunClient::new_with_token(&base, None);
+        context.deadline = Deadline::after(Duration::from_secs(8)).unwrap();
+        let started = std::time::Instant::now();
+        let result = context.wait_running_cluster("web", 1).await;
+        server.abort();
+        assert_eq!(result, Ok(()));
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    /// #2128: a wait whose every read hangs still ends in its own message,
+    /// naming the read that didn't answer, before the runner's deadline.
+    #[tokio::test]
+    async fn a_wait_whose_reads_never_answer_says_so() {
+        let router = axum::Router::new().route(
+            "/v1/cluster/nodes",
+            axum::routing::get(std::future::pending::<axum::Json<serde_json::Value>>),
+        );
+        let (base, server) = serve(router).await;
+        let mut context = context("rbtest-wait");
+        context.client = BunClient::new_with_token(&base, None);
+        context.deadline = Deadline::after(Duration::from_secs(3)).unwrap();
+        let error = context.wait_running_cluster("web", 1).await.unwrap_err();
+        server.abort();
+        assert!(error.contains("waiting for web to reach"), "{error}");
+        assert!(error.contains("did not answer within"), "{error}");
     }
 
     /// #2128: the agent's own timeout answer reads the same way, and the
