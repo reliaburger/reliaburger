@@ -334,6 +334,10 @@ pub struct Compatibility {
 /// the `declared_images` on `TaskArrayWrite::RegisterJobs` and `DeployBegin`
 /// are new. `JobDefinition` and `DeploymentRecord` refuse unknown fields, so
 /// an older replica can't read them (#1322).
+/// Gossip `Sync` carries the sender's member count, so joiners get pages of
+/// the table (#2442).
+/// The gossip directory extension carries the leader hint's age, so a hint
+/// nobody re-advertises expires (#2406).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
