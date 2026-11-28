@@ -10687,6 +10687,54 @@ async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
     assert_eq!(kept, vec![healthy.0]);
 }
 
+/// #2541: on a loaded edge box after a power cut, re-adopting one surviving
+/// instance took longer than the adoption timeout. The timeout ended
+/// startup, so Bun exited and systemd had to start it again. A slow
+/// adoption is an instance whose ownership is unknown: it's fenced and
+/// retired, so it starts again through reconciliation, and every other
+/// instance on the node is still adopted.
+#[tokio::test(start_paused = true)]
+async fn an_adoption_past_its_timeout_is_fenced_and_retired_and_bun_starts() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    for (index, app) in ["hello", "redis"].into_iter().enumerate() {
+        let mut record = adoption_record(&format!("default__{app}-0"), app, false);
+        record.host_port = Some(30123 + index as u16);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+    }
+    let slow = InstanceId("default__hello-0".into());
+    let healthy = InstanceId("default__redis-0".into());
+    grill.set_adopt_result(&slow, true);
+    grill.set_adopt_result(&healthy, true);
+    grill.set_adopt_delay(&slow, std::time::Duration::from_secs(60));
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    assert!(agent.supervisor.get_instance(&slow).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy).unwrap().state,
+        ContainerState::Running
+    );
+    let slow_calls: Vec<String> = grill
+        .calls()
+        .into_iter()
+        .filter(|(_, id)| *id == slow)
+        .map(|(op, _)| op)
+        .collect();
+    let adopted_at = slow_calls.iter().position(|op| op == "adopt").unwrap();
+    assert!(
+        slow_calls[adopted_at..].iter().any(|op| op == "kill"),
+        "the slow instance was never fenced: {slow_calls:?}"
+    );
+    let kept: Vec<_> = crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect();
+    assert_eq!(kept, vec![healthy.0]);
+}
+
 /// Two records beside each other on disk: `stale` is changed by the test,
 /// `healthy` matches its runtime launch and must still adopt (#1852).
 async fn power_cut_split_fixture(

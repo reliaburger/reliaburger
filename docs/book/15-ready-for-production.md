@@ -10728,6 +10728,65 @@ the last cut of a run whose late start nobody ever recorded, it says
 than one that can't fail, but only just: after the third false alarm you
 stop reading the alarms.
 
+### And then a real one
+
+With the checker trusted, the runs started finding Reliaburger's own bugs.
+In run 37, cut 108, Bun came back after the power-on, began re-adopting the
+containers that had survived, and exited: `cannot restore workload
+ownership: runtime adoption timed out for default__hello-0`. systemd started
+it again two seconds later and it recovered, with no data lost, which is why
+I1, I2 and I7 passed and only I4 ("Bun started once") caught it. The journal
+showed a loaded box: the report worker's snapshots had been timing out for
+fifteen seconds before it. Adoption gives each instance 10 s to prove it's
+still the launch its record names, and the timeout was written with `??`, so
+a slow answer became an error and the error ended startup
+([#2541](https://github.com/reliaburger/reliaburger/issues/2541)).
+
+Startup refuses on uncertainty for a reason: an instance Bun can't account
+for might still be running, and starting a second copy beside it is worse
+than not starting. But a slow adoption is a different kind of uncertainty
+from a corrupt record, because Bun can settle it: kill the instance and wait
+for the runtime to confirm it has exited. Then the instance is known to be
+stopped, and it can be retired like one the runtime refused, to start again
+through ordinary reconciliation. So the timeout now gets a `match` of its
+own instead of the `??`:
+
+```rust
+let adopted = match tokio::time::timeout(
+    ADOPTION_TIMEOUT,
+    self.supervisor.grill().adopt(&runtime_id, &record),
+)
+.await
+{
+    Ok(answer) => answer?,
+    Err(_) => {
+        self.fence_unanswered_adoption(&runtime_id).await?;
+        false
+    }
+};
+```
+
+`tokio::time::timeout` wraps the future's own `Result` in a second one: the
+outer `Err` means time ran out, the inner one is the runtime's own error.
+`??` unwraps both and returns either error, which treats "slow" and "wrong"
+the same. The `match` keeps the runtime's errors as fatal as they were, and
+gives the timeout its own answer. If the kill isn't confirmed, startup still
+refuses, as it always did.
+
+What about the half-finished adoption? The run left a runc helper process
+behind when Bun exited, so it mattered. When a timeout fires, Rust drops the
+future it was waiting on, and dropping an async future cancels it at its
+last `.await`. That would be a problem if the adoption's runc commands lived
+inside that future. They don't: runc's Grill runs every operation on an
+instance in a `tokio::spawn`ed task holding that instance's lifecycle lock,
+and dropping a task's `JoinHandle` only stops waiting for it. The task runs
+on and reaps the commands it started. The fence's kill takes the same lock,
+so it queues behind the adoption, which is why the kill gets the adoption's
+10 s on top of its usual bound. The test is a mock runtime whose adoption of
+one instance takes a minute, under Tokio's paused clock so it doesn't: Bun
+must adopt the other instance, kill the slow one after its adoption began,
+and remove its record (`an_adoption_past_its_timeout_is_fenced_and_retired_and_bun_starts`).
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node

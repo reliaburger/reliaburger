@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// How long one recorded instance's runtime adoption may take at startup
+/// before Bun stops waiting for it and fences the instance instead (#2541).
+const ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Commit permission to execute only after the runtime has prepared this attempt.
     pub(super) async fn transition_deploy_state(
@@ -516,14 +520,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    /// Fence an instance whose adoption didn't answer within
+    /// `ADOPTION_TIMEOUT`, so startup can retire it like one the runtime
+    /// refused and carry on (#2541). Before, the timeout ended startup: on a
+    /// loaded edge box after a power cut, one slow adoption made Bun exit
+    /// and systemd start it again.
+    ///
+    /// The kill is what makes this safe. Until it's confirmed, the instance
+    /// may still run, and retiring its record would let reconciliation
+    /// start a second copy. A kill that isn't confirmed still refuses
+    /// startup, as any uncertain observation does.
+    ///
+    /// runc runs each adoption in a task of its own under the instance's
+    /// lifecycle lock, and timing out only stops waiting for that task: it
+    /// runs on and reaps the runtime commands it started. The kill takes
+    /// the same lock, so it waits for the adoption to finish, which is why
+    /// it gets the adoption's budget on top of its own. Nothing the
+    /// adoption started is left behind.
+    async fn fence_unanswered_adoption(&self, id: &InstanceId) -> Result<(), BunError> {
+        eprintln!(
+            "bun: {id}: runtime adoption didn't answer in {} s; stopping it to start it again",
+            ADOPTION_TIMEOUT.as_secs()
+        );
+        sidecars::kill_unless_forgotten(
+            self.supervisor.grill(),
+            id,
+            ADOPTION_TIMEOUT + self.stop_confirmation_timeout,
+        )
+        .await
+    }
+
     /// Adopt still-running workloads recorded by a previous bun process.
     ///
     /// Called once at startup, BEFORE any reconciliation: adopted instances
     /// are seeded into the supervisor as Running so they don't get
     /// double-started. Records whose process is gone are deleted (the
-    /// instance reschedules through the normal path). Returns the number
-    /// of instances adopted. Any uncertain observation refuses startup and
-    /// preserves durable records and identity material for recovery.
+    /// instance reschedules through the normal path), and so are those of
+    /// instances whose adoption didn't answer in time, once a kill has
+    /// fenced them (#2541). Returns the number of instances adopted. Any
+    /// other uncertain observation refuses startup and preserves durable
+    /// records and identity material for recovery.
     ///
     /// App backoff starts fresh; normal reconciliation rebuilds cluster
     /// routing.
@@ -645,14 +681,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
-            let adopted = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+            let adopted = match tokio::time::timeout(
+                ADOPTION_TIMEOUT,
                 self.supervisor.grill().adopt(&runtime_id, &record),
             )
             .await
-            .map_err(|_| {
-                BunError::AdoptionState(format!("runtime adoption timed out for {runtime_id}"))
-            })??;
+            {
+                Ok(answer) => answer?,
+                Err(_) => {
+                    self.fence_unanswered_adoption(&runtime_id).await?;
+                    false
+                }
+            };
             if !adopted {
                 if !self.defer_startup_retirement(&runtime_id).await? {
                     self.retire_instance_artifacts_fully(&runtime_id).await?;

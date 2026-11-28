@@ -1136,7 +1136,7 @@ before their Phase 15 cases can use this contract.
 **Reconnect after Bun restart:**
 
 1. On startup, Bun reads the instance records it wrote for each launch (`adopt_recorded_instances` in `src/bun/agent/records.rs`) and the runtime's durable launch inventory (the runc intent journal, the process records).
-2. For each record, the runtime backend adopts the instance only on positive evidence that it's still the same live launch (`runc state`, the Apple `container inspect`, or the process's pid, start time and boot id). A launch it can't prove is retired, never guessed at.
+2. For each record, the runtime backend adopts the instance only on positive evidence that it's still the same live launch (`runc state`, the Apple `container inspect`, or the process's pid, start time and boot id). A launch it can't prove is retired, never guessed at. An adoption that doesn't answer within 10 s is fenced: Bun kills the instance, and once the runtime confirms it has exited, retires it like a refused one, so reconciliation starts it again and the rest of the node starts as usual. Only a kill that isn't confirmed refuses startup (#2541). runc runs the adoption in a task of its own under the instance's lifecycle lock, so the kill waits for it to finish and nothing it started is left behind; the kill gets the adoption's 10 s on top of its own bound for that reason.
 3. Re-attach log capture (Ketchup resumes).
 4. Resume health checking.
 5. Re-populate the Onion service map from the adopted instances.
