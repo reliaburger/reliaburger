@@ -1,0 +1,44 @@
+{
+  "bun_categories": {
+    "Bun: API server": 12.0,
+    "Bun: Raft core and log": 1.0,
+    "Bun: agent loop and supervisor": 9.0,
+    "Bun: async runtime (scheduler, timers, parking)": 23.0,
+    "Bun: containers (Grill)": 34.0,
+    "Bun: metrics (Mayo)": 18.0,
+    "Bun: other Reliaburger code": 14.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: service discovery (Onion)": 2.0,
+    "Bun: task-array leader tick and node sync": 2.0
+  },
+  "bun_total": 116.0,
+  "categories": {
+    "Bun: API server": 12.0,
+    "Bun: Raft core and log": 1.0,
+    "Bun: agent loop and supervisor": 9.0,
+    "Bun: async runtime (scheduler, timers, parking)": 23.0,
+    "Bun: containers (Grill)": 34.0,
+    "Bun: metrics (Mayo)": 18.0,
+    "Bun: other Reliaburger code": 14.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: service discovery (Onion)": 2.0,
+    "Bun: task-array leader tick and node sync": 2.0,
+    "idle (no runnable work)": 39717.0,
+    "other processes and kernel threads": 68.0
+  },
+  "other_by_command": {
+    "containerd": 9.0,
+    "exe": 19.0,
+    "jbd2/vda1": 1.0,
+    "kworker/3:3-mm_": 1.0,
+    "kworker/u8:1-ev": 1.0,
+    "lima-guestagent": 28.0,
+    "multipathd": 2.0,
+    "rcu_preempt": 4.0,
+    "rootlesskit": 1.0,
+    "vmstat": 2.0
+  },
+  "rate": 0.0,
+  "total": 39901.0,
+  "uncategorised_share": 0.0
+}

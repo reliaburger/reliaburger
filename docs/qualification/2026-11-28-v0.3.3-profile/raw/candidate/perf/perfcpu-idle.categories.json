@@ -1,0 +1,42 @@
+{
+  "bun_categories": {
+    "Bun: API server": 15.0,
+    "Bun: Raft core and log": 5.0,
+    "Bun: agent loop and supervisor": 10.0,
+    "Bun: async runtime (scheduler, timers, parking)": 16.0,
+    "Bun: containers (Grill)": 61.0,
+    "Bun: metrics (Mayo)": 9.0,
+    "Bun: other Reliaburger code": 10.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: task-array leader tick and node sync": 3.0
+  },
+  "bun_total": 130.0,
+  "categories": {
+    "Bun: API server": 15.0,
+    "Bun: Raft core and log": 5.0,
+    "Bun: agent loop and supervisor": 10.0,
+    "Bun: async runtime (scheduler, timers, parking)": 16.0,
+    "Bun: containers (Grill)": 61.0,
+    "Bun: metrics (Mayo)": 9.0,
+    "Bun: other Reliaburger code": 10.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: task-array leader tick and node sync": 3.0,
+    "helper/child: exit and address-space teardown": 1.0,
+    "idle (no runnable work)": 39711.0,
+    "other processes and kernel threads": 61.0
+  },
+  "other_by_command": {
+    "containerd": 9.0,
+    "containerd-star": 2.0,
+    "exe": 17.0,
+    "kworker/1:0-mm_": 1.0,
+    "lima-guestagent": 23.0,
+    "perf": 2.0,
+    "rcu_preempt": 4.0,
+    "rootlesskit": 1.0,
+    "vmstat": 2.0
+  },
+  "rate": 0.0,
+  "total": 39903.0,
+  "uncategorised_share": 0.0
+}

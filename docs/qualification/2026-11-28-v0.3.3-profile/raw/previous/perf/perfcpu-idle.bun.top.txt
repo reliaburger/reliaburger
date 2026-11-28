@@ -1,0 +1,81 @@
+total 116
+100.00% incl  12.07% self  [libc.so.6]
+100.00% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+ 85.34% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 85.34% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 85.34% incl   0.00% self  tokio-rt-worker
+ 56.03% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::maybe_move_runtime::{closure}::{cl
+ 56.03% incl   1.72% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 42.24% incl   0.00% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 41.38% incl   0.00% self  el0t_64_sync_handler
+ 41.38% incl   0.86% self  el0_svc
+ 41.38% incl   0.00% self  el0t_64_sync
+ 40.52% incl   0.00% self  el0_svc_common.constprop.0
+ 40.52% incl   0.00% self  do_el0_svc
+ 39.66% incl   0.86% self  invoke_syscall
+ 15.52% incl   0.86% self  syscall
+ 15.52% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<reliaburger::grill::process_control::ProcessControl>::run<reliaburger::grill::proc
+ 14.66% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<rayon_core::registry::DefaultSpawn as rayon_core::registry::ThreadSpawn>::spawn::{closure}, ()>::{closure} as core::op
+ 14.66% incl   0.00% self  rb-bun
+ 14.66% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<rayon_core::registry::DefaultSpawn as rayon_core::registry::ThreadSpawn>::spawn::{closure}, ()>
+ 14.66% incl   0.00% self  <rayon_core::registry::WorkerThread>::wait_until_cold
+ 14.66% incl   0.00% self  <rayon_core::registry::ThreadBuilder>::run
+ 13.79% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::inspect_status
+ 12.93% incl   0.00% self  __arm64_sys_futex
+ 12.93% incl   0.00% self  do_futex
+ 12.93% incl   0.00% self  sysinfo::unix::linux::process::refresh_procs::{closure}
+ 11.21% incl   0.00% self  rayon::iter::plumbing::bridge_unindexed_producer_consumer<&rayon::iter::par_bridge::IterParallelProducer<alloc::boxed::Box<dyn core::iter::traits::iterator::Ite
+ 11.21% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::finish_retirement
+ 10.34% incl   0.00% self  <&rayon::iter::par_bridge::IterParallelProducer<alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator + core::marker::Send>> as rayon::iter::plumbing::Un
+ 10.34% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::load
+ 10.34% incl   0.00% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  9.48% incl   0.00% self  rayon::iter::plumbing::bridge_producer_consumer::helper<rayon::vec::DrainProducer<sysinfo::unix::linux::process::ProcAndTasks>, rayon::iter::filter_map::FilterM
+  8.62% incl   0.00% self  reliaburger::grill::process_owner::load
+  7.76% incl   0.00% self  futex_wake
+  7.76% incl   0.00% self  wake_up_q
+  7.76% incl   7.76% self  try_to_wake_up
+  7.76% incl   0.00% self  <rayon_core::job::StackJob<rayon_core::latch::SpinLatch, rayon_core::join::join_context::call_b<alloc::collections::linked_list::LinkedList<alloc::vec::Vec<sysi
+  7.76% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<reliaburger::grill::capture::CaptureReader>::read_chunk::{closure}::{closure}>, to
+  7.76% incl   0.00% self  reliaburger::sesame::connection::serve_tls_connection<<std::time::SystemTime>::now>::{closure}
+  7.76% incl   0.00% self  tokio::runtime::task::raw::poll<reliaburger::sesame::connection::serve_tls_connection<<std::time::SystemTime>::now>::{closure}, alloc::sync::Arc<tokio::runtime:
+  7.76% incl   0.00% self  <hyper_util::server::conn::auto::UpgradeableConnection<hyper_util::rt::tokio::TokioIo<reliaburger::sesame::connection::StallGuardedIo<reliaburger::sesame::conne
+  7.76% incl   0.00% self  reliaburger::sesame::connection::serve_http_connection<reliaburger::sesame::connection::LifetimeLimitedIo<tokio_rustls::server::TlsStream<tokio::net::tcp::strea
+  6.90% incl   0.00% self  sysinfo::unix::linux::process::_get_stat_data
+  6.90% incl   0.86% self  malloc
+  6.90% incl   0.00% self  <tokio::runtime::time::Driver>::park_internal
+  6.90% incl   0.00% self  <axum::util::MapIntoResponseFuture<axum::routing::route::RouteFuture<core::convert::Infallible>> as core::future::future::Future>::poll
+  6.90% incl   0.00% self  <axum::middleware::from_fn::FromFn<reliaburger::bun::api::audit::audit_layer, reliaburger::bun::api::ApiState, axum::routing::route::Route, (axum::extract::stat
+  6.90% incl   0.00% self  <axum::util::MapIntoResponseFuture<tower::util::map_err::MapErrFuture<axum::routing::route::RouteFuture<core::convert::Infallible>, <core::convert::Infallible a
+  6.90% incl   0.00% self  <axum::middleware::from_fn::Next>::run::{closure}
+  6.90% incl   0.00% self  <hyper_util::service::glue::TowerToHyperServiceFuture<axum::routing::Router, http::request::Request<hyper::body::incoming::Incoming>> as core::future::future::F
+  6.90% incl   0.00% self  <axum::middleware::map_response::MapResponse<reliaburger::bun::api::ui::forbid_framing, (), axum::routing::route::Route, ()> as tower_service::Service<http::req
+  6.90% incl   0.00% self  <axum::routing::route::RouteFuture<core::convert::Infallible> as core::future::future::Future>::poll
+  6.90% incl   0.00% self  <hyper::proto::h1::dispatch::Server<hyper_util::service::glue::TowerToHyperService<axum::routing::Router>, hyper::body::incoming::Incoming> as hyper::proto::h1:
+  6.90% incl   0.00% self  <axum::middleware::from_fn::FromFn<reliaburger::bun::api::audit::refusal_layer, reliaburger::bun::api::ApiState, axum::routing::route::Route, (axum::extract::st
+  6.90% incl   0.00% self  <axum::util::MapIntoResponseFuture<tower::util::map_err::MapErrFuture<axum::middleware::from_fn::ResponseFuture, <core::convert::Infallible as core::convert::In
+  6.90% incl   0.00% self  <hyper::proto::h1::dispatch::Dispatcher<hyper::proto::h1::dispatch::Server<hyper_util::service::glue::TowerToHyperService<axum::routing::Router>, hyper::body::i
+  6.90% incl   0.00% self  <axum::util::MapIntoResponseFuture<tower::util::map_err::MapErrFuture<axum::middleware::map_response::ResponseFuture, <core::convert::Infallible as core::conver
+  6.90% incl   0.00% self  <axum::middleware::from_fn::FromFn<reliaburger::bun::api::internal::refuse_retired_tls_peer, reliaburger::bun::api::ApiState, axum::routing::route::Route, (axum
+  6.90% incl   0.00% self  <axum::middleware::from_fn::FromFn<reliaburger::sesame::auth::auth_middleware, reliaburger::sesame::auth::AuthState, axum::routing::route::Route, (axum::extract
+  6.90% incl   0.00% self  <axum::middleware::map_response::ResponseFuture as core::future::future::Future>::poll
+  6.03% incl   0.00% self  <std::fs::OpenOptions>::_open
+  6.03% incl   0.00% self  open64
+  6.03% incl   0.00% self  rayon_core::join::join_context<rayon::iter::plumbing::bridge_producer_consumer::helper<rayon::vec::DrainProducer<sysinfo::unix::linux::process::ProcAndTasks>, r
+  6.03% incl   0.00% self  <std::sys::fs::unix::File>::open_c
+  6.03% incl   0.86% self  <parking_lot::condvar::Condvar>::wait_until_internal
+  6.03% incl   0.00% self  <parking_lot::condvar::Condvar>::notify_one_slow
+  6.03% incl   0.86% self  tokio::runtime::task::raw::poll<<reliaburger::bun::agent::BunAgent<reliaburger::grill::AnyGrill>>::spawn_log_forwarder::{closure}, alloc::sync::Arc<tokio::runti
+  6.03% incl   0.00% self  <reliaburger::sesame::trust::TrustSet>::validate_node_leaf
+  6.03% incl   0.00% self  reliaburger::cluster::runtime::spawn_supervised<reliaburger::cluster::runtime::start::{closure}::{closure}>::{closure}
+  6.03% incl   0.00% self  <axum::util::MapIntoResponseFuture<axum::handler::future::IntoServiceFuture<core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future + core::marker::Se
+  6.03% incl   0.00% self  reliaburger::bun::audit::scope_request<<axum::middleware::from_fn::Next>::run::{closure}>::{closure}
+  5.17% incl   0.00% self  sysinfo::unix::linux::process::_get_stat_data_and_file
+  5.17% incl   0.00% self  __arm64_sys_openat
+  5.17% incl   0.00% self  <reliaburger::bun::agent::BunAgent<reliaburger::grill::AnyGrill>>::spawn_log_forwarder::{closure}
+  5.17% incl   0.00% self  <reliaburger::grill::AnyGrill as reliaburger::grill::Grill>::follow_logs::{closure}
+  5.17% incl   0.00% self  <reliaburger::grill::runc::RuncGrill as reliaburger::grill::Grill>::follow_logs::{closure}
+  5.17% incl   0.00% self  <ring::ec::suite_b::ecdsa::verification::EcdsaVerificationAlgorithm as ring::signature::VerificationAlgorithm>::verify
+  5.17% incl   0.00% self  ring::ec::suite_b::ops::p256::twin_mul_nistz256
+  5.17% incl   0.00% self  <core::pin::Pin<alloc::boxed::Box<reliaburger::bun::readiness::spawn_owned<reliaburger::cluster::runtime::spawn_supervised<reliaburger::cluster::runtime::start:
+  5.17% incl   0.00% self  <reliaburger::reporting::transport::TcpReportingSender as reliaburger::reporting::transport::ReportingTransport>::send::{closure}
+  5.17% incl   0.00% self  <reliaburger::reporting::worker::ReportWorker<reliaburger::reporting::transport::TcpReportingSender>>::send_report_until_shutdown::{closure}

@@ -1,0 +1,401 @@
+{
+  "categories": {
+    "perfcpu-host": {
+      "rows": [
+        {
+          "candidate": 37.08416833667334,
+          "category": "idle (no runnable work)",
+          "points": 1.255010020040075,
+          "previous": 35.82915831663327
+        },
+        {
+          "candidate": 0.00501002004008016,
+          "category": "Bun: GitOps loop",
+          "points": 0.00250501002004008,
+          "previous": 0.00250501002004008
+        },
+        {
+          "candidate": 0.06763527054108216,
+          "category": "Bun: task ledger (group commit, fsync)",
+          "points": 0.005010020040080165,
+          "previous": 0.062625250501002
+        },
+        {
+          "candidate": 10.586172344689379,
+          "category": "Bun: task-array leader tick and node sync",
+          "points": 0.1427855711422854,
+          "previous": 10.443386773547093
+        },
+        {
+          "candidate": 0.00250501002004008,
+          "category": "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)",
+          "points": 0.00250501002004008,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.045090180360721446,
+          "category": "Bun: Raft core and log",
+          "points": 0.017535070140280565,
+          "previous": 0.02755511022044088
+        },
+        {
+          "candidate": 0.03507014028056112,
+          "category": "Bun: agent loop and supervisor",
+          "points": 0.0125250501002004,
+          "previous": 0.022545090180360723
+        },
+        {
+          "candidate": 0.04008016032064128,
+          "category": "Bun: API server",
+          "points": -0.005010020040080165,
+          "previous": 0.045090180360721446
+        },
+        {
+          "candidate": 0.03006012024048096,
+          "category": "Bun: metrics (Mayo)",
+          "points": 0.005010020040080158,
+          "previous": 0.025050100200400802
+        },
+        {
+          "candidate": 0.00250501002004008,
+          "category": "Bun: gossip (Mustard)",
+          "points": 0.0,
+          "previous": 0.00250501002004008
+        },
+        {
+          "candidate": 0.00250501002004008,
+          "category": "Bun: service discovery (Onion)",
+          "points": 0.00250501002004008,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.09769539078156313,
+          "category": "Bun: containers (Grill)",
+          "points": 0.022545090180360716,
+          "previous": 0.07515030060120241
+        },
+        {
+          "candidate": 0.025050100200400802,
+          "category": "Bun: other Reliaburger code",
+          "points": -0.01002004008016032,
+          "previous": 0.03507014028056112
+        },
+        {
+          "candidate": 1.4253507014028055,
+          "category": "Bun: async runtime (scheduler, timers, parking)",
+          "points": 0.16032064128256507,
+          "previous": 1.2650300601202404
+        },
+        {
+          "candidate": 3.687374749498998,
+          "category": "helper/child: clone3 (process creation)",
+          "points": 0.04258517034068143,
+          "previous": 3.6447895791583167
+        },
+        {
+          "candidate": 7.282064128256513,
+          "category": "helper/child: execve",
+          "points": 0.06262525050100187,
+          "previous": 7.219438877755511
+        },
+        {
+          "candidate": 8.74248496993988,
+          "category": "helper/child: exit and address-space teardown",
+          "points": -0.455911823647293,
+          "previous": 9.198396793587174
+        },
+        {
+          "candidate": 7.4448897795591185,
+          "category": "helper/child: page faults",
+          "points": -0.3006012024048097,
+          "previous": 7.745490981963928
+        },
+        {
+          "candidate": 10.613727454909819,
+          "category": "helper: wait, poll, pipes and socket syscalls",
+          "points": -0.04509018036072199,
+          "previous": 10.658817635270541
+        },
+        {
+          "candidate": 2.18436873747495,
+          "category": "helper: user space and other kernel",
+          "points": 0.06763527054108254,
+          "previous": 2.1167334669338675
+        },
+        {
+          "candidate": 8.056112224448897,
+          "category": "busybox task: user space and other kernel",
+          "points": 0.1152304609218433,
+          "previous": 7.940881763527054
+        },
+        {
+          "candidate": 0.02004008016032064,
+          "category": "relish (raw scenario spawner and bench client)",
+          "points": -0.022545090180360723,
+          "previous": 0.042585170340681364
+        },
+        {
+          "candidate": 2.5200400801603204,
+          "category": "other processes and kernel threads",
+          "points": -1.0771543086172346,
+          "previous": 3.597194388777555
+        }
+      ],
+      "title": "host jobs, share of the VM"
+    },
+    "perfcpu-idle": {
+      "rows": [
+        {
+          "candidate": 2.3076923076923075,
+          "category": "Bun: task-array leader tick and node sync",
+          "points": 0.5835543766578248,
+          "previous": 1.7241379310344827
+        },
+        {
+          "candidate": 0.7692307692307693,
+          "category": "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)",
+          "points": -0.09283819628647205,
+          "previous": 0.8620689655172413
+        },
+        {
+          "candidate": 3.8461538461538463,
+          "category": "Bun: Raft core and log",
+          "points": 2.9840848806366047,
+          "previous": 0.8620689655172413
+        },
+        {
+          "candidate": 7.6923076923076925,
+          "category": "Bun: agent loop and supervisor",
+          "points": -0.06631299734748008,
+          "previous": 7.758620689655173
+        },
+        {
+          "candidate": 11.538461538461538,
+          "category": "Bun: API server",
+          "points": 1.1936339522546415,
+          "previous": 10.344827586206897
+        },
+        {
+          "candidate": 6.923076923076923,
+          "category": "Bun: metrics (Mayo)",
+          "points": -8.594164456233422,
+          "previous": 15.517241379310345
+        },
+        {
+          "candidate": 0.0,
+          "category": "Bun: service discovery (Onion)",
+          "points": -1.7241379310344827,
+          "previous": 1.7241379310344827
+        },
+        {
+          "candidate": 46.92307692307692,
+          "category": "Bun: containers (Grill)",
+          "points": 17.612732095490713,
+          "previous": 29.310344827586206
+        },
+        {
+          "candidate": 7.6923076923076925,
+          "category": "Bun: other Reliaburger code",
+          "points": -4.3766578249336865,
+          "previous": 12.068965517241379
+        },
+        {
+          "candidate": 12.307692307692308,
+          "category": "Bun: async runtime (scheduler, timers, parking)",
+          "points": -7.519893899204243,
+          "previous": 19.82758620689655
+        }
+      ],
+      "title": "idle cluster, share of Bun"
+    }
+  },
+  "control": [],
+  "findings": [
+    {
+      "detail": "15.5% to 6.9%, -8.6 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: metrics (Mayo) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "29.3% to 46.9%, +17.6 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: containers (Grill) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "19.8% to 12.3%, -7.5 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: async runtime (scheduler, timers, parking) (idle cluster, share of Bun)"
+    }
+  ],
+  "idle": [
+    {
+      "candidate": {
+        "high": 0.020311984695688966,
+        "low": 0.017152506991138478,
+        "median": 0.0176458768371792,
+        "n": 3
+      },
+      "field": "bun_cpu_cores",
+      "interval": [
+        0.9548822630049171,
+        1.09914396220255
+      ],
+      "previous": {
+        "high": 0.018479821928863834,
+        "low": 0.017322281852225202,
+        "median": 0.0184796362031581,
+        "n": 3
+      },
+      "ratio": 0.9548822630049171,
+      "title": "Bun's CPU, share of one core",
+      "verdict": "no clear change"
+    },
+    {
+      "candidate": {
+        "high": 298.81926337559474,
+        "low": 290.2770382160532,
+        "median": 290.4577915614176,
+        "n": 3
+      },
+      "field": "bun_wakeups_per_second",
+      "interval": [
+        0.9903316026570537,
+        1.0386396969337415
+      ],
+      "previous": {
+        "high": 293.29346936129383,
+        "low": 287.70252500242873,
+        "median": 291.3807680027189,
+        "n": 3
+      },
+      "ratio": 0.9968324043909009,
+      "title": "Bun's context switches a second",
+      "verdict": "no clear change"
+    },
+    {
+      "candidate": {
+        "high": 200988,
+        "low": 177696,
+        "median": 179348,
+        "n": 3
+      },
+      "field": "bun_rss_kb",
+      "interval": [
+        1.005727739919857,
+        1.1743520228106668
+      ],
+      "previous": {
+        "high": 176684,
+        "low": 171148,
+        "median": 174484,
+        "n": 3
+      },
+      "ratio": 1.0278764815111987,
+      "title": "Bun's RSS, KiB",
+      "verdict": "no clear change"
+    }
+  ],
+  "rates": [
+    {
+      "candidate": {
+        "high": 36969.78333333333,
+        "low": 32738.883333333335,
+        "median": 32961.3,
+        "n": 3
+      },
+      "interval": [
+        0.8706871943803213,
+        1.0917037509510998
+      ],
+      "previous": {
+        "high": 37601.2,
+        "low": 33294.833333333336,
+        "median": 33864.3,
+        "n": 3
+      },
+      "ratio": 0.9733347507552201,
+      "relative_candidate": 1.0,
+      "relative_previous": 1.0,
+      "steady_candidate": null,
+      "steady_previous": null,
+      "title": "Raw VM processes (calibration)",
+      "verdict": "no clear change",
+      "window": "raw"
+    },
+    {
+      "candidate": {
+        "high": 15500.0,
+        "low": 15500.0,
+        "median": 15500.0,
+        "n": 3
+      },
+      "interval": [
+        1.0,
+        1.0
+      ],
+      "previous": {
+        "high": 15500.0,
+        "low": 15500.0,
+        "median": 15500.0,
+        "n": 3
+      },
+      "ratio": 1.0,
+      "relative_candidate": 0.47024844287088186,
+      "relative_previous": 0.45770915093476017,
+      "steady_candidate": {
+        "high": 15880.89330024814,
+        "low": 15880.89330024814,
+        "median": 15880.89330024814,
+        "n": 3
+      },
+      "steady_previous": {
+        "high": 15880.89330024814,
+        "low": 15880.89330024814,
+        "median": 15880.89330024814,
+        "n": 3
+      },
+      "title": "Host jobs, default cap",
+      "verdict": "no clear change",
+      "window": "host"
+    },
+    {
+      "candidate": {
+        "high": 11533.333333333334,
+        "low": 11383.333333333334,
+        "median": 11416.666666666666,
+        "n": 3
+      },
+      "interval": [
+        1.0028985507246377,
+        1.0103244837758112
+      ],
+      "previous": {
+        "high": 11500.0,
+        "low": 11300.0,
+        "median": 11333.333333333334,
+        "n": 3
+      },
+      "ratio": 1.0073529411764706,
+      "relative_candidate": 0.34636578856618716,
+      "relative_previous": 0.33466905659745905,
+      "steady_candidate": {
+        "high": 12183.62282878412,
+        "low": 12109.181141439207,
+        "median": 12133.995037220844,
+        "n": 3
+      },
+      "steady_previous": {
+        "high": 12084.36724565757,
+        "low": 11861.042183622829,
+        "median": 11885.856079404468,
+        "n": 3
+      },
+      "title": "Shared containers",
+      "verdict": "no clear change",
+      "window": "shared"
+    }
+  ]
+}

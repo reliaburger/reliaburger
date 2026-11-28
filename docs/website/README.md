@@ -312,7 +312,7 @@ byte copies of a recording's `jobs.cast` and `report.json` in
 `docs/qualification/`, and `scripts/ci/test_job_demo.py` names that
 directory (`RECORDING`), checks the copies, and checks that the caption
 says which release ran and that the chapter buttons and poster match the
-report. The [0.3.2 recording's README](../qualification/2026-11-23-v0.3.2-job-throughput-recording/README.md)
+report. The [0.3.3 recording's README](../qualification/2026-11-28-v0.3.3-job-throughput-recording/README.md)
 is the method: on the quiet Studio, install the published release into a
 throwaway `RELIABURGER_HOME`, `relish setup --quickstart --nodes 1 --yes`,
 resize the VM to the section's 4 vCPU / 8 GiB with `limactl edit`, allowlist
