@@ -140,3 +140,24 @@ path = "fuzz_targets/api_bearer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "task_manifest_file"
+path = "fuzz_targets/task_manifest_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "task_array_submit"
+path = "fuzz_targets/task_array_submit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_submit"
+path = "fuzz_targets/batch_submit.rs"
+test = false
+doc = false
+bench = false
