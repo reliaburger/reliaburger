@@ -25,7 +25,10 @@ authentication and authorisation check, so an exec through the relay needs
 the same Deployer role and `exec` permission as one sent straight to the
 node. The relay builds the target's path one segment at a time and refuses a
 path that would need any percent-encoding, and a node-only route on the
-target refuses a relayed request.
+target refuses a relayed request. A relayed request ends within 30 seconds,
+body included, or answers 504, and the relay refuses a followed event stream
+(`v1/events?follow=true`) with 400: `/v1/events?follow=true` on the node
+you're connected to already follows every node.
 
 ```sh
 relish wtf                       # diagnose the whole cluster: one row per check
@@ -59,7 +62,8 @@ Summary: 1 critical, 2 warning, 1 unknown, 2 OK
 
 A check that had nothing to look at gives no row: `gitops` without a GitOps
 configuration, `policies` without a policy, `os` on nodes that aren't
-appliances. `exports` and `rollouts` show up only when something is wrong.
+appliances. `exports`, `images` and `rollouts` show up only when something is
+wrong.
 
 `--short` prints the counts and then only what isn't OK, each finding with its
 `next:` step. When everything is OK, it's the counts line alone, which suits a
@@ -70,9 +74,9 @@ Summary: 1 critical, 2 warning, 1 unknown, 2 OK
 CRITICAL [crashloop] app api/default restarted repeatedly (app.api/default)
   next: app api is crashlooping; inspect its recent logs and run `relish rollback api` if this started after a deploy
 WARNING [disk-high] node node-1 filesystem for images is 88.0% full (node.node-1)
-  next: node node-1 disk is at 88.0%; prune images (`relish pickle gc`) or logs
+  next: node node-1 disk is at 88.0%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml
 WARNING [disk-high] node node-2 filesystem for images is 90.5% full (node.node-2)
-  next: node node-2 disk is at 90.5%; prune images (`relish pickle gc`) or logs
+  next: node node-2 disk is at 90.5%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml
 UNKNOWN [alerts] cluster: node node-2: alerts: timed out after 5s
 ```
 
@@ -228,13 +232,15 @@ means, the numbers that decide it and the line of code that does (see
 | `council-fenced` | critical | Nodes belong to a council `relish council recover` replaced |
 | `council-epoch-split` | critical | Nodes serve different recovery epochs |
 | `council-voter-lagging` | warning | A voter answers but has applied more than 100 fewer log entries |
+| `council-retired-identities-nearly-full` | warning | 90% of the 65,536 retired node identities are used |
 | `council-multiple-leaders` | critical | More than one node is named leader |
-| `no-leader` | critical | The council has no leader |
-| `quorum-loss` | critical | Fewer than a majority of council members answer |
+| `no-leader` | critical | The council has no leader. After 60 s, service calls and ingress routes with no instance on the same node fail ([why](03_networking.md#when-the-council-has-no-leader)) |
+| `quorum-loss` | critical | Fewer than a majority of council members answer. After 60 s without a leader, service calls and ingress routes with no instance on the same node fail ([why](03_networking.md#when-the-council-has-no-leader)) |
 | `council-member-down` | warning | A council member is missing, quorum holds |
 | `active-faults` | warning | Smoker faults are active |
 | `disk-high` | warning, critical | A filesystem is 85% full (critical at 95%) |
 | `export-failing` | warning | A node can't export its logs or metrics, so their caps and retention are on hold |
+| `image-collection-failing` | warning | A node's image collection keeps failing or being refused, so it removes no unpacked image |
 | `cert-expired` | critical | A certificate has expired |
 | `cert-expiring` | warning | A certificate expires within 14 days without healthy rotation |
 | `registry-lost-images` | critical | No live node holds every layer of an image |

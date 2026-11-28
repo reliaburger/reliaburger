@@ -47,7 +47,7 @@ pub async fn sweep_expired_tokens_once(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let tokens = council.security_state().await.api_tokens;
+    let tokens = council.security_state().await.api_tokens.clone();
     if crate::sesame::token::tokens_to_sweep(&tokens, now_unix_ms).is_empty() {
         return Ok(Vec::new());
     }
@@ -99,9 +99,9 @@ pub async fn retire_signing_keys_once(
         .security_state()
         .await
         .retiring_oidc_keys
-        .into_iter()
+        .iter()
         .filter(|key| key.not_after <= now_unix_secs)
-        .map(|key| key.key_id)
+        .map(|key| key.key_id.clone())
         .collect();
     if due.is_empty() {
         return Ok(Vec::new());
@@ -248,8 +248,8 @@ mod tests {
             .security_state()
             .await
             .api_tokens
-            .into_iter()
-            .map(|token| token.name)
+            .iter()
+            .map(|token| token.name.clone())
             .collect();
         assert_eq!(left, ["admin", "fresh"]);
         let audit = events.read().await.recent(10, None, None);

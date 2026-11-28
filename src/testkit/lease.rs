@@ -1634,6 +1634,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: "a".repeat(32),
                 config: Box::new(config),
+                declared_images: Default::default(),
                 now_epoch_secs: 1,
             },
         )

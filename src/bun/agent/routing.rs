@@ -718,7 +718,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
+        if self.last_firewall_inputs.is_none() {
+            self.warn_about_foreign_listeners();
+        }
         self.spawn_perimeter_apply(ruleset, inputs);
+    }
+
+    /// Name each service that listens inside the host-port range without
+    /// being Bun's own or one of its workloads'. The perimeter closes the
+    /// whole range to non-members, so outsiders lose it (#2479).
+    fn warn_about_foreign_listeners(&self) {
+        let range = self.perimeter_config.host_port_range;
+        let mut own: std::collections::BTreeSet<u16> = self
+            .perimeter_config
+            .service_ports
+            .iter()
+            .copied()
+            .collect();
+        own.extend(&self.perimeter_config.cluster_ports);
+        own.insert(self.perimeter_config.management_port);
+        own.extend(
+            self.supervisor
+                .list_instances()
+                .iter()
+                .filter_map(|instance| instance.host_port),
+        );
+        for port in crate::firewall::rules::foreign_listeners_on_this_node(range, &own) {
+            eprintln!(
+                "warning: something that isn't Bun listens on TCP port {port}, inside \
+                 [network] port_range ({}-{}); the perimeter firewall closes that range \
+                 to everything outside the cluster, so outsiders can't reach it. Move \
+                 port_range or the service",
+                range.0, range.1
+            );
+        }
     }
 
     /// Withdraw local routing and poll request release without blocking the agent loop.

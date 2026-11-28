@@ -203,6 +203,34 @@ pub(crate) fn platform_descriptor<'a>(
         })
 }
 
+/// The layer media types a node can unpack: a tar, compressed with gzip or
+/// zstd or not at all, in OCI's spelling and Docker's.
+pub(crate) const LAYER_MEDIA_TYPES: &[&str] = &[
+    "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.oci.image.layer.v1.tar+zstd",
+    "application/vnd.docker.image.rootfs.diff.tar.gzip",
+];
+
+/// Refuse an image whose layers no node can unpack, naming the first media
+/// type that isn't one of [`LAYER_MEDIA_TYPES`] (#2465).
+pub(crate) fn check_layer_media_types(
+    manifest: &OciImageManifest,
+) -> Result<(), OciDistributionError> {
+    match manifest
+        .layers
+        .iter()
+        .find(|layer| !LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str()))
+    {
+        Some(layer) => Err(invalid(format!(
+            "layer {} has media type {}, which no node can unpack: \
+             rebuild the image with gzip, zstd or uncompressed layers",
+            layer.digest, layer.media_type
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Refuse negative layer sizes and totals that overflow cache accounting.
 pub(crate) fn check_layer_sizes(manifest: &OciImageManifest) -> Result<(), OciDistributionError> {
     manifest.layers.iter().try_fold(0_u64, |total, layer| {
@@ -348,8 +376,9 @@ pub(crate) const METADATA_READ: RegistryReadBudget = RegistryReadBudget {
     total: Duration::from_secs(120),
 };
 
-/// One layer blob, which may be tens of megabytes over a slow link.
-pub(crate) const LAYER_READ: RegistryReadBudget = RegistryReadBudget {
+/// A blob read into memory whole: a cosign signature, or a test fixture.
+/// Layers on their way to a blob store go through [`pull_layer_to_store`].
+pub(crate) const BUFFERED_BLOB_READ: RegistryReadBudget = RegistryReadBudget {
     attempt: Duration::from_secs(120),
     total: Duration::from_secs(360),
 };
@@ -428,6 +457,346 @@ where
             return Err(error);
         }
     }
+}
+
+/// How long a layer read may wait for its next bytes (or for the response
+/// to start) before the attempt is abandoned and retried (#2424).
+pub(crate) const LAYER_IDLE: Duration = Duration::from_secs(60);
+
+/// The slowest average rate a whole layer pull may run at, across its
+/// attempts: about half a megabit a second. With [`LAYER_TOTAL_FLOOR`] it
+/// bounds a registry that trickles a byte a minute forever.
+pub(crate) const LAYER_MIN_RATE: u64 = 64 * 1024;
+
+/// The least time any layer pull gets, however small the layer.
+pub(crate) const LAYER_TOTAL_FLOOR: Duration = Duration::from_secs(360);
+
+/// Bytes gathered before each write to the upload file, so a large layer
+/// costs one blocking write per megabyte rather than one per network read.
+const LAYER_WRITE_BATCH: usize = 1 << 20;
+
+/// Why a layer could not be pulled into the blob store.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LayerPullError {
+    /// The layer, or the image's layers together, can't fit under
+    /// `[images] max_storage`. Refused before any byte is requested.
+    #[error(
+        "physical image storage quota exceeded: {what} needs {needed} bytes, \
+         {remaining} bytes remain under [images] max_storage"
+    )]
+    NoRoom {
+        what: String,
+        needed: u64,
+        remaining: u64,
+    },
+    /// The descriptor is unusable: a bad digest or a negative size.
+    #[error("invalid layer descriptor for {digest}: {reason}")]
+    Descriptor { digest: String, reason: String },
+    /// The registry refused, or kept failing until the attempts ran out.
+    #[error("registry read of {digest} failed: {reason}")]
+    Registry { digest: String, reason: String },
+    /// The bytes received are not the bytes the descriptor names.
+    #[error("layer {digest} {reason}")]
+    Integrity { digest: String, reason: String },
+    /// Every attempt together took longer than the layer's size allows.
+    #[error(
+        "layer {digest} of {size} bytes did not arrive within {seconds} s \
+         ({received} bytes received): the registry is slower than {rate} KiB/s"
+    )]
+    TooSlow {
+        digest: String,
+        size: u64,
+        seconds: u64,
+        received: u64,
+        rate: u64,
+    },
+    /// The blob store refused a write or the publication.
+    #[error(transparent)]
+    Store(#[from] crate::pickle::types::PickleError),
+}
+
+/// Refuse `needed` bytes of new layers that the store's ceiling can't hold.
+pub(crate) fn check_room(
+    store: &crate::pickle::store::BlobStore,
+    what: &str,
+    needed: u64,
+) -> Result<(), LayerPullError> {
+    match store.remaining_capacity()? {
+        Some(remaining) if needed > remaining => Err(LayerPullError::NoRoom {
+            what: what.to_string(),
+            needed,
+            remaining,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Stream one layer from a registry into `store`: each attempt appends to
+/// one upload file while hashing, so memory holds at most
+/// [`LAYER_WRITE_BATCH`] bytes. The blob is published only after its digest
+/// and size match `layer` (#2424).
+///
+/// An attempt fails when no bytes arrive for [`LAYER_IDLE`], not when the
+/// layer takes long. A retry asks for the rest with an HTTP `Range` request;
+/// a registry that answers with the whole blob instead starts over. Every
+/// attempt together gets [`LAYER_TOTAL_FLOOR`] or the time the layer takes
+/// at [`LAYER_MIN_RATE`], whichever is longer.
+pub(crate) async fn pull_layer_to_store(
+    client: &Client,
+    reference: &Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    store: &crate::pickle::store::BlobStore,
+) -> Result<(), LayerPullError> {
+    let digest = crate::pickle::types::Digest::new(&layer.digest).map_err(|error| {
+        LayerPullError::Descriptor {
+            digest: layer.digest.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    let size = u64::try_from(layer.size).map_err(|_| LayerPullError::Descriptor {
+        digest: layer.digest.clone(),
+        reason: format!("negative size {}", layer.size),
+    })?;
+    check_room(store, &format!("layer {}", layer.digest), size)?;
+    let mut transfer = LayerTransfer {
+        client,
+        reference,
+        layer,
+        store,
+        size,
+        upload: store.initiate_upload().await?,
+        hasher: Sha256::new(),
+        received: 0,
+        resumed: false,
+    };
+    let result = transfer.run().await;
+    match result {
+        Ok(()) => Ok(store
+            .commit_upload_as_blob(&transfer.upload, &digest)
+            .await?),
+        Err(error) => {
+            if let Err(cancel) = store.cancel_upload(&transfer.upload).await {
+                eprintln!(
+                    "warning: could not remove the partial download of {}: {cancel}",
+                    layer.digest
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// How one attempt of a layer transfer ended, when it didn't finish.
+enum AttemptFailure {
+    /// Worth another attempt: a stall, a broken connection, a throttle.
+    Transient(String),
+    /// Retrying would get the same answer.
+    Terminal(LayerPullError),
+}
+
+/// One layer on its way into an upload file.
+struct LayerTransfer<'a> {
+    client: &'a Client,
+    reference: &'a Reference,
+    layer: &'a oci_client::manifest::OciDescriptor,
+    store: &'a crate::pickle::store::BlobStore,
+    size: u64,
+    upload: String,
+    hasher: Sha256,
+    /// Bytes hashed and written to the upload so far.
+    received: u64,
+    /// Whether some of those bytes came from a ranged retry.
+    resumed: bool,
+}
+
+impl LayerTransfer<'_> {
+    /// Attempt the transfer until it completes, fails for good, runs out of
+    /// attempts or passes the whole-layer deadline.
+    async fn run(&mut self) -> Result<(), LayerPullError> {
+        use tokio::time::{Instant, sleep_until, timeout_at};
+        let total = LAYER_TOTAL_FLOOR.max(Duration::from_secs(self.size / LAYER_MIN_RATE));
+        let deadline = Instant::now() + total;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let reason = match timeout_at(deadline, self.attempt()).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(AttemptFailure::Terminal(error))) => return Err(error),
+                Ok(Err(AttemptFailure::Transient(reason))) => reason,
+                Err(_) => return Err(self.too_slow(total)),
+            };
+            if attempt == MAX_ATTEMPTS {
+                return Err(LayerPullError::Registry {
+                    digest: self.layer.digest.clone(),
+                    reason: format!("{reason} (attempt {attempt} of {MAX_ATTEMPTS})"),
+                });
+            }
+            let delay =
+                Duration::from_millis((1000 << (attempt - 1)) + u64::from(rand::random::<u8>()));
+            sleep_until((Instant::now() + delay).min(deadline)).await;
+            if Instant::now() >= deadline {
+                return Err(self.too_slow(total));
+            }
+        }
+    }
+
+    fn too_slow(&self, total: Duration) -> LayerPullError {
+        LayerPullError::TooSlow {
+            digest: self.layer.digest.clone(),
+            size: self.size,
+            seconds: total.as_secs(),
+            received: self.received,
+            rate: LAYER_MIN_RATE / 1024,
+        }
+    }
+
+    /// Drop what was received and start the upload again from byte 0.
+    async fn restart(&mut self) -> Result<(), AttemptFailure> {
+        let terminal = |error: crate::pickle::types::PickleError| {
+            AttemptFailure::Terminal(LayerPullError::Store(error))
+        };
+        self.store
+            .cancel_upload(&self.upload)
+            .await
+            .map_err(terminal)?;
+        self.upload = self.store.initiate_upload().await.map_err(terminal)?;
+        self.hasher = Sha256::new();
+        self.received = 0;
+        self.resumed = false;
+        Ok(())
+    }
+
+    /// One request: the whole blob, or the rest of it after `received`.
+    async fn attempt(&mut self) -> Result<(), AttemptFailure> {
+        use futures_util::StreamExt;
+        use oci_client::client::BlobResponse;
+        let request = async {
+            if self.received == 0 {
+                self.client
+                    .pull_blob_stream(self.reference, self.layer)
+                    .await
+                    .map(|stream| (stream, false))
+            } else {
+                self.client
+                    .pull_blob_stream_partial(self.reference, self.layer, self.received, None)
+                    .await
+                    .map(|response| match response {
+                        BlobResponse::Full(stream) => (stream, false),
+                        BlobResponse::Partial(stream) => (stream, true),
+                    })
+            }
+        };
+        let (mut stream, partial) = match tokio::time::timeout(LAYER_IDLE, request).await {
+            Err(_) => {
+                return Err(AttemptFailure::Transient(format!(
+                    "no response within {} s",
+                    LAYER_IDLE.as_secs()
+                )));
+            }
+            Ok(Err(error)) if is_transient(&error) => {
+                return Err(AttemptFailure::Transient(error.to_string()));
+            }
+            Ok(Err(error)) => {
+                return Err(AttemptFailure::Terminal(LayerPullError::Registry {
+                    digest: self.layer.digest.clone(),
+                    reason: error.to_string(),
+                }));
+            }
+            Ok(Ok(response)) => response,
+        };
+        if self.received > 0 {
+            if partial {
+                self.resumed = true;
+            } else {
+                // The registry ignored the range and sent the whole blob.
+                self.restart().await?;
+            }
+        }
+
+        let mut batch = Vec::with_capacity(LAYER_WRITE_BATCH.min(self.size as usize));
+        let ended = loop {
+            let next = match tokio::time::timeout(LAYER_IDLE, stream.next()).await {
+                Err(_) => Err(format!("no bytes for {} s", LAYER_IDLE.as_secs())),
+                Ok(None) => break Ok(()),
+                // oci-client checks the digest of a whole response as it
+                // ends; the hash below decides, so its verdict is the end.
+                Ok(Some(Err(error))) if is_digest_verdict(&error) => break Ok(()),
+                Ok(Some(Err(error))) => Err(format!("response broke off: {error}")),
+                Ok(Some(Ok(bytes))) => Ok(bytes),
+            };
+            let bytes = match next {
+                Ok(bytes) => bytes,
+                Err(reason) => break Err(reason),
+            };
+            let arrived = self.received + batch.len() as u64 + bytes.len() as u64;
+            if arrived > self.size {
+                return Err(self.integrity(format!(
+                    "is larger than its descriptor's {} bytes",
+                    self.size
+                )));
+            }
+            batch.extend_from_slice(&bytes);
+            if batch.len() >= LAYER_WRITE_BATCH {
+                self.write(&mut batch).await?;
+            }
+        };
+        // Keep what did arrive: a retry asks only for the rest.
+        self.write(&mut batch).await?;
+        if let Err(reason) = ended {
+            return Err(AttemptFailure::Transient(reason));
+        }
+        if self.received != self.size {
+            return Err(self.integrity(format!(
+                "size mismatch: expected {}, received {}",
+                self.size, self.received
+            )));
+        }
+        let actual = format!("sha256:{}", hex::encode(self.hasher.clone().finalize()));
+        if actual != self.layer.digest {
+            if self.resumed {
+                // A registry may honour a range on bytes it then changed;
+                // a mismatch after a resume earns one clean retry.
+                self.restart().await?;
+                return Err(AttemptFailure::Transient(format!(
+                    "a resumed transfer hashed to {actual}"
+                )));
+            }
+            return Err(self.integrity(format!(
+                "digest mismatch: expected {}, received {actual}",
+                self.layer.digest
+            )));
+        }
+        Ok(())
+    }
+
+    /// Hash and append `batch` to the upload, leaving it empty.
+    async fn write(&mut self, batch: &mut Vec<u8>) -> Result<(), AttemptFailure> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.hasher.update(&batch[..]);
+        self.store
+            .write_upload_chunk(&self.upload, batch)
+            .await
+            .map_err(|error| AttemptFailure::Terminal(LayerPullError::Store(error)))?;
+        self.received += batch.len() as u64;
+        batch.clear();
+        Ok(())
+    }
+
+    fn integrity(&self, reason: String) -> AttemptFailure {
+        AttemptFailure::Terminal(LayerPullError::Integrity {
+            digest: self.layer.digest.clone(),
+            reason,
+        })
+    }
+}
+
+/// Whether a stream error is oci-client's digest check of a whole response.
+fn is_digest_verdict(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<oci_client::errors::DigestError>())
 }
 
 #[cfg(test)]
@@ -577,7 +946,7 @@ mod tests {
 
     #[test]
     fn every_read_class_leaves_room_to_retry_a_stalled_attempt() {
-        for budget in [METADATA_READ, LAYER_READ] {
+        for budget in [METADATA_READ, BUFFERED_BLOB_READ] {
             assert!(budget.total >= budget.attempt * 2 + Duration::from_secs(2));
         }
     }

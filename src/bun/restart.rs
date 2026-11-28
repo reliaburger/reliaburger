@@ -5,6 +5,11 @@
 /// exponential backoff; jobs have a configurable maximum.
 use std::time::Duration;
 
+/// How long a run must last before its next crash restarts it as promptly
+/// as the first did: ten minutes, as a kubelet resets a container's
+/// back-off. Apps and sidecars share it (#2373).
+pub const RESTART_FORGIVEN_AFTER: Duration = Duration::from_secs(600);
+
 /// Controls restart behaviour for a workload instance.
 ///
 /// The backoff grows exponentially: `initial * multiplier^count`,

@@ -42,9 +42,23 @@
 //! # A node with no council
 //!
 //! A fresh node, one that has never been initialised and never received a
-//! membership, has nothing to check against, and the first leader to
-//! replicate to it is how it joins. It serves any node certificate, as it did
-//! before this check. It holds no Raft state worth protecting yet.
+//! membership, has no council of its own to check against, and the first
+//! leader to replicate to it is how it joins. It used to serve any node
+//! certificate, on the reasoning that it held no Raft state worth
+//! protecting. That was wrong (#2397): whatever it was fed became its
+//! replicated state, API tokens, CRL and trust set included, and nodes past
+//! the council cap stay seatless for their whole lives. One compromised
+//! worker could take them all over.
+//!
+//! So a node with no council checks the sender against the council it
+//! *expects* ([`ExpectedCouncil`]): the voters the leader named in the join
+//! bundle when the node enrolled, saved beside its identity and kept current
+//! by [`RaftAdmission::maintain_expected_council`]. The sender must be one of
+//! those voters, or one they vouch for, on a connection whose certificate is
+//! that voter's, exactly as for a member. A plaintext cluster has no
+//! certificates and no join, so a node there with no expected council still
+//! serves whoever replicates to it: nothing on such a cluster is
+//! authenticated.
 //!
 //! # A node whose view is behind
 //!
@@ -91,6 +105,130 @@ pub const VOUCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// The council's voters as one node sees them: Raft id to node name.
 pub type CouncilVoters = BTreeMap<u64, String>;
 
+/// The council's voters with their Raft addresses: Raft id to node name and
+/// address. What a voter answers a [`RaftRpc::CouncilVoters`] question with,
+/// and what a node with no council expects.
+pub type CouncilRoster = BTreeMap<u64, CouncilNodeInfo>;
+
+/// The file, in a node's identity directory, holding its expected council.
+pub const EXPECTED_COUNCIL_FILE: &str = "council.json";
+
+/// The file, in a node's Raft directory, naming the voters of the council a
+/// recovery replaced (#2406). Node-local: it sits beside the fence record and
+/// never replicates.
+pub const PREVIOUS_COUNCIL_FILE: &str = "previous-council.json";
+
+/// The voters of the councils this node's recoveries replaced, as
+/// `relish council recover` saved them in `raft_dir`. Empty when it was
+/// never recovered.
+pub fn load_previous_council(raft_dir: &std::path::Path) -> std::io::Result<CouncilRoster> {
+    match std::fs::read(raft_dir.join(PREVIOUS_COUNCIL_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CouncilRoster::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Save `roster` as the previous council in `raft_dir`, atomically.
+pub fn save_previous_council(
+    raft_dir: &std::path::Path,
+    roster: &CouncilRoster,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(roster).map_err(std::io::Error::other)?;
+    crate::sesame::identity::atomic_write_mode(
+        &raft_dir.join(PREVIOUS_COUNCIL_FILE),
+        &bytes,
+        Some(0o644),
+    )
+}
+
+/// How often a node refreshes its expected council: from its own membership
+/// when it has one, otherwise by asking the voters it expects.
+pub const EXPECTED_COUNCIL_REFRESH: Duration = Duration::from_secs(30);
+
+/// The names in `roster`.
+pub fn roster_names(roster: &CouncilRoster) -> CouncilVoters {
+    roster
+        .iter()
+        .map(|(id, info)| (*id, info.name.clone()))
+        .collect()
+}
+
+/// The council a node with no council of its own expects to hear from
+/// (#2397): the voters the leader named when the node joined, kept current
+/// since. Cheap to clone; clones share the roster.
+#[derive(Debug, Clone, Default)]
+pub struct ExpectedCouncil {
+    roster: Arc<tokio::sync::RwLock<CouncilRoster>>,
+    file: Option<std::path::PathBuf>,
+}
+
+impl ExpectedCouncil {
+    /// An in-memory expected council holding `roster`.
+    pub fn new(roster: CouncilRoster) -> Self {
+        Self {
+            roster: Arc::new(tokio::sync::RwLock::new(roster)),
+            file: None,
+        }
+    }
+
+    /// The expected council saved in `identity_dir`, written back there as it
+    /// changes. Empty when nothing is saved yet.
+    pub fn load(identity_dir: &std::path::Path) -> std::io::Result<Self> {
+        let file = identity_dir.join(EXPECTED_COUNCIL_FILE);
+        let roster = match std::fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => CouncilRoster::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            roster: Arc::new(tokio::sync::RwLock::new(roster)),
+            file: Some(file),
+        })
+    }
+
+    /// Save `roster` as the expected council in `identity_dir`, atomically.
+    /// `relish join` calls this with the voters the join bundle names.
+    pub fn save(identity_dir: &std::path::Path, roster: &CouncilRoster) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(roster).map_err(std::io::Error::other)?;
+        std::fs::create_dir_all(identity_dir)?;
+        crate::sesame::identity::atomic_write_mode(
+            &identity_dir.join(EXPECTED_COUNCIL_FILE),
+            &bytes,
+            Some(0o644),
+        )
+    }
+
+    /// The voters this node expects.
+    pub async fn roster(&self) -> CouncilRoster {
+        self.roster.read().await.clone()
+    }
+
+    /// Replace the expected council with `roster`, and save it when it
+    /// changed. An empty roster is ignored: it would lock the node out.
+    pub async fn replace(&self, roster: CouncilRoster) -> std::io::Result<()> {
+        if roster.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut current = self.roster.write().await;
+            if *current == roster {
+                return Ok(());
+            }
+            *current = roster.clone();
+        }
+        let Some(file) = self.file.clone() else {
+            return Ok(());
+        };
+        let Some(directory) = file.parent().map(std::path::Path::to_path_buf) else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || Self::save(&directory, &roster))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+}
+
 /// Who is on the other end of a Raft connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerIdentity {
@@ -128,7 +266,9 @@ impl PeerIdentity {
 /// Where the sender of one Raft RPC stands with this node's council.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
-    /// This node has no council yet: it serves whoever replicates to it.
+    /// This node has no council yet, and the sender is a voter of the
+    /// council it expects (or vouched for by one) speaking with its own
+    /// certificate. On a plaintext cluster with no expected council, anyone.
     NoCouncil,
     /// The sender is a voter in this node's council (or vouched for by one),
     /// and the connection's certificate is that voter's.
@@ -138,23 +278,31 @@ pub enum Standing {
 }
 
 /// Where `sender` stands, given this node's council `voters` (`None` when it
-/// has no council), the senders its voters have vouched for, and who the
-/// connection's certificate says is talking.
+/// has no council), the council it `expected`s while it has none, the
+/// senders its voters have vouched for, and who the connection's certificate
+/// says is talking.
 pub fn standing(
     voters: Option<&CouncilVoters>,
+    expected: &CouncilVoters,
     vouched: &CouncilVoters,
     sender: Option<u64>,
     peer: &PeerIdentity,
 ) -> Standing {
-    let Some(voters) = voters else {
-        return Standing::NoCouncil;
+    let (council, admitted) = match voters {
+        Some(voters) => (voters, Standing::Member),
+        // Nothing to authenticate against on a plaintext cluster that never
+        // joined through `relish join`.
+        None if expected.is_empty() && *peer == PeerIdentity::Plaintext => {
+            return Standing::NoCouncil;
+        }
+        None => (expected, Standing::NoCouncil),
     };
     let Some(sender) = sender else {
         return Standing::Stranger;
     };
-    let known = voters.get(&sender).or_else(|| vouched.get(&sender));
+    let known = council.get(&sender).or_else(|| vouched.get(&sender));
     match known {
-        Some(name) if peer.speaks_for(name) => Standing::Member,
+        Some(name) if peer.speaks_for(name) => admitted,
         _ => Standing::Stranger,
     }
 }
@@ -167,58 +315,60 @@ fn voter_name(membership: &Membership<u64, CouncilNodeInfo>, id: u64) -> Option<
     membership.get_node(&id).map(|node| node.name.clone())
 }
 
-/// Add `membership`'s voters, with their node names, to `voters`.
-fn add_voters(voters: &mut CouncilVoters, membership: &Membership<u64, CouncilNodeInfo>) {
+/// Add `membership`'s voters, with their node names and addresses, to
+/// `roster`.
+fn add_voters(roster: &mut CouncilRoster, membership: &Membership<u64, CouncilNodeInfo>) {
     for id in membership.voter_ids() {
         if let Some(node) = membership.get_node(&id) {
-            voters.insert(id, node.name.clone());
+            roster.insert(id, node.clone());
         }
     }
 }
 
 /// This node's council from openraft's own state: the voters of its committed
-/// and effective memberships together, or `None` when it has neither (a fresh
-/// node). `None` too when the Raft core has stopped.
-pub async fn council_voters(raft: &Raft<TypeConfig>) -> Option<CouncilVoters> {
+/// and effective memberships together, with their addresses, or `None` when
+/// it has neither (a fresh node). `None` too when the Raft core has stopped.
+pub async fn council_roster(raft: &Raft<TypeConfig>) -> Option<CouncilRoster> {
     raft.with_raft_state(|state| {
         let committed = state.membership_state.committed().membership();
         let effective = state.membership_state.effective().membership();
         if committed.nodes().next().is_none() && effective.nodes().next().is_none() {
             return None;
         }
-        let mut voters = CouncilVoters::new();
-        add_voters(&mut voters, committed);
-        add_voters(&mut voters, effective);
-        Some(voters)
+        let mut roster = CouncilRoster::new();
+        add_voters(&mut roster, committed);
+        add_voters(&mut roster, effective);
+        Some(roster)
     })
     .await
     .ok()
     .flatten()
 }
 
-/// The voters this node could ask to vouch for a sender: every voter in its
-/// council except itself and the sender, with their Raft addresses.
-async fn vouchers(raft: &Raft<TypeConfig>, sender: u64) -> Vec<(u64, CouncilNodeInfo)> {
+/// [`council_roster`], names only.
+pub async fn council_voters(raft: &Raft<TypeConfig>) -> Option<CouncilVoters> {
+    council_roster(raft)
+        .await
+        .map(|roster| roster_names(&roster))
+}
+
+/// The voters this node could ask: every voter in its council, or in the
+/// council it expects while it has none, except itself and `skip`, with
+/// their Raft addresses.
+async fn askable_voters(
+    raft: &Raft<TypeConfig>,
+    expected: &ExpectedCouncil,
+    skip: Option<u64>,
+) -> Vec<(u64, CouncilNodeInfo)> {
     let me = raft.metrics().borrow().id;
-    raft.with_raft_state(move |state| {
-        let mut found: BTreeMap<u64, CouncilNodeInfo> = BTreeMap::new();
-        for membership in [
-            state.membership_state.committed().membership(),
-            state.membership_state.effective().membership(),
-        ] {
-            for id in membership.voter_ids() {
-                if id == me || id == sender {
-                    continue;
-                }
-                if let Some(node) = membership.get_node(&id) {
-                    found.insert(id, node.clone());
-                }
-            }
-        }
-        found.into_iter().collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default()
+    let roster = match council_roster(raft).await {
+        Some(roster) => roster,
+        None => expected.roster().await,
+    };
+    roster
+        .into_iter()
+        .filter(|(id, _)| *id != me && Some(*id) != skip)
+        .collect()
 }
 
 /// A sender a voter vouched for, and until when that counts.
@@ -241,6 +391,10 @@ struct AdmissionState {
 pub struct RaftAdmission {
     /// Dials the council's voters to ask them to vouch. `None` never asks.
     dialer: Option<TcpRaftNetworkFactory>,
+    /// The council this node expects while it has none of its own.
+    expected: ExpectedCouncil,
+    /// The voters of the councils this node's recoveries replaced.
+    previous: Arc<CouncilRoster>,
     state: Arc<AdmissionState>,
 }
 
@@ -260,6 +414,8 @@ impl RaftAdmission {
     pub fn new(dialer: TcpRaftNetworkFactory) -> Self {
         Self {
             dialer: Some(dialer),
+            expected: ExpectedCouncil::default(),
+            previous: Arc::default(),
             state: Arc::default(),
         }
     }
@@ -269,8 +425,31 @@ impl RaftAdmission {
     pub fn without_vouching() -> Self {
         Self {
             dialer: None,
+            expected: ExpectedCouncil::default(),
+            previous: Arc::default(),
             state: Arc::default(),
         }
+    }
+
+    /// The same check, expecting `expected` while this node has no council.
+    pub fn expecting(mut self, expected: ExpectedCouncil) -> Self {
+        self.expected = expected;
+        self
+    }
+
+    /// The same check, also asking `previous`, the voters of the councils
+    /// this node's recoveries replaced, about an epoch claim on gossip
+    /// (#2406). A recovered council starts with one voter, so without them
+    /// two survivors recovered on one epoch would have nobody to ask, and
+    /// would never see the split (#694).
+    pub fn remembering(mut self, previous: CouncilRoster) -> Self {
+        self.previous = Arc::new(previous);
+        self
+    }
+
+    /// The council this check expects while the node has none.
+    pub fn expected_council(&self) -> &ExpectedCouncil {
+        &self.expected
     }
 
     /// Where `sender` stands with this node's council, for an RPC that
@@ -292,8 +471,9 @@ impl RaftAdmission {
         // Otherwise ask the Raft core: it holds the committed membership as
         // well, and it is never behind the metrics.
         let voters = council_voters(raft).await;
+        let expected = roster_names(&self.expected.roster().await);
         let vouched = self.vouched().await;
-        standing(voters.as_ref(), &vouched, sender, peer)
+        standing(voters.as_ref(), &expected, &vouched, sender, peer)
     }
 
     /// The senders vouched for and still current.
@@ -339,19 +519,11 @@ impl RaftAdmission {
             }
             *last = Some(Instant::now());
         }
-        let vouchers = vouchers(&raft, sender).await;
+        let vouchers = askable_voters(&raft, &self.expected, Some(sender)).await;
         let asked: Vec<u64> = vouchers.iter().map(|(id, _)| *id).collect();
-        let answers = futures_util::future::join_all(vouchers.into_iter().map(|(id, info)| {
-            let mut dialer = dialer.clone();
-            async move {
-                let network = dialer.new_client(id, &info).await;
-                let answer = tokio::time::timeout(VOUCH_TIMEOUT, network.council_voters()).await;
-                (id, answer.ok().and_then(Result::ok))
-            }
-        }))
-        .await;
-        let voucher = answers.into_iter().find_map(|(id, voters)| {
-            let name = voters?.get(&sender)?.clone();
+        let answers = ask_voters(&dialer, vouchers).await;
+        let voucher = answers.into_iter().find_map(|(id, roster)| {
+            let name = roster?.get(&sender)?.name.clone();
             peer.speaks_for(&name).then_some((id, name))
         });
         let Some((voucher, name)) = voucher else {
@@ -374,6 +546,93 @@ impl RaftAdmission {
             },
         );
     }
+}
+
+impl RaftAdmission {
+    /// Keep the expected council current until `shutdown`: every
+    /// [`EXPECTED_COUNCIL_REFRESH`], from this node's own membership when it
+    /// has one, otherwise from what the voters it expects name now. A
+    /// seatless node follows a changing council this way, one step at a
+    /// time, as long as one voter it knows is still answering.
+    pub async fn maintain_expected_council(
+        self,
+        raft: Raft<TypeConfig>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+            if let Err(error) = self.refresh_expected_council(&raft).await {
+                eprintln!("raft: could not save the expected council: {error}");
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(EXPECTED_COUNCIL_REFRESH) => {}
+            }
+        }
+    }
+
+    /// One refresh of the expected council (see
+    /// [`Self::maintain_expected_council`]).
+    pub async fn refresh_expected_council(&self, raft: &Raft<TypeConfig>) -> std::io::Result<()> {
+        if let Some(roster) = council_roster(raft).await {
+            return self.expected.replace(roster).await;
+        }
+        let Some(dialer) = &self.dialer else {
+            return Ok(());
+        };
+        let voters = askable_voters(raft, &self.expected, None).await;
+        if voters.is_empty() {
+            return Ok(());
+        }
+        // Every voter that answered is one this node already trusts; the
+        // voters any of them names now are the council to expect.
+        let mut roster = CouncilRoster::new();
+        for (_, answer) in ask_voters(dialer, voters).await {
+            if let Some(answer) = answer {
+                roster.extend(answer);
+            }
+        }
+        self.expected.replace(roster).await
+    }
+
+    /// Ask the voters of this node's council (or of the council it expects),
+    /// and those of the councils its recoveries replaced, which councils they
+    /// serve, so that one that serves a newer recovery
+    /// epoch tells this node so, and its fence moves (#2406). The answers
+    /// themselves aren't needed: a refusal carries the epoch, and the
+    /// transport hands that to the fence.
+    pub async fn ask_voters_for_their_epoch(&self, raft: &Raft<TypeConfig>) {
+        let Some(dialer) = &self.dialer else {
+            return;
+        };
+        let me = raft.metrics().borrow().id;
+        let mut voters: BTreeMap<u64, CouncilNodeInfo> = askable_voters(raft, &self.expected, None)
+            .await
+            .into_iter()
+            .collect();
+        for (id, info) in self.previous.iter() {
+            if *id != me {
+                voters.entry(*id).or_insert_with(|| info.clone());
+            }
+        }
+        ask_voters(dialer, voters.into_iter().collect()).await;
+    }
+}
+
+/// Ask each of `voters` for its council, over the node-id-bound transport,
+/// each within [`VOUCH_TIMEOUT`]. `None` for a voter that didn't answer.
+async fn ask_voters(
+    dialer: &TcpRaftNetworkFactory,
+    voters: Vec<(u64, CouncilNodeInfo)>,
+) -> Vec<(u64, Option<CouncilRoster>)> {
+    futures_util::future::join_all(voters.into_iter().map(|(id, info)| {
+        let mut dialer = dialer.clone();
+        async move {
+            let network = dialer.new_client(id, &info).await;
+            let answer = tokio::time::timeout(VOUCH_TIMEOUT, network.council_voters()).await;
+            (id, answer.ok().and_then(Result::ok))
+        }
+    }))
+    .await
 }
 
 impl RaftRpc {
@@ -422,12 +681,51 @@ mod tests {
         PeerIdentity::Node(name.to_string())
     }
 
+    /// A node with no council of its own serves only the council it expects
+    /// (#2397): not a node certificate that names itself leader, and not
+    /// one speaking for an expected voter.
     #[test]
-    fn a_node_with_no_council_serves_anyone() {
+    fn a_node_with_no_council_serves_only_the_council_it_expects() {
+        let none = CouncilVoters::new();
+        assert_ne!(
+            standing(None, &none, &none, Some(5), &node("n5")),
+            Standing::NoCouncil,
+            "an mTLS node that expects nobody must serve nobody"
+        );
+        let expected = voters(&[(1, "n1"), (2, "n2")]);
+        assert_eq!(
+            standing(None, &expected, &none, Some(1), &node("n1")),
+            Standing::NoCouncil
+        );
+        assert_eq!(
+            standing(None, &expected, &none, Some(9), &node("n9")),
+            Standing::Stranger
+        );
+        assert_eq!(
+            standing(None, &expected, &none, Some(1), &node("n9")),
+            Standing::Stranger
+        );
+        let vouched = voters(&[(3, "n3")]);
+        assert_eq!(
+            standing(None, &expected, &vouched, Some(3), &node("n3")),
+            Standing::NoCouncil
+        );
+    }
+
+    /// A plaintext cluster has no certificates and no join, so a node there
+    /// with nothing to expect still serves whoever replicates to it; once it
+    /// expects a council, it holds the RPC's claim to it.
+    #[test]
+    fn a_plaintext_node_with_no_council_expects_what_it_was_told() {
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(None, &none, Some(9), &node("n9")),
+            standing(None, &none, &none, Some(9), &PeerIdentity::Plaintext),
             Standing::NoCouncil
+        );
+        let expected = voters(&[(1, "n1")]);
+        assert_eq!(
+            standing(None, &expected, &none, Some(9), &PeerIdentity::Plaintext),
+            Standing::Stranger
         );
     }
 
@@ -436,7 +734,7 @@ mod tests {
         let council = voters(&[(1, "n1"), (2, "n2")]);
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &none, Some(2), &node("n2")),
+            standing(Some(&council), &none, &none, Some(2), &node("n2")),
             Standing::Member
         );
     }
@@ -446,7 +744,7 @@ mod tests {
         let council = voters(&[(1, "n1"), (2, "n2")]);
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &none, Some(9), &node("n9")),
+            standing(Some(&council), &none, &none, Some(9), &node("n9")),
             Standing::Stranger
         );
     }
@@ -456,11 +754,17 @@ mod tests {
         let council = voters(&[(1, "n1"), (2, "n2")]);
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &none, Some(2), &node("n9")),
+            standing(Some(&council), &none, &none, Some(2), &node("n9")),
             Standing::Stranger
         );
         assert_eq!(
-            standing(Some(&council), &none, Some(2), &PeerIdentity::Unnamed),
+            standing(
+                Some(&council),
+                &none,
+                &none,
+                Some(2),
+                &PeerIdentity::Unnamed
+            ),
             Standing::Stranger
         );
     }
@@ -470,7 +774,7 @@ mod tests {
         let council = voters(&[(1, "n1")]);
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &none, None, &node("n1")),
+            standing(Some(&council), &none, &none, None, &node("n1")),
             Standing::Stranger
         );
     }
@@ -480,11 +784,23 @@ mod tests {
         let council = voters(&[(1, "n1"), (2, "n2")]);
         let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &none, Some(2), &PeerIdentity::Plaintext),
+            standing(
+                Some(&council),
+                &none,
+                &none,
+                Some(2),
+                &PeerIdentity::Plaintext
+            ),
             Standing::Member
         );
         assert_eq!(
-            standing(Some(&council), &none, Some(9), &PeerIdentity::Plaintext),
+            standing(
+                Some(&council),
+                &none,
+                &none,
+                Some(9),
+                &PeerIdentity::Plaintext
+            ),
             Standing::Stranger
         );
     }
@@ -493,12 +809,13 @@ mod tests {
     fn a_vouched_sender_is_a_member_under_the_vouched_name_only() {
         let council = voters(&[(1, "n1"), (2, "n2")]);
         let vouched = voters(&[(3, "n3")]);
+        let none = CouncilVoters::new();
         assert_eq!(
-            standing(Some(&council), &vouched, Some(3), &node("n3")),
+            standing(Some(&council), &none, &vouched, Some(3), &node("n3")),
             Standing::Member
         );
         assert_eq!(
-            standing(Some(&council), &vouched, Some(3), &node("n9")),
+            standing(Some(&council), &none, &vouched, Some(3), &node("n9")),
             Standing::Stranger
         );
     }

@@ -32,6 +32,33 @@ use super::types::{NodeCapabilityReport, NodeReadinessReport, ReportingMessage, 
 /// (as opposed to merely listed in `stale_nodes`).
 const EVICTION_MULTIPLIER: u32 = 3;
 
+/// The most reports the aggregator stores before it publishes the view,
+/// even while more are queued, so consumers never wait on a long burst.
+const MAX_UNPUBLISHED: usize = 256;
+
+/// Rollups waiting for the rollup store's write lock (#2443). One rollup
+/// arrives per node per minute, so this covers a long stall of a large
+/// fleet; past it a rollup is dropped and counted, and the worker's
+/// five-minute backfill after a failed send covers most such gaps.
+const ROLLUP_INGEST_QUEUE: usize = 1024;
+
+/// Ingest rollups into `store` from a queue, off the report loop, so a
+/// query or flush holding the store's lock never stalls state reports
+/// (#2443). The task ends when the queue's sender is dropped, once it has
+/// ingested everything already queued.
+fn spawn_rollup_ingest(
+    store: Arc<RwLock<RollupStore>>,
+) -> tokio::sync::mpsc::Sender<crate::mayo::rollup::NodeRollup> {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<crate::mayo::rollup::NodeRollup>(ROLLUP_INGEST_QUEUE);
+    tokio::spawn(async move {
+        while let Some(rollup) = rx.recv().await {
+            store.write().await.ingest(&rollup);
+        }
+    });
+    tx
+}
+
 /// The aggregated view of all worker reports.
 ///
 /// Published via a `watch` channel so any number of consumers
@@ -113,6 +140,10 @@ pub struct ReportAggregator<T: ReportingTransport> {
     readiness_entries: HashMap<NodeId, ReadinessEntry>,
     watch_tx: watch::Sender<AggregatedState>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
+    /// The queue into the rollup ingest task, while [`run`](Self::run) runs.
+    rollup_tx: Option<tokio::sync::mpsc::Sender<crate::mayo::rollup::NodeRollup>>,
+    /// Rollups dropped because the ingest queue was full.
+    rollups_dropped: u64,
     config: ReportingTreeSection,
     shutdown: CancellationToken,
     /// Current leadership epoch (the Raft term the leader-target
@@ -122,6 +153,20 @@ pub struct ReportAggregator<T: ReportingTransport> {
     /// Gossip membership, for evicting reports of departed nodes.
     /// `None` disables eviction-by-membership.
     membership_rx: Option<watch::Receiver<Vec<MembershipSnapshot>>>,
+    /// How often the aggregator did work that grows with the fleet, so a
+    /// test can pin it per message without timing anything (#2440).
+    #[cfg(test)]
+    work: WorkCounts,
+}
+
+/// Counts of the aggregator's fleet-sized steps, for tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WorkCounts {
+    /// Views built and published.
+    publishes: usize,
+    /// Freshness table reconciled against the whole membership list.
+    reconciliations: usize,
 }
 
 impl<T: ReportingTransport> ReportAggregator<T> {
@@ -137,7 +182,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         membership_rx: Option<watch::Receiver<Vec<MembershipSnapshot>>>,
     ) -> (Self, watch::Receiver<AggregatedState>) {
         let (watch_tx, watch_rx) = watch::channel(AggregatedState::default());
-        let aggregator = Self {
+        let mut aggregator = Self {
             transport,
             entries: HashMap::new(),
             report_freshness: HashMap::new(),
@@ -146,79 +191,51 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             readiness_entries: HashMap::new(),
             watch_tx,
             rollup_store,
+            rollup_tx: None,
+            rollups_dropped: 0,
             config,
             shutdown,
             epoch_rx,
             membership_rx,
+            #[cfg(test)]
+            work: WorkCounts::default(),
         };
+        aggregator.refresh_report_deadlines(true);
         (aggregator, watch_rx)
     }
 
     /// Run the aggregator event loop until shutdown.
     pub async fn run(&mut self) {
+        self.rollup_tx = self.rollup_store.clone().map(spawn_rollup_ingest);
+        self.run_loop().await;
+        // Dropping the sender lets the ingest task finish what's queued.
+        self.rollup_tx = None;
+    }
+
+    async fn run_loop(&mut self) {
         let stale_timeout = Duration::from_secs(self.config.stale_report_timeout_secs);
         let mut stale_check = tokio::time::interval(stale_timeout);
         // The first tick fires immediately — skip it so we don't
         // mark everything stale at startup.
         stale_check.tick().await;
 
+        // Reports that changed the view since it was last published. One
+        // publish copies every node's report, so publishing per message made
+        // the leader's work grow with the square of the fleet and its queue
+        // overflow from 500 nodes up (#1411). The view is published once the
+        // queue is empty, or after `MAX_UNPUBLISHED` reports in a busy spell.
+        let mut unpublished = 0usize;
         loop {
+            // `biased` polls the arms in order. The timers and watches come
+            // before the reports so a busy queue can't starve them, and the
+            // publish arm comes last so it only runs once the queue is empty.
             tokio::select! {
+                biased;
                 _ = self.shutdown.cancelled() => break,
-                msg = self.transport.recv() => {
-                    match msg {
-                        Some((_, peer, ReportingMessage::Report(report))) => {
-                            // C6: a self-report may only claim the node id the
-                            // peer's cert authenticates. Under mTLS a worker
-                            // that sends Report{node_id: victim} is dropped, so
-                            // it can't overwrite another node's entry. When mTLS
-                            // is off (`peer` is None) no binding is applied.
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_report(report);
-                                self.publish();
-                            }
-                        }
-                        Some((_, _, ReportingMessage::Ack { .. })) => {
-                            // Workers don't send Acks to the aggregator
-                        }
-                        Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
-                            // C6: a rollup may only claim the node id the peer's
-                            // cert authenticates. Otherwise, under mTLS, node X
-                            // could submit a NodeRollup{node_id: Y}, poisoning Y's
-                            // cluster metrics and pre-claiming Y's (node, window)
-                            // dedup keys so Y's genuine rollups drop as duplicates.
-                            if Self::report_identity_ok(&peer, &rollup.node_id)
-                                && let Some(ref store) = self.rollup_store
-                            {
-                                store.write().await.ingest(&rollup);
-                            }
-                        }
-                        Some((_, peer, ReportingMessage::CapabilityReport(report))) => {
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_capability(report);
-                                self.publish();
-                            }
-                        }
-                        Some((_, peer, ReportingMessage::NodeReadinessReport(report))) => {
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_readiness(report);
-                                self.publish();
-                            }
-                        }
-                        None => {
-                            // The transport only closes at shutdown; anything
-                            // else is a bug worth a loud log, not a silent
-                            // stop (CP10).
-                            if !self.shutdown.is_cancelled() {
-                                eprintln!("report aggregator: transport closed unexpectedly");
-                            }
-                            break;
-                        }
-                    }
-                }
                 _ = stale_check.tick() => {
                     self.evict_expired(stale_timeout);
                     self.publish();
+                    unpublished = 0;
                 }
                 changed = Self::watch_changed(&mut self.epoch_rx) => {
                     if changed.is_err() {
@@ -229,16 +246,99 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                     // count. Republish so consumers see coverage drop now,
                     // not at the next report.
                     self.publish();
+                    unpublished = 0;
                 }
                 changed = Self::watch_changed(&mut self.membership_rx) => {
                     if changed.is_err() {
                         self.membership_rx = None;
                         continue;
                     }
-                    if self.evict_departed() {
+                    let forgot = self.refresh_report_deadlines(true);
+                    if self.evict_departed() || forgot {
                         self.publish();
+                        unpublished = 0;
                     }
                 }
+                msg = self.transport.recv() => {
+                    let Some((_, peer, message)) = msg else {
+                        // The transport only closes at shutdown; anything
+                        // else is a bug worth a loud log, not a silent
+                        // stop (CP10).
+                        if !self.shutdown.is_cancelled() {
+                            eprintln!("report aggregator: transport closed unexpectedly");
+                        }
+                        break;
+                    };
+                    if self.handle_message(peer, message).await {
+                        unpublished += 1;
+                    }
+                    if unpublished >= MAX_UNPUBLISHED {
+                        self.publish();
+                        unpublished = 0;
+                    }
+                }
+                _ = std::future::ready(()), if unpublished > 0 => {
+                    self.publish();
+                    unpublished = 0;
+                }
+            }
+        }
+    }
+
+    /// Store one inbound message. Returns whether the published view needs
+    /// to change.
+    async fn handle_message(&mut self, peer: Option<NodeId>, message: ReportingMessage) -> bool {
+        match message {
+            ReportingMessage::Report(report) => {
+                // C6: a self-report may only claim the node id the peer's
+                // cert authenticates. Under mTLS a worker that sends
+                // Report{node_id: victim} is dropped, so it can't overwrite
+                // another node's entry. When mTLS is off (`peer` is None) no
+                // binding is applied.
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_report(report);
+                true
+            }
+            // Workers don't send Acks to the aggregator.
+            ReportingMessage::Ack { .. } => false,
+            ReportingMessage::MetricsRollup(rollup) => {
+                // C6: a rollup may only claim the node id the peer's cert
+                // authenticates. Otherwise, under mTLS, node X could submit a
+                // NodeRollup{node_id: Y}, poisoning Y's cluster metrics and
+                // pre-claiming Y's (node, window) dedup keys so Y's genuine
+                // rollups drop as duplicates. Rollups don't change the view.
+                // The store's lock may be held by a query or a flush, so the
+                // rollup is queued for the ingest task rather than ingested
+                // here (#2443).
+                if Self::report_identity_ok(&peer, &rollup.node_id)
+                    && let Some(tx) = &self.rollup_tx
+                    && tx.try_send(rollup).is_err()
+                {
+                    self.rollups_dropped += 1;
+                    if self.rollups_dropped.is_power_of_two() {
+                        eprintln!(
+                            "report aggregator: rollup ingest queue full; {} rollup(s) dropped so far",
+                            self.rollups_dropped
+                        );
+                    }
+                }
+                false
+            }
+            ReportingMessage::CapabilityReport(report) => {
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_capability(report);
+                true
+            }
+            ReportingMessage::NodeReadinessReport(report) => {
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_readiness(report);
+                true
             }
         }
     }
@@ -284,7 +384,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
     }
 
     fn store_report(&mut self, report: StateReport) {
-        self.refresh_report_deadlines();
+        self.refresh_report_deadlines(false);
         self.report_freshness
             .insert(report.node_id.clone(), Instant::now());
         self.entries.insert(
@@ -358,28 +458,54 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             || self.readiness_entries.len() != readiness_before
     }
 
-    fn refresh_report_deadlines(&mut self) {
+    /// Bring the freshness table in line with the leadership epoch and,
+    /// when `membership_changed` or the epoch moved, with gossip's member
+    /// list. Returns whether it forgot any node.
+    ///
+    /// Reconciling walks the whole member list, so it runs only when
+    /// something it depends on changed: at construction, when the
+    /// membership watch fires and on a new epoch. Every report used to pay
+    /// for it, which made the leader's work per reporting interval grow
+    /// with the square of the fleet (#2440).
+    fn refresh_report_deadlines(&mut self, membership_changed: bool) -> bool {
         let epoch = self.current_epoch();
-        if epoch != self.freshness_epoch {
+        let epoch_changed = epoch != self.freshness_epoch;
+        let before = self.report_freshness.len();
+        if epoch_changed {
             self.report_freshness.clear();
             self.freshness_epoch = epoch;
+        }
+        if !(membership_changed || epoch_changed) {
+            return false;
         }
         if let Some(rx) = &self.membership_rx {
             let members = rx.borrow();
             if !members.is_empty() {
+                #[cfg(test)]
+                {
+                    self.work.reconciliations += 1;
+                }
+                let active: std::collections::HashSet<&NodeId> =
+                    members.iter().map(|m| &m.node_id).collect();
                 self.report_freshness
-                    .retain(|node, _| members.iter().any(|m| &m.node_id == node));
+                    .retain(|node, _| active.contains(node));
                 for member in members.iter() {
-                    self.report_freshness
-                        .entry(member.node_id.clone())
-                        .or_insert_with(Instant::now);
+                    if !self.report_freshness.contains_key(&member.node_id) {
+                        self.report_freshness
+                            .insert(member.node_id.clone(), Instant::now());
+                    }
                 }
             }
         }
+        self.report_freshness.len() < before
     }
 
     fn publish(&mut self) {
-        self.refresh_report_deadlines();
+        self.refresh_report_deadlines(false);
+        #[cfg(test)]
+        {
+            self.work.publishes += 1;
+        }
         let _ = self.watch_tx.send(self.build_aggregated_state());
     }
 
@@ -399,13 +525,15 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             })
             .map(|(node, _)| node.clone())
             .collect();
+        let mut stale_set: std::collections::HashSet<NodeId> =
+            stale_nodes.iter().cloned().collect();
         for (node_id, entry) in &self.entries {
             if entry.epoch != epoch {
                 continue; // a previous leadership epoch — not current truth
             }
             reports.insert(node_id.clone(), entry.report.clone());
             if now.duration_since(entry.received_at) > stale_timeout
-                && !stale_nodes.contains(node_id)
+                && stale_set.insert(node_id.clone())
             {
                 stale_nodes.push(node_id.clone());
             }
@@ -596,6 +724,7 @@ mod tests {
         let rollup = |name: &str| crate::mayo::rollup::NodeRollup {
             node_id: NodeId::new(name),
             timestamp: 60,
+            part: 0,
             entries: vec![crate::mayo::rollup::RollupEntry {
                 metric_name: "node_cpu_usage_percent".to_string(),
                 labels: std::collections::BTreeMap::new(),
@@ -697,6 +826,12 @@ mod tests {
             "capability reports must have the same mTLS identity binding"
         );
         drop(state);
+        // Rollups are ingested off the report loop (#2443): give the
+        // honest one a moment to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rollups.read().await.buffer_len() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             rollups.read().await.buffer_len(),
             1,
@@ -777,6 +912,177 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    /// #2443: the aggregator ingested a rollup inline, awaiting the rollup
+    /// store's write lock, on the loop that handles every report. A query
+    /// or a flush holding that lock stalled state, capability and readiness
+    /// reports with it. A report is now published while the store is
+    /// locked, and the rollup is ingested once the lock is free.
+    #[tokio::test]
+    async fn a_report_is_published_while_the_rollup_store_is_locked() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let rollup_dir = tempfile::tempdir().unwrap();
+        let rollups = Arc::new(RwLock::new(crate::mayo::rollup_store::RollupStore::new(
+            rollup_dir.path().to_path_buf(),
+        )));
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            Some(Arc::clone(&rollups)),
+            None,
+            None,
+        );
+
+        let guard = rollups.read().await;
+        let rollup = crate::mayo::rollup::NodeRollup {
+            node_id: NodeId::new("w1"),
+            timestamp: 60,
+            part: 0,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "node_cpu_usage_percent".to_string(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        };
+        worker_transport
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup))
+            .await
+            .unwrap();
+        worker_transport
+            .send(addr(2), &ReportingMessage::Report(report("w1")))
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move { aggregator.run().await });
+
+        tokio::time::timeout(Duration::from_millis(500), watch_rx.changed())
+            .await
+            .expect("the report waited for the rollup store's lock")
+            .unwrap();
+        assert!(watch_rx.borrow().reports.contains_key(&NodeId::new("w1")));
+
+        // The rollup isn't lost: it lands once the lock is free.
+        drop(guard);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rollups.read().await.buffer_len() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rollup was never ingested"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rollups.read().await.buffer_len(), 1);
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_reports_is_published_once_the_queue_is_empty() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        // The whole burst is queued before the aggregator starts, so it
+        // stores them back to back and publishes in batches.
+        for index in 0..200 {
+            worker_transport
+                .send(
+                    addr(2),
+                    &ReportingMessage::Report(report(&format!("w{index}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(async move { aggregator.run().await });
+
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if watch_rx.borrow_and_update().reports.len() == 200 {
+                    return;
+                }
+                watch_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(complete.is_ok(), "the burst never reached the view");
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_report_does_not_rebuild_the_state_once_per_message() {
+        // #2440: storing a report must cost the same whatever the fleet's
+        // size. 200 members, each reported once, then a queued burst of
+        // 200 more reports: one published view, and no pass over the
+        // membership list, because membership didn't change.
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let names: Vec<String> = (0..200).map(|index| format!("w{index}")).collect();
+        let (_members, membership) =
+            watch::channel(names.iter().map(|name| member(name)).collect::<Vec<_>>());
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            Some(membership),
+        );
+        for name in &names {
+            aggregator.insert_local_report(report(name));
+        }
+        aggregator.work = WorkCounts::default();
+        for index in 0..200 {
+            worker_transport
+                .send(
+                    addr(2),
+                    &ReportingMessage::Report(report(&format!("n{index}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let handle = tokio::spawn(async move {
+            aggregator.run().await;
+            aggregator
+        });
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if watch_rx.borrow_and_update().reports.len() == 400 {
+                    return;
+                }
+                watch_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(complete.is_ok(), "the burst never reached the view");
+        shutdown.cancel();
+        let aggregator = handle.await.unwrap();
+        // Tokio makes a task yield after about 128 channel operations (its
+        // cooperative budget), so a long burst publishes once per stretch,
+        // not once: two for these 200. Per message it was 200.
+        assert!(aggregator.work.publishes <= 2, "{:?}", aggregator.work);
+        assert_eq!(aggregator.work.reconciliations, 0, "{:?}", aggregator.work);
     }
 
     #[tokio::test]

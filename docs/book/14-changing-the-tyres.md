@@ -342,6 +342,16 @@ The logic reads like a table. Marker says `Staged`: the process died *between* s
 
 Trace the crash-loop story through it, because this is the automatic rollback promised at the start of the chapter. Upgrade swaps and execs: `Executed`, attempts 0. New binary boots, decision increments to 1 (under the limit of 2): `VerifyUpgrade`. It crashes. The supervisor (systemd in production, the test harness in tests) restarts the symlink, which still points at the new binary. Attempts 2: still `VerifyUpgrade`. Crashes again. Attempts 3: over budget. `RevertAndExecPrevious`. Startup flips the symlink back and execs the old binary, which wakes up, sees `RevertPending`-and-I'm-the-previous-version, and completes the revert: report the failure to the leader, archive the marker, get on with life. No human involved, and every step of that story is a unit test with the same name.
 
+### Count the boot before anything can fail
+
+That story has a quiet assumption: the new binary gets far enough to count. For a long time it counted in startup recovery, right after it had loaded its config, run about ten validations, checked the state format and taken the registry's upload lock. A release that renamed a config key, or tightened a validation this node's config broke, exited before any of that. The supervisor restarted it, it exited at the same line, and `boot_attempts` stayed at 0 for ever. The node was down until someone logged in and moved the symlink by hand, and on an appliance there's no one to log in (#2415).
+
+So now the very first thing an agent boot does, before it opens its config, is count. The trouble is that the marker lives in the data directory, and only the config says where that is. The old binary solves it for the new one: just before it swaps the symlink, it writes a small pointer beside it, `{binary_dir}/.bun.upgrade-pending`, holding the marker's absolute path and the boot budget. The new binary finds its own directory from the executable path alone, reads the pointer, loads the marker and runs the same `decide_startup`. That's `count_upgrade_boot` in `src/upgrade/manager.rs`. A counted boot is written to disk at once. A boot past the budget flips the symlink back and execs the previous version, still without a config. Everything else (completing a revert, archiving a stale marker) waits for startup recovery as before, and the pointer goes wherever the marker goes: commit, completed revert, stale archive, failed `execv`.
+
+Startup recovery runs later in the same boot, so it's handed what the early step did (`EarlyBoot::Counted`), and a boot is never counted twice. Even a command line the new release won't parse counts. `bun` calls clap's `Cli::try_parse()` instead of `Cli::parse()`: `parse` prints the error and exits on its own, while `try_parse` returns a `Result`, so we can count the boot before calling `error.exit()` ourselves. (`error.use_stderr()` tells a real error from `--help` and `--version`, which aren't boots.)
+
+The test is `an_upgrade_that_fails_before_config_load_reverts_by_itself` in `tests/self_upgrade.rs`. It poisons v0.2.0 with a `.fail-early` sidecar, a debug-only hook that exits before the config is read, and waits for the node to come back on v0.1.0 by itself.
+
 ### Why pure?
 
 `decide_startup` touches no filesystem, spawns nothing, execs nothing. All I/O happens before it (loading the marker) or after it (persisting the mutated marker the decision carries, then acting). That split is what makes the scariest logic in the chapter *boring to test*: the crash-loop test doesn't crash anything, it calls a function with `boot_attempts: 2` and asserts on the returned enum. Fourteen tests cover every phase-times-version combination, and they run in six milliseconds.
@@ -352,7 +362,8 @@ One Rust note for the road. The decision arms use *match guards* (`MarkerPhase::
 
 ### What we decided not to do
 
-- **Keeping attempts in the supervisor.** systemd's `StartLimitBurst` could count restarts, but then the logic lives in a unit file we don't ship and can't test, and macOS/test environments behave differently. The marker makes the binary self-contained: any dumb `while true; do bun; done` loop is an adequate supervisor.
+- **Keeping attempts in the supervisor.** systemd's `StartLimitBurst` could count restarts, but then the logic lives in a unit file we don't ship and can't test, and macOS/test environments behave differently. The marker makes the binary self-contained: any dumb `while true; do bun; done` loop is an adequate supervisor. The price is that the binary has to count before it can fail, which is why the count runs before the config is read.
+- **Having the old binary count, and a shim decide.** The old binary could bump `boot_attempts` before each exec, with a second small binary in front of `bun` deciding whether to revert. That's a second binary to ship, sign and upgrade. The pointer file gets the same result with one.
 - **Reverting on the *first* failed boot.** Transient failures exist (a port not yet released, a slow disk). One retry is cheap; the budget is configurable (`upgrades.max_boot_attempts`, default 2).
 - **Deleting stale markers.** Archiving costs nothing and the file is exactly what you'll want when diagnosing "why did node 7 revert last night".
 
@@ -1114,6 +1125,25 @@ In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script
 The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything, points the upgrade at the proxy, and keeps the proxy down until the run's state shows a directive that failed on it. Only then does it reopen the proxy. So the node has used up its own 10 s budget and answered 503, and the orchestrator has to re-send. The test requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.
 
 The first version timed the outage instead: 25 seconds from when the proxy started. That flaked twice over (#908). On a loaded host, pushing the binary and starting the run took up to 45 seconds, so the outage was over before the first directive and the test failed with "proved nothing". And with the outage hit, three swaps of 45 to 55 seconds each brought the walk within seconds of the harness's 180 s watch, so CI once timed out with the leader, which goes last, still on v0.1.0. Ending the outage on an event, not a clock, fixes the first. For the second, `watch_upgrade` now fails after 180 s *without progress*: any change to the run's phase, a node's phase or a node's retry count restarts the clock. A walk that stops moving still fails, but a slow one no longer does.
+
+## A binary nobody tracks
+
+The registry blob from the last two sections has another enemy besides a late registry: the registry's own garbage collector (#2419). `relish upgrade start` pushes the binary once, as a bare blob in the `reliaburger-bun` repository, with no manifest and no tag. Chapter 5's GC treats any blob no manifest tracks as an orphan, and deletes it once the file is an hour old. A blob is a perfectly good orphan for that hour: it covers a push whose manifest hasn't arrived yet. An upgrade lasts longer. Workers go one at a time, a node may spend five minutes on its step, and a paused run waits for the operator with no limit at all. Pause at 10:20, resume at 11:40, and somewhere in between node A's hourly sweep nominated the binary, the arbiter approved it ("not tracked, nothing to lose"), and every node still to go got a 404.
+
+The fix reads state the cluster already has. While `active_upgrade` is set, paused included, its binaries are in use, so the Raft arbiter strips their digests out of every GC report before it approves anything:
+
+```rust
+let kept = self
+    .state
+    .active_upgrade
+    .as_ref()
+    .map(crate::upgrade::types::ClusterUpgradeState::binary_digests)
+    .unwrap_or_default();
+```
+
+`Option::map` takes a function, and a method path like `ClusterUpgradeState::binary_digests` is one: it takes `&ClusterUpgradeState`, which is exactly what `as_ref()` leaves inside the `Option`, so no closure is needed. `unwrap_or_default()` turns "no upgrade" into an empty set. The arbiter decides for every node, so that alone is enough. Each node's GC loop also reads the same set from its replica into `GcConfig::pinned_digests` and doesn't nominate those blobs, which saves a round trip on a council member. Nothing has to release the pin: when the upgrade completes or is aborted, `active_upgrade` is cleared, the binary is an ordinary orphan again, and the next sweep after the grace period collects it.
+
+`gc_arbitration_refuses_the_binary_of_an_active_upgrade` puts a paused upgrade in the state machine, sends a GC report naming its binary and another orphan, and checks that only the other orphan is approved. It then clears the upgrade and checks that the binary is approved too, so the pin can't leak storage. `gc_keeps_the_binary_of_an_upgrade_that_is_still_running` does the same for nomination.
 
 ## Asking the wrong node
 
@@ -2092,3 +2122,65 @@ let directory = directory.borrow();
 The project's async rules gained a line too: never hold two `watch` borrows at once. Two more places broke it with other pairs of gossip channels: the council reconciler's membership filter in `src/cluster/recovery_fence.rs` held the membership and the directory, and Bun's roster refresher held the directory and the roster. Neither had a partner taking the pair the other way round yet, but neither should wait for one. Each now borrows one channel per statement.
 
 `directory_write_waits_for_metrics_read` in the same file is the test fixture. It holds a metrics borrow, as the maintainer does, and queues an openraft write behind it. Then it runs the code under test on its own thread, which blocks on the metrics behind that queued writer, and checks whether a gossip write can still land. Three tests use it: one each for `resolve_leader` and `leader_api_address`, and `forwarding_reads_the_metrics_without_holding_the_gossip_directory` for Pickle's forwarder. With the directory borrowed first, all three fail with "a gossip directory write waited for the metrics read". Every wait in the fixture has a timeout, so a regression fails the test instead of hanging it.
+
+## One node that never answers
+
+The leader's walk polls every node in the group it's working on, every 3 seconds. Pass 1 of `poll_and_drive_group` calls `control.probe(address)` for each one, and `HttpNodeControl::probe` is two plain reqwest calls, `GET /v1/version` and `GET /v1/health`. Neither had a timeout. Nor did the cluster's HTTP client: `crate::http_client::builder()` sets HTTP/1 and the bundled roots, and its doc comment says the caller adds timeouts. The orchestrator's caller didn't (#2416).
+
+Now picture a node that accepts the connection and then says nothing. Its bun is deadlocked, or `SIGSTOP`ped, or the box lost power and the leader's pooled connection went half-open. The kernel still finishes the handshake from the listen backlog. `send()` writes the request and waits for headers that never come. `step()` never returns, so `check_timeout` never runs for the node that's actually stuck, nothing reaches Raft, and the run neither moves nor pauses. `relish upgrade abort` and `resume` both answer that the run isn't paused. The 300 s stuck-node timeout we built for exactly this case sits behind the call that hangs.
+
+The fix bounds every call in `step` itself, not just in `HttpNodeControl`, so every `NodeControl` gets it, the test mock included:
+
+- A probe gets `PROBE_TIMEOUT`, 5 s, the bound the start handler already gave its own probe. A probe that runs out counts as unreachable, the same as a refused connection, so the stuck-node timeout runs as before.
+- A directive gets `DIRECTIVE_TIMEOUT`, 150 s. A node answers `/v1/upgrade/apply` only once it has fetched the binary (75 s at most) and asked it for its formats (60 s at most), so 5 s would turn every slow fetch into a retry storm. A directive with no answer by then is `DirectiveError::Transient`, retried with the usual backoff.
+- The group's probes run side by side with `futures_util::future::join_all`, then the results are applied in node order. Done one after another, 200 silent workers would cost 200 × 5 s a tick.
+
+`tokio::time::timeout(duration, future)` wraps any future and returns `Err(Elapsed)` if it hasn't finished in time. Dropping the inner future cancels it. For a reqwest call that closes the connection, so nothing is left waiting behind it.
+
+Both cluster clients, plaintext and mTLS, also got a 5 s `connect_timeout`, so no peer call anywhere waits out the kernel's two-minute SYN timeout. They didn't get an overall `.timeout()`. The same client carries streaming calls (the log fan-out, build transfers) that legitimately run for minutes.
+
+### Tests
+
+`a_node_that_never_answers_its_probe_does_not_stall_the_step` gives `MockControl` a silent node whose probe is `std::future::pending()`, a future that never finishes, beside a node that's been `Directed` for longer than `NODE_TIMEOUT`. Before the fix `step` never returned and the test's outer 30 s timeout fired. Now the silent node stays `Healthy` and the stuck one fails and pauses the run. `a_groups_probes_run_concurrently` checks that three silent nodes cost one probe bound, and `a_directive_that_never_answers_is_a_transient_failure` that a silent directive leaves the node `Pending` with a retry booked. All three run with `#[tokio::test(start_paused = true)]`. With the clock paused, Tokio jumps straight to the next timer whenever every task is waiting, so a 150 s bound takes no real time. That's safe here because nothing in the test calls `tokio::spawn`.
+
+### A tick that writes nothing new
+
+The same loop had a quieter cost (#2422). Pass 1 re-polls nodes it already marked `Healthy`, on purpose, to catch one that reverts after a lucky poll. When the node was still healthy, it called `set_phase(record, Healthy, now)`, and `set_phase` always stamped `record.since = Some(now)`. The driver writes the run to Raft whenever `step` returns something different, and the derived `PartialEq` on `NodeUpgradeRecord` compares `since` too. So from the first healthy node until its group finished, every 3 s tick committed a full copy of the run (every node record and every platform's signatures) that differed only in a timestamp. On a 200-worker roll at `--parallel 1` that's about 1,200 Raft entries carrying nothing.
+
+`set_phase` now returns early when the node is already in that phase. `since` means what its doc says, when the node entered its current phase, which is also what `relish upgrade status` wants to show. `a_tick_that_changes_nothing_leaves_the_run_equal` steps a cluster whose nodes are all where they were and asserts the result equals the input.
+
+## A version label is not a version
+
+Both signatures cover a binary's bytes, and nothing else. The version the gates compare (same version? a downgrade?) was a label: the file name for `--binary`, or a key in the unsigned release metadata for the network form. So a genuine, signed v0.3.1 copied onto a USB stick as `bun-v0.3.3` passed everything. Its signature verified, 0.3.3 is newer than the running 0.3.2 so no `--allow-downgrade` was asked for, and the formats matched. Worse, whoever controls a metadata mirror could list an old, vulnerable release under a new number, and `--external-key` would countersign it (#2403).
+
+After the swap it got stranger. The process that came up was 0.3.1, and the marker said `0.3.2 -> 0.3.3`. `decide_startup` had no arm for "a version the marker never mentions", so the catch-all archived the marker as stale and booted normally: no verification, no boot counting, no revert.
+
+The fix asks the bytes. `bun --compatibility` now prints `{protocol, state, version}`, a `CompatibilityAnswer` in `src/upgrade/compatibility.rs`, and the version comes from the code compiled into the binary, which no one can change without breaking its signature. Before staging, `check_reported_version` compares it with the directive's `target_version` and refuses a mismatch with `UpgradeError::VersionMismatch`, naming both. A release from before 0.3.4 prints no version, so it can only be an older release: it's accepted only with `allow_downgrade`.
+
+The answer is a new struct, not a new field on `Compatibility`. `Compatibility` has `#[serde(deny_unknown_fields)]` and release metadata stores it too, so growing it would change what every metadata reader accepts. The new field is `Option<BinaryVersion>` with `#[serde(default)]`, which is how serde reads an answer that leaves it out: as `None`, not an error.
+
+The debug builds the upgrade tests use need one more step. A test gives one compiled binary several versions with `.version` sidecars beside the store's files (§14.1), but the candidate is queried as a private copy, which has no sidecar, so it answers with the compiled version. `development_version_override` reads the sidecar beside the store's file for the target version instead, the same file the swapped-in binary will read. Release builds compile that branch out.
+
+`decide_startup` also splits its catch-all. `Executed` or `Verifying` with a version that's neither side of the upgrade now returns `RevertAndExecPrevious`: the swap happened and something unexpected runs. Only a `Staged` marker, or a revert that landed on an unexpected version, is still archived, the second so that a mislabelled *previous* binary can't loop the node.
+
+### Tests
+
+`a_candidate_whose_own_version_differs_from_the_directive_is_refused_before_staging` signs a candidate that says it's v0.1.5 and labels it v0.2.0: `prepare` refuses it, and no marker or candidate file is left. `a_candidate_that_does_not_say_its_version_needs_allow_downgrade` plays a pre-0.3.4 release. In `src/upgrade/marker.rs`, `a_swapped_in_binary_of_an_unexpected_version_reverts` replaces the old test that pinned the archive.
+
+### What we decided not to do
+
+We didn't sign a statement `{version, platform, sha256}` instead of bare bytes, or sign `metadata.json`. Either would bind the label to the bytes cryptographically, and it may still come. The version compiled into the binary already does that job: it's covered by the signature, so it can't be relabelled.
+
+## Complete, except for the node that was off
+
+`relish upgrade start` builds the run's node list from the membership listing, and that listing shows dead members too, so it drops every node gossip calls `dead` or `left`. That part is right: a dead node has no address and can't fetch a binary. What was wrong is that it did it silently (#2417). The leader checks each node it's given and calls the run `Completed` when every listed node is `Healthy`. So a node that was powered off when you typed `start` came back on the old version, rejoined (the formats match, so nothing refused it), and you'd been told the cluster upgrade was complete. For a security release, that's an unpatched node nobody mentioned.
+
+Now relish says so, at every step that could mislead. `left_out_nodes` picks the down members out of the listing. `start` prints them before it pushes anything (`not upgrading 1 node that is down: node-5 (dead); it will still run its current version when it returns`) and returns them as `left_out` in its JSON. `plan` lists them under their own heading. `status` compares the run's node list with the membership, so it also catches a node that joined while the run was going, and a finished run reads "on 7 of 8 nodes".
+
+### What we decided not to do
+
+We didn't record the skipped nodes in the run itself, as a `NodeUpgradePhase::Skipped` the history would keep. The run lives in Raft, so that's a durable-state change, and it's only worth making for the history: status can work the same answer out from the membership. Nor does the orchestrator chase a node that reappears. That would keep a run open for as long as a node might stay off, which could be for ever.
+
+### Tests
+
+`the_nodes_left_out_of_an_upgrade_are_named`, `start_says_which_down_nodes_it_leaves_out`, `plan_lists_the_nodes_it_leaves_out` and `cluster_status_names_the_members_a_finished_run_left_out` in `src/relish/upgrade.rs`. `build_node_list_leaves_out_dead_members` stays as it was: leaving the node out is still right.

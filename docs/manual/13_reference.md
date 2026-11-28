@@ -74,7 +74,7 @@ Changing it:
 | `join-token revoke` | the `node_id` and how many tokens were `revoked` |
 | `identity rotate-signing-key` | the new `key_id`, the `retiring_key_id` and when it stops verifying, `retire_after` |
 | `ca rotate` | the `role`, the `stage` (`begun`, `finalised`) and the council's `message` |
-| `upgrade start` | `scope`, `target_version`, `upgrade_id`, and `already_running` with its `detail` |
+| `upgrade start` | `scope`, `target_version`, `upgrade_id`, `already_running` with its `detail`, and `left_out`: the down members it didn't include, each `node_id` and gossip `state` |
 | `upgrade rollback`, `resume`, `abort` | the `change`, and the version or upgrade it was about |
 | `council recover`, `council re-enrol` | what was restored or removed, and the epochs |
 | `decommission-node` | the retirement record |
@@ -152,6 +152,12 @@ and one a scoped token can't see says `not visible to a scoped token`.
 `--watch`, and `--output json` or `yaml` refuses them, since the machine
 report always carries everything (see [diagnostics](07_diagnostics.md#three-ways-to-read-it)).
 
+## Cluster limits
+
+| Limit | Value | At the limit |
+|---|---|---|
+| Retired node identities | 65,536 | `relish decommission-node` is refused with `retired identity limit reached`; retired names are permanent, so nothing frees one. `relish council status` shows the count and `relish wtf` warns from 90% |
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
@@ -171,7 +177,7 @@ backups use each backend's standard credential variables.
 |------|---------|---------|
 | `--config PATH` | none (all defaults) | node config file |
 | `--listen ADDR` | `127.0.0.1:9117` | API listen address |
-| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux) |
+| `--runtime NAME` | `auto` | `auto`, `process`, `runc`, or `mixed` (Linux); `apple` is accepted only to refuse it with what to run instead |
 | `--cluster` | off | form or join a cluster using `[cluster]` |
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
@@ -286,25 +292,26 @@ is a field the node can't honour; nothing is silently dropped.
 | `command`, `args` | Replace the image's entrypoint and its default arguments (`args` only with an image) |
 | `working_dir` | Absolute working directory inside the container; image apps only |
 | `run_as_user`, `run_as_group` | Container uid and gid, inside its user namespace; refused on `exec` and `script` apps |
-| `replicas` | A count, or `"*"` for one per node. Default 1 |
+| `replicas` | A count from 1 to 10000, or `"*"` for one per node. Default 1 |
 | `port` | Port the app listens on; published on the node and in service discovery |
 | `cpu`, `memory` | Request–limit ranges, such as `"250m-1000m"` and `"256Mi-512Mi"` |
+| `pids` | Most processes and threads the container may hold at once (`pids.max`), 1–32768. Default 4096 for an image app, its init containers (which share its limit) and each sidecar; refused on `exec` and `script` apps, and on a rootless node |
 | `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
 | `env` | Environment variables: plain, encrypted (`ENC[AGE:...]`) or from a secret provider (`PROVIDER[name:path]`, see `security`) |
 | `namespace` | Namespace; `default` when omitted |
 | `owner` | The name of the API token of the controller that manages the app. Only that token or an admin may set it; `relish apply` and GitOps then leave the app alone, and `relish release` hands it back (see `writing-a-controller`) |
-| `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s or `interval`, whichever is shorter; at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros; `interval` and `initial_delay` at most 86400 s |
+| `health` | `path` (starts with one `/`, no whitespace; a query string is fine), `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s or `interval`, whichever is shorter; at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros; `interval` and `initial_delay` at most 86400 s |
 | `[[init]]` | `image` (default: the app's), `command` and `env` (on top of the app's; plain or `PROVIDER[name:path]`, no encrypted values); runs before the app with its env and mounts |
-| `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute, and is adopted across a Bun restart. `relish apps NAME` lists it under its instance. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
+| `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu`, `memory` and `pids` (default 4096). Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute, and is adopted across a Bun restart. `relish apps NAME` lists it under its instance. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
 | `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
 | `[[volumes]]` | `path`, and `source` (a node directory, allowlisted) or a managed volume with optional `size`; not on `exec` or `script` apps. A `size` needs root, and can't change once the volume exists |
 | `placement` | `required` and `preferred` node labels, `key=value` |
-| `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout`, `health_timeout`, `auto_rollback` |
+| `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout` (at most `"1h"`), `health_timeout` (at most `"24h"`), `auto_rollback` |
 | `stop_signal` | The signal a stop sends: `SIGTERM` (default), `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH` |
 | `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop. When Bun shuts down, every stop on the node shares 20 s |
 | `runtime` | A `[app.NAME.runtime]` table: `capabilities` to add, namespaced `sysctls` and `devices` (`path`, `permissions`). Each needs the node's `[runtime]` allowlist and, from a token with a `[permission]` block, `host-exec`; not on `exec` or `script` apps (see `security`) |
 | `pre_stop`, `pre_stop_timeout` | A command run inside each instance before its signal, and its bound (default 30 s, at most an hour). A failure is logged, never fatal. On `exec` and `script` apps it runs on the host and needs an absolute, allowlisted path |
-| `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max`, `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
+| `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max` (at most 10000), `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
 | `ingress` | `host`, `path`, `tls` (`cluster`, `explicit` or `none`), `websocket`, `rate_limit_rps`, `rate_limit_burst` |
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
@@ -384,27 +391,43 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
 | `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
+Fixed limits on the image directory, not settings (see `images-and-volumes`):
+
+| Limit | Value |
+|-------|-------|
+| One image's unpacked file content | 16 GiB, and at most the image filesystem's free space less 1 GiB |
+| One image's files (tar entries, across all layers) | 1,000,000 |
+| Unpacked images no container uses | collected at most hourly after a create from an image, or at once when the image filesystem is 95% full; anything a pull handed out, or an interrupted unpack left, within the last hour stays |
+
 ## Node config sections
 
 Every section is optional, and an unknown key is an error, so a typo fails at
-startup instead of being ignored.
+startup instead of being ignored. Two keys aren't for operators:
+`[reporting_tree] max_events_per_report` accepts only its default, `100`, and
+`[upgrades] release_keys_override` swaps the release signing keys in debug
+builds for tests and is ignored in a release build.
 
 | Section | For |
 |---------|-----|
-| `[node]` | `name`, `labels` (matched by `placement`), `loop_stall_snapshot_ms` (750: when one turn of Bun's agent loop runs this long, a watchdog thread writes a snapshot of every Bun thread to the journal, starting `bun: agent loop stalled`; at most ten an hour; `0` turns it off) |
-| `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
+| `[node]` | `name` (one DNS label: 1 to 63 lowercase letters, digits and `-`, not starting or ending with `-`; default `node-<gossip_port>`), `labels` (matched by `placement`), `loop_stall_snapshot_ms` (750: when one turn of Bun's agent loop runs this long, a watchdog thread writes a snapshot of every Bun thread to the journal, starting `bun: agent loop stalled`; at most ten an hour; `0` turns it off) |
+| `[cluster]` | `name`, `join`, ports, `council_size` (unset: the council grows to seven voters; an odd number from 1 to 7 caps it lower; only the node that bootstraps the cluster reads it), `environment` (a free-form tag such as `"production"`, descriptive only: safety gates read `[testing] safety_class`), `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
-| `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
+| `[resources]` | CPU and memory held back for the node itself: `reserved_cpu` (`"500m"`, or `"0.5"` cores), `reserved_memory` (`"512Mi"`); `gpu_enabled` (true: detect NVIDIA GPUs at startup) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
-| `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
-| `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`) |
-| `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
-| `[gitops]`, `[upgrades]` | see `operations` |
-| `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`) |
+| `[security]` | `master_key_path`, `bootstrap_path` (the security bootstrap that seeds a brand-new cluster), `identity_dir` (default `{storage.data}/identity`: this node's certificate, key and CA chain, written by `relish init` and `relish join`), `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `allow_insecure_cluster` (default `false`: a plaintext node whose gossip address isn't loopback also needs `true`, or `bun --cluster` refuses to bind its cluster transports; `relish init --development-plaintext` writes both keys), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
+| `[ebpf]`, `[dns]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers; `[dns] restrict_sources` (true: answer `.internal` names only to loopback and private-range clients; turn off only to debug); `[ebpf] program_dir` (unset: the programs built into `bun`; a directory overrides them, for development), `[ebpf] cgroup_path` (`/sys/fs/cgroup`: the cgroup v2 root the connect hook attaches to), `[ebpf] sweep_interval_secs` (60: how often the firewall and egress maps are reconciled with live instances; `0` turns the sweep off) |
+| `[ingress]` | `enabled` (false), `http_port` (80), `https_port` (443), `tls_cert` and `tls_key` (both or neither), `max_connections` (10,000 requests in flight, WebSockets included; past it, 503), `max_request_body_bytes` (10 MiB; past it, 413), `request_body_budget_bytes` (256 MiB shared by every body being buffered; past it, 503), `max_open_connections` (32,768 connections across both listeners; past it, the connection is closed), `max_tls_handshakes_per_source` (16 TLS handshakes in progress from one client address; past it, the connection is dropped). A request body that sends nothing for 30 s gets 408, and a response is cut after 30 s with no byte from the app (see `networking`) |
+| `[images]` | registry, storage caps (`max_storage`, unlimited by default; `max_files`, 65,536 by default), pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`), `registry_bind` (`"127.0.0.1"`: the address the registry listens on; a clustered node's explicit bind must cover its advertised address), `p2p_concurrency` (4 layers fetched at once per peer-to-peer pull), `pull_through` (true: external images go through the cluster's cache, so a later pull anywhere comes from a peer), `cache_recheck_secs` (3600: how long a cached upstream image is served before Pickle checks whether its tag moved) |
+| `[metrics]` | `collection_interval_secs` (10, not 0: node and process metrics), `scrape_interval_secs` (30: static `scrape_targets`), `app_scrape_interval_secs` (10, not 0: apps that declare `metrics`), `alerts_enabled` (true: evaluate the built-in alerts), `rollup_interval_secs` (60, not 0: how often rollups go to the council), `rollup_retention_hours` (24: how long council members keep them), `export_path` (unset; a path, `file://`, `s3://` or `gs://` URL for Parquet export), and retention and storage (see `observability`) |
+| `[logs]` | retention, storage and export (see `observability`) |
+| `[alerts]` | `evaluation_interval_secs` (30, not 0: how often the alert rules run), and webhook destinations (see `observability`) |
+| `[gitops]` | see `operations` |
+| `[upgrades]` | see `operations`; `binary_dir` (unset: the directory of the running binary, which holds the versioned binaries and the `bun` symlink), `boot_grace_secs` (30: how long a new binary must stay up after it answers `/v1/version` before the upgrade counts), `gossip_rejoin_secs` (60: how long it has to rejoin gossip, in a cluster), `max_boot_attempts` (2, not 0: boots on the new version before Bun reverts) |
+| `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`), including `[testing] max_lease_seconds` (3600, at most 86400: the longest test lease this node issues) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
 | `[reporting_tree]` | `report_interval_secs` (5, not 0), `stale_report_timeout_secs` (30: more than `report_interval_secs`, at most 86400), `stale_node_grace_secs` (300, not 0: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
+| `[reconstruction]` | the learning period after a new leader is elected, when it collects state reports before it reconciles: `report_threshold_percent` (95, 1 to 100: the share of live nodes that must report to end it early), `learning_period_timeout_secs` (15, not 0: the longest it lasts), `large_cluster_timeout_secs` (30, not 0: the longest it lasts in a large cluster), `large_cluster_node_count` (5000: the node count from which a cluster is large) |
 | `[runtime]` | `stop_confirmation_timeout_secs`; `allowed_capabilities`, `allowed_sysctls` and `allowed_devices`, the runtime knobs apps may use here, which the scheduler also places by (empty: none; see `security`) |
 
 ### Shorter certificates for soak runs
@@ -471,6 +494,8 @@ way, so check the exit code before you trust it.
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
+It prints at most 1 MiB of the command's output; longer output is cut and
+ends with the line `[output cut at 1 MiB]`.
 
 ## Terminal UI keys
 
@@ -703,7 +728,7 @@ See [security and access](10_security.md).
   - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
-  - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
+  - `relish secret encrypt --pubkey <PUBKEY> [VALUE]`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
 - `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
   - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient

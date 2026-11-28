@@ -96,7 +96,39 @@ nowhere.
 
 ## What doesn't
 
-The report warns about everything it approximates or drops. The usual ones:
+The report warns about everything it approximates or drops. After converting
+a resource, the importer walks every field it holds and warns about each one
+it didn't read, as `PATH = VALUE is not imported`, so a field Kubernetes adds
+later is reported too. A field at its Kubernetes default loses nothing and
+says nothing (`restartPolicy: Always`, `dnsPolicy: ClusterFirst`, a port's
+`protocol: TCP`, `imagePullPolicy: IfNotPresent`), and neither do metadata,
+`status`, selectors and history limits. The ones most likely to hurt get a
+sentence on what to do instead:
+
+- a StatefulSet's `volumeClaimTemplates` and every container's `volumeMounts`:
+  declare a `[[app.NAME.volumes]]` entry for each mount path, or the data
+  lives in the container and is lost when it restarts;
+- `imagePullSecrets`: the pull uses the registry credentials configured on
+  each node (see `images-and-volumes`);
+- `hostNetwork`, `hostPID`, `hostIPC` and a port's `hostPort`: an app always
+  runs in its own namespaces;
+- `startupProbe`: the warning gives the `[health] initial_delay` that allows
+  the same start-up time (`failureThreshold` times `periodSeconds`);
+- `readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `runAsNonRoot` and
+  `seccompProfile`: every container runs in its own user namespace with
+  Docker's default capabilities, Docker's default seccomp filter and
+  no-new-privileges set, whatever the manifest asks, and Reliaburger has no
+  read-only root filesystem;
+- a Service's `type` other than `ClusterIP`, its `nodePort`s,
+  `sessionAffinity` and a headless `clusterIP: None`;
+- a Deployment's `strategy.type: Recreate`, and a `maxSurge` or
+  `maxUnavailable` given as a percentage (Reliaburger's are counts);
+- an HPA metric after the first, its `behavior`, and a first metric that isn't
+  a `cpu` or `memory` resource, which is imported as `cpu` at `70%`;
+- a sidecar's probes, `securityContext`, ports and everything else a sidecar
+  doesn't carry.
+
+The rest of the usual ones:
 
 - a job's extra containers: a job runs only the first;
 - pod volumes and `fsGroup`: declare Reliaburger volumes instead. A `hostPath`
@@ -156,7 +188,7 @@ and `runAsUser`/`runAsGroup`; a job's `max_attempts` becomes `backoffLimit` and
 `forbid` → `Forbid`); an omitted `overlap` still exports as `Forbid`, because
 that's Reliaburger's default and Kubernetes' is `Allow`. It reports what it
 can't express: firewall and egress rules on apps and jobs, process workloads,
-`run_before`, a job's `pids` and `replay_unknown`, and for now health checks,
+`run_before`, an app's, a sidecar's or a job's `pids`, a job's `replay_unknown`, and for now health checks,
 metrics, volumes, config files and placement. Init containers export as
 ordinary ones named `init-0`, `init-1` and so on, before any native sidecars,
 with the app's image when they name none and the app's `env` under their own,

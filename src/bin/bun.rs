@@ -330,7 +330,7 @@ async fn current_registry_capability(
     };
     let authoritative;
     let local;
-    let catalog = if let Some(council) = council {
+    let catalog: &reliaburger::pickle::types::ManifestCatalog = if let Some(council) = council {
         authoritative = council.manifest_catalog().await;
         &authoritative
     } else {
@@ -460,7 +460,7 @@ fn enforce_mtls_mode(
     }
     anyhow::bail!(
         "[security] require_mtls is set but this node has no identity yet at {dir}: \
-         run `relish join --token <token> --node-id {} <member-api-url>` to enrol, then restart bun",
+         run `relish join --token <token> --node-id {} --ca-fingerprint <root-ca-fingerprint> <member-api-url>` to enrol, then restart bun",
         params.node_name
     );
 }
@@ -567,9 +567,9 @@ async fn refresh_leader_security_view(
         return;
     }
     let metrics = council.metrics();
-    let leader = reliaburger::cluster::directory::leader_api_address(Some(&metrics), directory);
+    let leader = reliaburger::cluster::directory::leader_api_target(Some(&metrics), directory);
     let result = match leader {
-        Some(leader) => client.fetch(leader).await,
+        Some((leader, address)) => client.fetch(council, &leader.0, address).await,
         None => Err("no council leader is known yet".to_string()),
     };
     match result {
@@ -838,11 +838,29 @@ async fn run_testapp(
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // A flag the new release renamed or removed stops it right here,
+            // so a fresh self-upgrade counts this boot first (#2415). Help
+            // and version output are not boots.
+            if error.use_stderr() {
+                count_upgrade_boot(&std::env::args().collect::<Vec<_>>());
+            }
+            error.exit()
+        }
+    };
     if cli.compatibility {
+        // The version too, so an upgrade can check a binary is the release
+        // it's labelled as (#2403).
+        let version = std::env::current_exe()
+            .map(|exe| reliaburger::upgrade::resolve_running_version(&exe))
+            .unwrap_or_else(|_| reliaburger::upgrade::version::compiled_version());
         println!(
             "{}",
-            serde_json::to_string(&reliaburger::compatibility::CURRENT)?
+            serde_json::to_string(&reliaburger::upgrade::CompatibilityAnswer::this_binary(
+                version
+            ))?
         );
         return Ok(());
     }
@@ -1022,6 +1040,49 @@ async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow:
     prepare_storage_directory(configured, &fallback, label).await
 }
 
+/// Count this boot against an in-flight self-upgrade, and exec the previous
+/// version if the new one has used up its attempts (#2415).
+///
+/// Runs before the config is read, so it needs nothing but the executable
+/// and the command line. A failure here is reported and left to startup
+/// recovery: never stop a boot over upgrade bookkeeping.
+fn count_upgrade_boot(original_argv: &[String]) -> reliaburger::upgrade::manager::EarlyBoot {
+    use reliaburger::upgrade::manager::{self, EarlyBoot};
+    let Ok(exe_path) = std::env::current_exe() else {
+        return EarlyBoot::Uncounted;
+    };
+    let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
+    match manager::count_upgrade_boot(&exe_path, &running_version) {
+        Ok(EarlyBoot::ExecPrevious { symlink }) => {
+            // Only returns on error; on success the process is replaced.
+            let error = manager::exec_symlink(&symlink, original_argv);
+            eprintln!("bun: warning: cannot exec the previous version: {error}");
+            EarlyBoot::Uncounted
+        }
+        Ok(early) => early,
+        Err(error) => {
+            eprintln!("bun: warning: cannot count this boot of an upgrade: {error}");
+            EarlyBoot::Uncounted
+        }
+    }
+}
+
+/// Is there a `{exe}{suffix}` file next to the resolved executable? The
+/// self-upgrade tests poison a version this way.
+fn debug_sidecar_exists(exe_path: &std::path::Path, suffix: &str) -> bool {
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
+    let Ok(resolved) = std::fs::canonicalize(exe_path) else {
+        return false;
+    };
+    let mut name = resolved
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    resolved.with_file_name(name).exists()
+}
+
 async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
@@ -1062,6 +1123,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             reliaburger::upgrade::version::build_commit()
         )
     );
+    // Count a fresh self-upgrade's boot before anything here can fail: a
+    // release that can't read this node's config must still revert by
+    // itself (#2415).
+    let original_argv: Vec<String> = std::env::args().collect();
+    let early_boot = count_upgrade_boot(&original_argv);
+
+    // Debug-only test hook: a `{exe}.fail-early` sidecar makes this process
+    // exit before it reads its config, as a release that rejects it would.
+    // Release builds never contain this branch.
+    if cfg!(debug_assertions) && debug_sidecar_exists(&exe_path, ".fail-early") {
+        eprintln!("bun: fail-early sidecar present; exiting (test hook)");
+        std::process::exit(101);
+    }
 
     // A rootless runc cluster is a contradiction between the command line
     // and the host, so refuse it before loading config or touching storage.
@@ -1188,6 +1262,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
         .await
         .context("cannot account physical image storage")?;
+    blob_store
+        .configure_file_limit(config.images.max_files)
+        .context("cannot set images.max_files")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
@@ -1200,7 +1277,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Self-upgrade: build the manager and run startup recovery BEFORE any
     // subsystem starts. A crash-looping new version reverts here; a freshly
     // swapped-in version gets a verification marker to prove itself against.
-    let original_argv: Vec<String> = std::env::args().collect();
     let upgrade_manager = match reliaburger::upgrade::manager::UpgradeManager::new(
         &config.upgrades,
         &data_base,
@@ -1217,7 +1293,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut upgrade_verify = None;
     if let Some(manager) = &upgrade_manager {
         use reliaburger::upgrade::manager::StartupAction;
-        match manager.startup_action() {
+        match manager.startup_action(&early_boot) {
             Ok(StartupAction::Continue { verify }) => upgrade_verify = verify,
             Ok(StartupAction::ExecPrevious) => {
                 // Only returns on error; on success the process is replaced.
@@ -1238,18 +1314,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // runs AFTER startup recovery so each failed boot burns an attempt and
     // the crash-loop revert machinery gets exercised for real. Release
     // builds never contain this branch.
-    // BLOCKING-OK: startup, before the agent loop or any workload runs
-    if cfg!(debug_assertions)
-        && let Ok(resolved) = std::fs::canonicalize(&exe_path)
-        && {
-            let mut name = resolved
-                .file_name()
-                .map(|n| n.to_os_string())
-                .unwrap_or_default();
-            name.push(".fail-boot");
-            resolved.with_file_name(name).exists()
-        }
-    {
+    if cfg!(debug_assertions) && debug_sidecar_exists(&exe_path, ".fail-boot") {
         eprintln!("bun: fail-boot sidecar present; exiting (test hook)");
         std::process::exit(101);
     }
@@ -1420,6 +1485,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
     let mut registry_directory = None;
+    let mut expected_council = None;
     // Address peers use for this node, captured before ClusterParams moves.
     let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
@@ -1507,6 +1573,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
         registry_directory = Some(cluster_runtime.directory_rx.clone());
+        expected_council = Some(cluster_runtime.expected_council.clone());
         api_gossip_stats = Some(cluster_runtime.gossip_stats.clone());
         api_backup_monitor = Some(reliaburger::council::backup::BackupMonitor(
             cluster_runtime.backup_rx.clone(),
@@ -2052,12 +2119,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if let Some(council) = &api_council {
         // A node with no Raft seat reads the leader's view of the security
         // state instead of its own empty replica (#1477).
-        let view_client = match (&api_identity, &crl_refresh, service_token.as_deref()) {
-            (Some(identity), Some(crl), Some(token)) => {
+        let view_client = match (
+            &api_identity,
+            &crl_refresh,
+            service_token.as_deref(),
+            &expected_council,
+        ) {
+            (Some(identity), Some(crl), Some(token), Some(expected)) => {
                 match reliaburger::sesame::security_view::SecurityViewClient::new(
                     identity,
                     crl.clone(),
                     token,
+                    expected.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -2441,11 +2514,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ));
     }
 
-    let agent_handle = reliaburger::bun::readiness::spawn_owned(
+    // The loop is what supervises every workload: if it ends, Bun exits and
+    // the service manager starts one that adopts them (#2379).
+    let owner_failure = reliaburger::bun::readiness::OwnerFailure::default();
+    let agent_handle = reliaburger::bun::readiness::spawn_fatal_owned(
         "agent",
         true,
         readiness.clone(),
         shutdown.clone(),
+        Arc::clone(&owner_failure),
         move |ready| async move {
             agent.run_with_readiness(ready).await;
         },
@@ -2727,13 +2804,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = rollup_flush_shutdown.cancelled() => {
-                        if let Err(e) = rollup_store.write().await.flush().await {
+                        if let Err(e) = reliaburger::mayo::rollup_store::flush_off_lock(&rollup_store).await {
                             eprintln!("bun: final rollup flush error: {e}");
                         }
                         break;
                     }
                     _ = tick.tick() => {
-                        if let Err(e) = rollup_store.write().await.flush().await {
+                        // The write runs outside the store lock, so the
+                        // aggregator's ingest and queries go on (#2443).
+                        if let Err(e) = reliaburger::mayo::rollup_store::flush_off_lock(&rollup_store).await {
                             eprintln!("bun: rollup flush error: {e}");
                         }
                     }
@@ -3029,8 +3108,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create the alert evaluator (shared between the API and the
     // evaluation loop so /v1/alerts always reflects current state).
+    // Firing alerts survive a restart, so a condition that clears while
+    // Bun is down still gets its resolve sent (#2478).
+    let alerts_state_path = data_base.join("alerts-firing.json");
     let alerts: Option<Arc<RwLock<AlertEvaluator>>> = if config.metrics.alerts_enabled {
-        Some(Arc::new(RwLock::new(AlertEvaluator::with_defaults())))
+        let mut evaluator = AlertEvaluator::with_defaults();
+        // BLOCKING-OK: startup, before the evaluation loop runs; one small file
+        let restored = evaluator.restore_firing(&alerts_state_path);
+        if restored > 0 {
+            println!("bun: {restored} firing alert(s) restored");
+        }
+        Some(Arc::new(RwLock::new(evaluator)))
     } else {
         None
     };
@@ -3257,6 +3345,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
             export_holds: export_holds.clone(),
+            image_store: cluster_image_store
+                .as_ref()
+                .map(reliaburger::grill::ImageStore::status)
+                .unwrap_or_default(),
         },
         test_policy: config.testing.clone(),
         token_lifetime: config.security.token_lifetime(),
@@ -3272,6 +3364,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .security_state()
             .await
             .oidc_signing_config
+            .clone()
             .map(|oidc| {
                 reliaburger::sesame::auth::WorkloadJwtVerifier::new(oidc, &config.cluster.name)
             }),
@@ -3575,6 +3668,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let eval_alerts = Arc::clone(alert_evaluator);
         let eval_shutdown = shutdown.clone();
         let eval_interval = config.alerts.evaluation_interval_secs;
+        let eval_state_path = alerts_state_path.clone();
         let cluster_name = config.cluster.name.clone();
 
         let webhook_client = reliaburger::http_client::builder()
@@ -3607,15 +3701,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .as_secs();
                         let latest = gather_latest_values(&eval_mayo, now_secs).await;
 
-                        let transitions = {
+                        let (transitions, firing) = {
                             let mut eval = eval_alerts.write().await;
-                            eval.evaluate(&latest)
+                            let transitions = eval.evaluate(&latest);
+                            let firing = (!transitions.is_empty()).then(|| eval.firing_records());
+                            (transitions, firing)
                         };
+                        // Saved whenever the firing set changed, before the
+                        // next evaluation, so saves can't land out of order.
+                        if let Some(firing) = firing {
+                            let path = eval_state_path.clone();
+                            let saved = tokio::task::spawn_blocking(move || firing.save(&path)).await;
+                            if let Ok(Err(error)) = saved {
+                                eprintln!("bun: saving firing alerts to {}: {error}", eval_state_path.display());
+                            }
+                        }
 
-                        for t in transitions {
+                        // One task per evaluation, not per transition; the
+                        // dispatcher bounds how many posts run at once (#2387).
+                        if !transitions.is_empty() {
                             let d = dispatcher.clone();
                             tokio::spawn(async move {
-                                d.dispatch(&t).await;
+                                d.dispatch_all(transitions).await;
                             });
                         }
                     }
@@ -3706,7 +3813,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             )),
             pull_through: config.images.pull_through,
             cache_recheck_secs: config.images.cache_recheck_secs,
-            fill_lock: tokio::sync::Mutex::new(()),
+            fill_locks: Default::default(),
         });
         if let Some(source) = &signature_source {
             source.use_cache(cluster_source.clone());
@@ -3907,6 +4014,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             retain_days: config.images.gc_retain_days,
             node_id: node_raft_id,
             orphan_grace: std::time::Duration::from_secs(3600),
+            pinned_digests: Default::default(),
         };
         let gc_interval = std::time::Duration::from_secs(
             u64::from(config.images.gc_interval_hours.max(1)) * 3600,
@@ -3975,11 +4083,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 // arbiter refuse anything still referenced.
                 let catalog_snapshot = match (&gc_council, gc_registry.forwarder.is_some()) {
                     (Some(council), _) => council.manifest_catalog().await,
-                    (None, true) => reliaburger::pickle::types::ManifestCatalog::default(),
-                    (None, false) => gc_catalog.read().await.clone(),
+                    (None, true) => Arc::default(),
+                    (None, false) => Arc::new(gc_catalog.read().await.clone()),
                 };
                 let store = Arc::clone(&gc_store);
-                let gc_cfg = gc_config.clone();
+                let mut gc_cfg = gc_config.clone();
+                // An active upgrade's binaries are untracked blobs nodes still
+                // need (#2419). The arbiter keeps them as well; this only
+                // saves nominating them.
+                if let Some(council) = &gc_council {
+                    gc_cfg.pinned_digests = council
+                        .read_desired(|state| {
+                            state
+                                .active_upgrade
+                                .as_ref()
+                                .map(reliaburger::upgrade::types::ClusterUpgradeState::binary_digests)
+                                .unwrap_or_default()
+                        })
+                        .await;
+                }
                 let nominated = tokio::task::spawn_blocking(move || {
                     gc_candidates(&store, &catalog_snapshot, &active, &gc_cfg)
                 })
@@ -4130,6 +4252,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     println!("bun: shutdown complete");
     if let Some(reason) = raft_failure.get() {
         anyhow::bail!("council Raft core stopped: {reason}");
+    }
+    if let Some(reason) = owner_failure.get() {
+        anyhow::bail!("{reason}");
     }
 
     Ok(())

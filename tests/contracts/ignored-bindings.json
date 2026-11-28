@@ -49,6 +49,12 @@
   },
   {
     "source": "src/grill/runc.rs",
+    "function": "runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones"
+  },
+  {
+    "source": "src/grill/runc.rs",
     "function": "runc_create_failure_rolls_back_private_rootfs_mount",
     "binary": "reliaburger",
     "test": "grill::runc::tests::runc_create_failure_rolls_back_private_rootfs_mount"
@@ -70,6 +76,36 @@
     "function": "runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir",
     "binary": "reliaburger",
     "test": "grill::runc::tests::runc_runs_an_image_by_its_own_entrypoint_env_and_working_dir"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_container_runs_under_seccomp_without_new_privileges",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_container_runs_under_seccomp_without_new_privileges"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_a_hostname_change_leaves_live_containers_under_control",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_hostname_change_leaves_live_containers_under_control"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_a_local_user_cannot_reach_a_containers_set_id_files",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_local_user_cannot_reach_a_containers_set_id_files"
   },
   {
     "source": "src/grill/runc.rs",
@@ -214,6 +250,12 @@
     "function": "cgroup_disk_io_throttle_applies_and_removes",
     "binary": "reliaburger",
     "test": "smoker::resource::tests::cgroup_disk_io_throttle_applies_and_removes"
+  },
+  {
+    "source": "src/smoker/resource.rs",
+    "function": "cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup",
+    "binary": "reliaburger",
+    "test": "smoker::resource::tests::cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup"
   },
   {
     "source": "src/bun/agent/tests/cgroup_faults.rs",
@@ -571,9 +613,27 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "a_v4_mapped_connect_to_a_vip_reaches_a_backend",
+    "binary": "reliaburger::ebpf",
+    "test": "a_v4_mapped_connect_to_a_vip_reaches_a_backend"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "a_lapsed_view_lease_routes_only_to_local_backends",
     "binary": "reliaburger::ebpf",
     "test": "a_lapsed_view_lease_routes_only_to_local_backends"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip",
+    "binary": "reliaburger::ebpf",
+    "test": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_rewritten_backend_entry_keeps_its_round_robin_position",
+    "binary": "reliaburger::ebpf",
+    "test": "a_rewritten_backend_entry_keeps_its_round_robin_position"
   },
   {
     "source": "tests/ebpf.rs",
@@ -1690,6 +1750,12 @@
     "function": "failed_upgrade_triggers_automatic_rollback",
     "binary": "reliaburger::self_upgrade",
     "test": "failed_upgrade_triggers_automatic_rollback"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "an_upgrade_that_fails_before_config_load_reverts_by_itself",
+    "binary": "reliaburger::self_upgrade",
+    "test": "an_upgrade_that_fails_before_config_load_reverts_by_itself"
   },
   {
     "source": "tests/self_upgrade.rs",

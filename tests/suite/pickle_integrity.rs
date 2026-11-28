@@ -157,6 +157,7 @@ async fn run_gc(registry: &Registry) {
         retain_days: 0,
         node_id: registry.state.node_raft_id,
         orphan_grace: Duration::ZERO,
+        pinned_digests: HashSet::new(),
     };
     let nominated = gc_candidates(
         &registry.state.store,
@@ -188,7 +189,7 @@ fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterS
         upstream: None,
         pull_through: false,
         cache_recheck_secs: 3600,
-        fill_lock: tokio::sync::Mutex::new(()),
+        fill_locks: Default::default(),
     }
 }
 

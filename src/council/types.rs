@@ -278,15 +278,17 @@ pub enum RaftRequest {
     /// commit returns a serial.
     ConsumeJoinTokenForIssue { token_hash: [u8; 32] },
     /// Publish the cluster-wide service endpoint catalogue (12b.4). The
-    /// leader rebuilds it from every node's health reports and replicates
-    /// the whole catalogue as one entry, so every node's DNS and ingress can
-    /// resolve services whose backends live on other nodes. Replacement requires
-    /// the exact publication generation used to prepare the candidate.
+    /// leader rebuilds it from every node's health reports, so every node's
+    /// DNS and ingress can resolve services whose backends live on other
+    /// nodes, and replicates only the services that changed since the
+    /// committed catalogue (#2438). Applying them requires the exact
+    /// publication generation used to prepare the candidate.
     PublishEndpoints {
         /// Committed generation observed while preparing this publication.
         expected_generation: u64,
-        /// Complete replacement catalogue, including original execution identities.
-        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        /// The changed services, in full with their original execution
+        /// identities, and the removed ones.
+        changes: Box<crate::onion::catalog::EndpointChanges>,
     },
     /// Create a durable Phase 15 resource lease.
     TestLeaseCreate(crate::testkit::lease::TestLease),
@@ -761,6 +763,104 @@ pub enum CouncilResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Shared: copy-on-write desired-state collections
+// ---------------------------------------------------------------------------
+
+/// One collection of the desired state, shared between copies of the state
+/// until one of them writes to it (#2435).
+///
+/// Cloning a `Shared` copies a pointer, not the collection. Reading goes
+/// through [`Deref`](std::ops::Deref) and costs nothing extra. Writing goes
+/// through [`DerefMut`](std::ops::DerefMut), which calls [`Arc::make_mut`]:
+/// the collection is copied only if another copy of the state still points
+/// at it. So a staged copy of the whole [`DesiredState`] is cheap, and an
+/// entry that writes one collection copies that one alone.
+///
+/// It serialises exactly as the value inside, so the snapshot format is
+/// the same as for a plain field.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Shared<T> {
+    /// Wrap a value.
+    pub fn new(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+
+    /// Whether two copies still point at one allocation.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&this.0, &other.0)
+    }
+
+    /// Another handle on the same allocation, for a caller that keeps it
+    /// after the state lock is released.
+    pub fn to_arc(&self) -> std::sync::Arc<T> {
+        std::sync::Arc::clone(&self.0)
+    }
+}
+
+// Hand-written so that cloning needs no `T: Clone`: it only copies the
+// pointer. `#[derive(Clone)]` would ask for `T: Clone` and, worse, read as
+// if it copied the collection.
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+// `for (id, spec) in &state.apps` iterates the collection inside.
+impl<'a, T> IntoIterator for &'a Shared<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.as_ref().into_iter()
+    }
+}
+
+// `.collect()` builds the collection inside, then shares it.
+impl<A, T: FromIterator<A>> FromIterator<A> for Shared<T> {
+    fn from_iter<I: IntoIterator<Item = A>>(iter: I) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
+impl<T: Serialize> Serialize for Shared<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DesiredState
 // ---------------------------------------------------------------------------
 
@@ -775,17 +875,17 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub apps: HashMap<AppId, AppSpec>,
+    pub apps: Shared<HashMap<AppId, AppSpec>>,
     /// Scheduling placements per app.
     #[serde(
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub scheduling: HashMap<AppId, Vec<Placement>>,
+    pub scheduling: Shared<HashMap<AppId, Vec<Placement>>>,
     /// Cluster-wide configuration key-value pairs.
     pub config: HashMap<String, String>,
     /// Pickle image registry manifest catalog.
-    pub manifest_catalog: ManifestCatalog,
+    pub manifest_catalog: Shared<ManifestCatalog>,
     /// Monotonic per-node fencing generations for registry blob collection.
     pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
@@ -802,7 +902,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub last_placed_nodes: HashMap<AppId, Vec<NodeId>>,
+    pub last_placed_nodes: Shared<HashMap<AppId, Vec<NodeId>>>,
     /// Apps the leader's last scheduling pass left unplaced because their
     /// namespace quota has no room, with the reason. Any node can answer
     /// "why isn't this running?" from it; it clears as soon as an app fits.
@@ -811,7 +911,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
+    pub quota_blocked: Shared<HashMap<AppId, crate::meat::quota::QuotaError>>,
     /// Fixed-size apps the leader's last scheduling pass placed only part
     /// of: how many replicas found a node, out of how many, and why the rest
     /// didn't (#702). It clears once every replica is placed.
@@ -820,7 +920,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub unschedulable: HashMap<AppId, crate::meat::types::Unschedulable>,
+    pub unschedulable: Shared<HashMap<AppId, crate::meat::types::Unschedulable>>,
     /// Each app's rollout record (#692): the fully rolled-out specs that
     /// `relish rollback` and the leader's node-by-node release fall back on,
     /// and the spec whose rollout failed. Survives every node restarting.
@@ -829,7 +929,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub rollouts: HashMap<AppId, crate::meat::deploy_types::AppRollouts>,
+    pub rollouts: Shared<HashMap<AppId, crate::meat::deploy_types::AppRollouts>>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
@@ -844,7 +944,7 @@ pub struct DesiredState {
     pub gitops_owned: crate::lettuce::types::GitOpsOwnership,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
-    pub security_state: SecurityState,
+    pub security_state: Shared<SecurityState>,
     /// The rolling binary upgrade in progress, if any (at most one).
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
@@ -861,9 +961,9 @@ pub struct DesiredState {
     pub batch_ids: crate::meat::batch_ids::BatchIds,
     /// Task arrays (0.2.0): chunk tables and counts, never a record per
     /// task. Ids come from `batch_ids`.
-    pub task_arrays: crate::meat::task_array_store::TaskArrays,
+    pub task_arrays: Shared<crate::meat::task_array_store::TaskArrays>,
     /// Durable build tracker: a monotonic id counter plus recent builds.
-    pub build_state: crate::bun::build_runner::BuildDurableState,
+    pub build_state: Shared<crate::bun::build_runner::BuildDurableState>,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
     /// that has never been recovered; the recovery path stamps a strictly
     /// higher value into the restored state so anything issued before the
@@ -900,18 +1000,18 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub declared_apps: HashMap<AppId, AppSpec>,
+    pub declared_apps: Shared<HashMap<AppId, AppSpec>>,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
     /// any service. Distinct from `manifest_catalog` (Pickle images).
-    pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    pub endpoint_catalog: Shared<crate::onion::catalog::EndpointCatalog>,
     /// Original discovery exposures awaiting remote withdrawal confirmation.
     pub endpoint_withdrawals: crate::onion::withdrawal::EndpointWithdrawals,
     /// Nodes that may retain discovery publications, including offline nodes.
     pub endpoint_consumers: std::collections::BTreeSet<String>,
     /// Permanent fences preventing stale reports from reviving retired executions.
-    pub producer_retirements: crate::onion::producer::ProducerRetirements,
+    pub producer_retirements: Shared<crate::onion::producer::ProducerRetirements>,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
@@ -920,7 +1020,7 @@ pub struct DesiredState {
     pub agent_leases: crate::proposal::lease::AgentLeases,
     /// Agent proposals (#1682): pending ones, applied ones inside the undo
     /// window, compacted records, and the id counter.
-    pub proposals: crate::proposal::Proposals,
+    pub proposals: Shared<crate::proposal::Proposals>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
     /// How many voters the council grows to, when the cluster was created
@@ -1030,7 +1130,10 @@ impl DesiredState {
 mod map_as_vec {
     use super::*;
 
-    pub fn serialize<K, V, S>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<K, V, S>(
+        map: &super::Shared<HashMap<K, V>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         K: Serialize + Eq + Hash,
         V: Serialize,
@@ -1040,14 +1143,16 @@ mod map_as_vec {
         vec.serialize(serializer)
     }
 
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+    pub fn deserialize<'de, K, V, D>(
+        deserializer: D,
+    ) -> Result<super::Shared<HashMap<K, V>>, D::Error>
     where
         K: Deserialize<'de> + Eq + Hash,
         V: Deserialize<'de>,
         D: Deserializer<'de>,
     {
         let vec: Vec<(K, V)> = Vec::deserialize(deserializer)?;
-        Ok(vec.into_iter().collect())
+        Ok(super::Shared::new(vec.into_iter().collect()))
     }
 }
 
@@ -1084,6 +1189,74 @@ impl Default for CouncilConfig {
     }
 }
 
+/// How long one snapshot chunk may take to be sent, received, decoded and
+/// answered, in milliseconds (#2367).
+///
+/// openraft's default is 200 ms, and a chunk that misses it restarts the
+/// whole install from offset 0, so a member on a slow link (or a slow CPU)
+/// that needed a snapshot never caught up. The last chunk also waits for the
+/// follower to decode the whole state and fsync it. Ten seconds is the
+/// transport's own bound on any RPC.
+pub const SNAPSHOT_CHUNK_TIMEOUT_MS: u64 = 10_000;
+
+/// The most snapshot bytes one chunk carries (#2367).
+///
+/// openraft's default is 3 MiB. 256 KiB is about 342 KiB on the wire as
+/// base64: under 300 ms on a 10 Mbit/s link, so a chunk fits its deadline
+/// with a wide margin even on a poor link, and a failed chunk costs little
+/// to resend.
+pub const SNAPSHOT_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// The most log entries openraft puts in one AppendEntries (#2370).
+///
+/// openraft's own default, set here so the batch count is a decision. Bytes
+/// are bounded separately, by [`LOG_READ_BUDGET_BYTES`].
+pub const MAX_PAYLOAD_ENTRIES: u64 = 300;
+
+/// The stored bytes of log entries a bounded log read returns, unless the
+/// first entry alone is larger (#2370).
+///
+/// openraft reads each AppendEntries batch through
+/// `limited_get_log_entries`, and gives the RPC `heartbeat_interval`
+/// (150 ms) to complete. 4 MiB crosses a 1 Gbit/s link in about 35 ms, so a
+/// batch of large entries fits its deadline with room for encoding and the
+/// follower's fsync. Entries are stored as JSON, the encoding they travel
+/// in, so stored bytes are close to frame bytes.
+pub const LOG_READ_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest request, as JSON, a council write accepts (#2370).
+///
+/// An entry that can't fit an AppendEntries frame could never replicate,
+/// and every later commit would wait behind it. 32 MiB leaves room under
+/// the transport's send limit (48 MiB) and its receive limit (64 MiB), and
+/// above the largest entry the council admits on purpose: a placement pass
+/// of 131,072 placements is about 20 MB.
+pub const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The length of `value` encoded as JSON, counted without building the
+/// encoding.
+pub fn json_len<T: Serialize>(value: &T) -> usize {
+    /// A writer that keeps only the count of bytes written to it.
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    // A failure to serialise means the value can't be encoded at all; the
+    // write path then fails at the log store's own encode, with its error.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 impl CouncilConfig {
     /// Convert to an `openraft::Config`.
     pub fn to_openraft_config(&self) -> openraft::Config {
@@ -1093,6 +1266,9 @@ impl CouncilConfig {
             election_timeout_max: self.election_timeout_max_ms,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(self.snapshot_threshold),
             max_in_snapshot_log_to_keep: self.max_in_snapshot_log_to_keep,
+            install_snapshot_timeout: SNAPSHOT_CHUNK_TIMEOUT_MS,
+            snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
+            max_payload_entries: MAX_PAYLOAD_ENTRIES,
             ..Default::default()
         }
     }
@@ -1356,7 +1532,7 @@ mod tests {
         .unwrap();
         let req = RaftRequest::PublishEndpoints {
             expected_generation: 42,
-            catalog: Box::new(catalog),
+            changes: Box::new(EndpointCatalog::new().changes_to(&catalog)),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
@@ -1378,6 +1554,24 @@ mod tests {
         assert_eq!(cfg.election_timeout_max_ms, 2000);
         assert_eq!(cfg.snapshot_threshold, 10_000);
         assert_eq!(cfg.max_in_snapshot_log_to_keep, 1000);
+    }
+
+    /// #2367: openraft's defaults give each snapshot chunk 200 ms and make
+    /// it 3 MiB, so a chunk on a slow link never arrives in time and the
+    /// install restarts from offset 0 for ever.
+    #[test]
+    fn a_snapshot_chunk_gets_seconds_and_fits_a_slow_link() {
+        let config = CouncilConfig::default().to_openraft_config();
+        assert!(
+            config.install_snapshot_timeout >= 10_000,
+            "a snapshot chunk gets {} ms",
+            config.install_snapshot_timeout
+        );
+        assert!(
+            config.snapshot_max_chunk_size <= 256 * 1024,
+            "a snapshot chunk is {} bytes",
+            config.snapshot_max_chunk_size
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@ A Reliaburger cluster is the same `bun` binary on every node, started with
 `--cluster`. Membership spreads by SWIM gossip. A Raft council, embedded in the
 agent, holds the desired state and schedules work; it starts on the first node
 and grows as nodes join, up to seven voters, or to the council size the
-cluster was created with (appliance clusters default to five).
+cluster was created with (`[cluster] council_size` on the first node, an odd
+number from 1 to 7; appliance clusters default to five).
 
 The council always holds an odd number of voters: the largest odd number the
 live nodes allow, up to seven. An even council survives no more failures than
@@ -82,6 +83,10 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+A node id is one DNS label, the same rule as `[node] name`: 1 to 63
+lowercase letters, digits and `-`, not starting or ending with `-`. `join-token
+create` and `join` refuse any other name before a token is minted or sent.
+
 Pick node names that differ by more than their last two characters. Raft
 numbers each member from a hash of its name, and a few short names collide
 (`worker-c0` and `worker-ar`, for instance). The council refuses a join token,
@@ -94,10 +99,18 @@ whether each is used, expired or still valid, never the token itself), and
 Like `create`, both are answered by the council leader, whichever member
 you ask.
 
-`relish init` printed the root CA fingerprint; pinning it means a member
-offering a different CA is refused. `--token-file` reads the token from a
+`relish init` printed the root CA fingerprint, and `--ca-fingerprint` is
+required: `join` fetches the CA before it can verify anything, so without the
+pin someone on the path could offer their own CA and receive your token. With
+it, a member offering a different CA is refused before the token is sent.
+`--insecure-trust-first-ca` skips the pin and prints the fingerprint it was
+offered as a warning; compare it with the one `relish init` printed. `--token-file` reads the token from a
 private file instead of the command line. `join` only enrols the identity (into
-`./identity` unless you pass `--identity-dir`). Then give the node its own
+`./identity` unless you pass `--identity-dir`). The identity directory also
+gets `council.json`, the council's voters when the leader signed the
+certificate: until the node holds a council seat, it takes Raft replication
+only from those voters, or from voters they name, and it keeps the file
+current by itself. Keep the directory whole when you move it. Then give the node its own
 config with `[cluster] name` matching the cluster and `join` listing an
 existing member's gossip address (port 9443), and start `bun --cluster`.
 
@@ -211,6 +224,15 @@ This discharges only that node's confirmations. The name can't rejoin; a
 replacement machine enrols fresh with `relish join`. Don't decommission a node
 that might still be running, such as one behind a network partition: it could
 still be sending traffic to addresses the cluster would then hand out again.
+
+Retirement is permanent: the council keeps every retired name for good, so
+an old disk can never come back as the old node. A cluster can hold 65,536
+retired names. At that limit `relish decommission-node` is refused with
+`retired identity limit reached`, and nothing frees a name. `relish council
+status` shows how many are used (`Retired: 3 of 65536 node identities`), and
+`relish wtf` warns with `council-retired-identities-nearly-full` from 90%. If
+you replace workers often, give a returning machine its old name back rather
+than retiring it and enrolling a new one.
 
 ## Contributors: clusters from a checkout
 

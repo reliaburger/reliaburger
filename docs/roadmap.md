@@ -773,7 +773,10 @@ what's shipped and what's scheduled.
   [#2227](https://github.com/reliaburger/reliaburger/pull/2227)), and the
   `v02-loops` bounds, first
   [recorded](qualification/2026-11-12-v02-loops-bounds.md) on 12 November,
-  are being recorded again this week. V04, the cold installs on Linux x86_64
+  passed the quiet macOS upgrade-node rerun 115 of 115 on 26 November
+  ([record](qualification/2026-11-26-v02-upgrade-node-macos.md)); the
+  macOS upgrade-cluster and registry-new-leader lanes wait for a quiet
+  Studio. V04, the cold installs on Linux x86_64
   and arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
   the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
@@ -799,8 +802,8 @@ what's shipped and what's scheduled.
   ([#359](https://github.com/reliaburger/reliaburger/issues/359)) moves to
   [0.6.0](https://github.com/reliaburger/reliaburger/milestone/23).
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
-  marks each of these as planned where it describes them: the reporting tree,
-  resource-aware council selection, per-app rollups and remote-read
+  marks each of these as planned where it describes them: the hierarchical
+  reporting tree, resource-aware council selection, per-app rollups and remote-read
   ([#364](https://github.com/reliaburger/reliaburger/issues/364));
   keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
   fully leader-coordinated rollouts
@@ -846,7 +849,7 @@ the item-by-item history.
 - [x] **Phase 12b: Correctness, security and convergence.** Six tiers (12b.1–12b.6) from the post-Phase-12 review; plans in the [archive](plans/archive/).
 - [x] **Phase 13: Relish TUI.** [Chapter 13](book/13-a-room-with-a-view.md).
 - [x] **Phase 14: Self-upgrade.** Rolling, signed binary replacement with rollback. [Chapter 14](book/14-changing-the-tyres.md).
-- [x] **Phase 15: Testing, benchmarking and diagnostics.** `relish test`, `bench`, `wtf`, `trace`; hardening passes 15a and 15b. [Chapter 15](book/15-ready-for-production.md).
+- [x] **Phase 15: Testing, benchmarking and diagnostics.** `relish test`, `bench`, `wtf`, `path`; hardening passes 15a and 15b. [Chapter 15](book/15-ready-for-production.md).
 - [x] **UX track.** `relish setup`, `manual`, `source` and the README.
 - [x] **Phase 16: Post-Phase-15 audit.** Truthfulness and hardening across code, manual and book.
 - [x] **0.1.0 release work.** The codebase completion plan (C01–C60), static review fixes, the V02 soak and the signed release ([closure record](qualification/2026-09-27-v0.1.0-release-closure.md)).
@@ -855,8 +858,9 @@ the item-by-item history.
 
 Deferred beyond the 0.x releases; the whitepaper (§22) has the reasoning and
 the [frozen roadmap](plans/archive/roadmap-to-0.1.0.md#future-v2) the detail:
-TPM sealing of the master secret, external secret managers, multi-cluster
+TPM sealing of the master secret, native Vault and cloud secret manager
+integrations (exec secret providers arrived in 0.2.4), multi-cluster
 federation (Franchise, which doesn't schedule batch work across clusters),
-IPv6, sidecars, GPU sharing beyond pre-partitioned MIG instances
+IPv6, GPU sharing beyond pre-partitioned MIG instances
 (time-slicing, MPS, changing MIG layouts) and a PromQL-to-SQL compatibility
 layer.

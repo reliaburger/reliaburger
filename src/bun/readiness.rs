@@ -250,6 +250,45 @@ where
     Factory: FnOnce(ReadySignal) -> Task + Send + 'static,
     Task: Future<Output = ()> + Send + 'static,
 {
+    spawn_owner(name, critical, evidence, shutdown, None, factory)
+}
+
+/// Why a fatal owner ended Bun, set once by the first one to end.
+pub type OwnerFailure = std::sync::Arc<std::sync::OnceLock<String>>;
+
+/// Spawn an owner Bun can't run without, such as the agent loop (#2379).
+/// An unexpected exit or panic is recorded as degradation, as with
+/// [`spawn_owned`], and then shuts Bun down with the reason in `failure`,
+/// so `main` exits non-zero and the service manager restarts it. A new Bun
+/// adopts the running workloads; a Bun whose loop is gone would supervise
+/// nothing while `systemctl` called it active.
+pub fn spawn_fatal_owned<Factory, Task>(
+    name: &'static str,
+    critical: bool,
+    evidence: ReadinessTracker,
+    shutdown: CancellationToken,
+    failure: OwnerFailure,
+    factory: Factory,
+) -> JoinHandle<()>
+where
+    Factory: FnOnce(ReadySignal) -> Task + Send + 'static,
+    Task: Future<Output = ()> + Send + 'static,
+{
+    spawn_owner(name, critical, evidence, shutdown, Some(failure), factory)
+}
+
+fn spawn_owner<Factory, Task>(
+    name: &'static str,
+    critical: bool,
+    evidence: ReadinessTracker,
+    shutdown: CancellationToken,
+    fatal: Option<OwnerFailure>,
+    factory: Factory,
+) -> JoinHandle<()>
+where
+    Factory: FnOnce(ReadySignal) -> Task + Send + 'static,
+    Task: Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         evidence.register(name, critical).await;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -282,6 +321,11 @@ where
                 "task exited unexpectedly before shutdown"
             };
             evidence.degraded(name, error).await;
+            if let Some(failure) = fatal {
+                eprintln!("bun: {name} {error}; shutting down so the service manager restarts bun");
+                let _ = failure.set(format!("{name} {error}"));
+                shutdown.cancel();
+            }
         }
     })
 }
@@ -719,7 +763,7 @@ mod tests {
             "socket owner",
             true,
             evidence.clone(),
-            shutdown,
+            shutdown.clone(),
             |_ready| async {},
         );
         handle.await.unwrap();
@@ -728,5 +772,92 @@ mod tests {
         assert!(!snapshot.ready);
         assert_eq!(snapshot.subsystems[0].state, SubsystemState::Degraded);
         assert_eq!(snapshot.subsystems[0].restart_count, 0);
+        assert!(!shutdown.is_cancelled(), "a plain owner leaves Bun running");
+    }
+
+    /// The agent loop's panic used to leave Bun up and supervising nothing
+    /// (#2379). A fatal owner's panic is recorded, then shuts Bun down.
+    #[tokio::test]
+    async fn a_fatal_owner_panic_cancels_shutdown() {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let failure = OwnerFailure::default();
+        let handle = spawn_fatal_owned(
+            "agent",
+            true,
+            evidence.clone(),
+            shutdown.clone(),
+            failure.clone(),
+            |ready| async move {
+                ready.ready();
+                panic!("a loop handler failed");
+            },
+        );
+        handle.await.unwrap();
+
+        assert!(shutdown.is_cancelled());
+        assert_eq!(
+            failure.get().map(String::as_str),
+            Some("agent task panicked before shutdown")
+        );
+        let observed = evidence.snapshot().await;
+        assert_eq!(observed.subsystems[0].state, SubsystemState::Degraded);
+        assert!(
+            observed.subsystems[0]
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fatal_owner_that_returns_early_cancels_shutdown() {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let failure = OwnerFailure::default();
+        spawn_fatal_owned(
+            "agent",
+            true,
+            evidence.clone(),
+            shutdown.clone(),
+            failure.clone(),
+            |_ready| async {},
+        )
+        .await
+        .unwrap();
+
+        assert!(shutdown.is_cancelled());
+        assert!(failure.get().unwrap().contains("exited unexpectedly"));
+        assert_eq!(
+            evidence.snapshot().await.subsystems[0].state,
+            SubsystemState::Degraded
+        );
+    }
+
+    /// A fatal owner that ends because Bun is shutting down is a clean stop:
+    /// no failure, so `main` exits 0.
+    #[tokio::test]
+    async fn a_fatal_owner_stopped_by_shutdown_records_no_failure() {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let failure = OwnerFailure::default();
+        let stop = shutdown.clone();
+        spawn_fatal_owned(
+            "agent",
+            true,
+            evidence.clone(),
+            shutdown.clone(),
+            failure.clone(),
+            move |_ready| async move { stop.cancel() },
+        )
+        .await
+        .unwrap();
+
+        assert!(failure.get().is_none());
+        assert_eq!(
+            evidence.snapshot().await.subsystems[0].state,
+            SubsystemState::Stopped
+        );
     }
 }

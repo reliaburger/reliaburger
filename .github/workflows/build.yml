@@ -121,7 +121,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Quarto
-        uses: quarto-dev/quarto-actions/setup@v2
+        uses: quarto-dev/quarto-actions/setup@8a96df13519ee81fd526f2dfca5962811136661b # v2.2.0
         with:
           tinytex: true
         env:
@@ -180,10 +180,11 @@ jobs:
       NIGHTLY_FEATURES: ${{ startsWith(github.ref, 'refs/heads/release-') && '--features nightly-signing' || '' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -204,6 +205,16 @@ jobs:
             target/${{ matrix.target }}/release/bun --version
             cp target/${{ matrix.target }}/release/bun dist/bun-${{ matrix.suffix }}
           fi
+      - name: Start the release bun and run one app
+        # `--version` doesn't start a cluster. Run the release pair the way a
+        # server does, on the process runtime, so a bun that can't start or
+        # run a workload never becomes a release asset (#2486).
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          scripts/release/smoke-release-bun.sh \
+            target/${{ matrix.target }}/release/bun \
+            target/${{ matrix.target }}/release/relish
       - name: Record the embedded source bundle's digest
         # The relish just built says what it embeds, and that it came from a
         # clean tree; candidate.py refuses anything else. The candidate job
@@ -249,10 +260,11 @@ jobs:
       RUSTFLAGS: -C force-frame-pointers=yes
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.98.0
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: profiling-aarch64-unknown-linux-gnu
           save-if: ${{ github.ref == 'refs/heads/main' }}

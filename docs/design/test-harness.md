@@ -1,5 +1,9 @@
 # Test harness
 
+**Status:** Shipped. A process document: the suites and gates the project runs today.
+**Reconciled against:** not reconciled
+**Sketches:** none
+
 The test count used to answer the wrong question. It mixed portable correctness tests,
 tests that returned successfully without running, privileged Linux checks, hour-long scale
 simulations and Criterion benchmarks into one reassuring number. A green line could mean
@@ -52,27 +56,27 @@ be visible until we remove its race.
 
 | Command | Contract | Automation |
 |---|---|---|
-| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux and hosted macOS |
-| `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
-| `make test-doc` | Rust documentation examples | Linux and hosted macOS |
-| `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
-| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
-| `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401); the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual |
-| `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
-| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
-| `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
+| `make lint` | Clippy for every target, with all features and with none, so the build without default features stays healthy | Linux; hosted macOS runs `make lint-macos` instead |
+| `make test` | Portable unit, component and integration correctness via nextest | Linux; hosted macOS runs `make test-macos`, relish's tests and the tests only macOS compiles |
+| `make test-doc` | Rust documentation examples | Linux; hosted macOS runs relish's doctests |
+| `make test-slow` | Required wall-clock health and retry acceptance | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401), then a hundred running 1,000 apps against the cluster summary's 1 s budget; the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual: the maintainer, before a release that changes the summary, reporting or the harness (`docs/testing.md`'s manual gates, #2489) |
+| `make test-upgrade-node` | Real single-node binary replacement | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; the train's merge queue, PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; the train's merge queue, PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu` | Real NVIDIA hardware | Manual |
-| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, SeaweedFS as a service container; `main`, nightly, and PRs touching the S3 client, log export or council backups |
+| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, a pinned SeaweedFS binary that `scripts/test-s3.sh` downloads and starts; `main`, nightly, and PRs touching the S3 client, log export or council backups |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
 | `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
 | `make ci-bench` | `make ci`, then `make bench` | Local |
-| `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
+| `make bench` | Criterion transport and 5–250-node gossip measurements, the 1k and 10k node scheduling pass, and policy evaluation | `main`, nightly, and PRs touching gossip, the scheduler, the policy engine or their benches |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
 | `make fuzz-corpus-check` | Every fuzz target body over its seeds and checked-in corpus, on stable (also part of `make test`) | Local; `make test` everywhere |
-| `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly, 30 s on PRs touching a decoder |
+| `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly on the newest train (else `main`), any budget by hand; never on pull requests |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
@@ -90,11 +94,15 @@ Pull requests into a release's merge-train branch (`release-*`) run the light se
 lint, minimum Rust, portable Linux with coverage, CI policy (with the demo app)
 and the optimised contract boundaries. Labelled `full-ci`, they run every heavy
 owner but not portable macOS (the `train-full` selection), which is also what a
-code PR into `main` runs. The merge queue on the train, pushes to `main`,
-the nightly and the gate PR into `main` labelled `release-gate` run
-everything, portable macOS included; a push to the train reuses the queue's
-run on the same commit when it passed every job (#1723); any other PR runs it only
-when it touches macOS-specific code or carries a `macos` label
+code PR into `main` runs. The merge queue on the train runs everything but
+portable macOS, which took 50 minutes to over 2 hours there and rebuilt the
+queue each time it failed (maintainer decision, 24 November 2026);
+[`macos-nightly.yml`](../../.github/workflows/macos-nightly.yml) runs it on
+the newest train every night instead. Pushes to `main`, the nightly and the
+gate PR into `main` labelled `release-gate` run everything, portable macOS
+included. A push to the train reuses the queue's run on the same commit when
+it passed every job (#1723); any other PR runs portable macOS only when it
+touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
 macOS runs `make test-macos`, relish's tests and the tests only macOS
 compiles, and compile-checks `bun`; every other portable test runs on Linux
@@ -169,8 +177,9 @@ The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
 The repository-local exception list names only reviewed findings whose affected
 API is unreachable or whose upstream has no compatible fix. Those exceptions
-aren't permanent configuration: `make audit` rejects all of them after 18
-August 2026, forcing a new reachability and upgrade review. GitHub Dependabot
+aren't permanent configuration: `make audit` rejects all of them after the
+date in its recipe, 10 December 2026 today, forcing a new reachability and
+upgrade review. GitHub Dependabot
 continues to track ecosystem advisories that RustSec doesn't carry.
 
 ## Gating rules
@@ -325,13 +334,22 @@ The 10k acceptance exercises a single real node's 10,000-member production state
 bounded protocol messages and dissemination batches. Simulating every membership table on
 one runner needs 100 million records and confuses distributed scale with single-process
 capacity. Criterion data is uploaded from CI, but we will not set a regression threshold
-until runs are stable on consistent hardware.
+until runs are stable on consistent hardware. That decision was made for gossip;
+the scheduler and policy benchmarks that `make bench` gained later inherited it,
+and run on pull requests that change them or the code they measure (#2493).
+Only `task_arrays` is compared with a baseline.
 
 `cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
 artefacts. On Linux that run is also the test gate and the portable JUnit source, so the suite isn't
-compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
-one percentage point lower. Raise it when coverage improves; do not lower it to land
-unrelated work.
+compiled and run a second time uninstrumented. The first measured Linux CI line baseline was 79.65%
+(July 2026), so CI started at 78.65%, one percentage point lower. By November the suite
+covered 88.60% of lines in each of the six green `push` runs of `ci.yml` from 26 and 27
+November (runs 45803622920 to 46025070846, summing `LH` and `LF` in each `coverage`
+artefact's `lcov.info`; the lowest,
+[45850762788](https://github.com/reliaburger/reliaburger/actions/runs/45850762788) on
+`release-1-3-3`, had 311,215 of 351,277 lines, 88.595%), so the floor is now 87.60% (#2487). Raise it when coverage improves; never
+lower it to land unrelated work. Each minor release revisits it after the tag, from that
+release's last green `portable Linux` run ([release step 10](../releasing.md#staging-a-candidate)).
 
 ## Finite inventory and authority
 
@@ -439,6 +457,12 @@ and before anything cleans up.
   the runner cancelled at its deadline stays open, so a timeout reads
   `case exceeded its 300000 ms deadline during step "exec in registry-web"`
   rather than just the deadline. Name a step for what it waits on.
+- **Bounded poll rounds.** Each round of a wait helper's reads (`nodes()`
+  and every node's `status()`) gets 10 s, or a quarter of the case's
+  remaining budget when that's less. A round that runs out counts as a
+  failed read: the wait records it in its note ("a status read did not
+  answer within … ms") and asks again on a fresh connection, so one
+  request that never answers can't spend the whole case (#2128).
 - **The soak harness.** `record_failure` runs before the caller's own
   cleanup (fault clear, settle). A `relish test` check passes its JSON
   report too: the bundle keeps it as `test-report.json`, writes the failing

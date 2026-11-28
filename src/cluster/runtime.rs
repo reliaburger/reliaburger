@@ -88,6 +88,10 @@ pub struct ClusterRuntime {
     /// This node's council backup loop state (#2016), served by
     /// `GET /v1/diagnostics` for `relish wtf`.
     pub backup_rx: watch::Receiver<crate::council::backup::BackupStatus>,
+    /// The council this node expects while it has none of its own (#2397),
+    /// kept current by the runtime. A seatless node's security-view fetch
+    /// asks only its voters (#2406).
+    pub expected_council: crate::council::admission::ExpectedCouncil,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -434,7 +438,34 @@ pub async fn start(
     let raft_blocklist = factory.blocklist();
     // The council membership check dials the voters this node knows with
     // the node's own identity, to ask about a leader it has never heard of.
-    let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone());
+    // While it has no council of its own it expects the one `relish join`
+    // saved beside its identity (#2397).
+    // BLOCKING-OK: one small file read once at startup, before any task runs on this worker
+    let expected_council = match &params.identity {
+        Some(identity) => crate::council::admission::ExpectedCouncil::load(identity.directory())
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "cluster: could not read the expected council in {} ({error}); this node \
+                     takes Raft replication only once a voter it knows vouches for the leader",
+                    identity.directory().display()
+                );
+                crate::council::admission::ExpectedCouncil::default()
+            }),
+        None => crate::council::admission::ExpectedCouncil::default(),
+    };
+    // BLOCKING-OK: one small file read once at startup, before any task runs on this worker
+    let previous_council = crate::council::admission::load_previous_council(&raft_dir)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "cluster: could not read the voters this node's recovery replaced ({error}); \
+                 gossip epoch claims are confirmed with its current voters only"
+            );
+            Default::default()
+        });
+    let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone())
+        .expecting(expected_council.clone())
+        .remembering(previous_council);
+    let committed_flusher = log_store.committed_flusher();
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
@@ -454,6 +485,11 @@ pub async fn start(
         council_shutdown.cancelled().await;
         if let Err(error) = shutdown_council.shutdown().await {
             eprintln!("cluster: council shutdown failed: {error}");
+        }
+        // The committed pointer rides on the next append (#2437); a clean
+        // stop writes the last one, so recovery replays every committed write.
+        if let Err(error) = committed_flusher.flush().await {
+            eprintln!("cluster: could not write the committed pointer: {error}");
         }
     });
 
@@ -517,6 +553,19 @@ pub async fn start(
     // sending none to them, or the leader keeps replicating to a
     // "partitioned" node over the connections it opens (#1810).
     let rpc_blocklist = raft_blocklist.clone();
+    let expected_maintainer = raft_admission.clone();
+    let fence_admission = raft_admission.clone();
+    let expected_raft = council.raft().clone();
+    let expected_shutdown = shutdown.clone();
+    spawn_supervised(
+        "cluster:expected-council",
+        supervision.clone(),
+        async move {
+            expected_maintainer
+                .maintain_expected_council(expected_raft, expected_shutdown)
+                .await;
+        },
+    );
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_admission(
             raft_listener,
@@ -538,6 +587,7 @@ pub async fn start(
     crate::cluster::recovery_fence::spawn_recovery_fence_supervisor(
         fence.clone(),
         Arc::clone(&council),
+        fence_admission,
         crate::cluster::recovery_fence::FenceSupervisorInputs {
             directory_rx: directory_rx.clone(),
             gossip_synced_rx,
@@ -789,6 +839,7 @@ pub async fn start(
             roster_rx,
             gossip_stats,
             backup_rx,
+            expected_council,
         },
     ))
 }
@@ -1492,12 +1543,23 @@ async fn reconcile_council_once(
     disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
-    let retired = council.security_state().await.crl.retired_nodes;
-    if retired.contains_key(&self_info.name) {
+    // Only the retired names, copied out under the lock (#2436).
+    let retired: BTreeSet<String> = council
+        .read_desired(|state| {
+            state
+                .security_state
+                .crl
+                .retired_nodes
+                .keys()
+                .cloned()
+                .collect()
+        })
+        .await;
+    if retired.contains(&self_info.name) {
         return;
     }
     let mut snapshot = membership_rx.borrow().clone();
-    snapshot.retain(|member| !retired.contains_key(&member.node_id.0));
+    snapshot.retain(|member| !retired.contains(&member.node_id.0));
     let directory = council_directory(&snapshot, self_id, self_info, port_offset, now);
 
     let metrics = council.metrics().borrow().clone();
@@ -1629,7 +1691,7 @@ async fn reconcile_council_once(
     if !change_in_flight {
         let retired_ids: BTreeSet<u64> = membership
             .nodes()
-            .filter(|(_, node)| retired.contains_key(&node.name))
+            .filter(|(_, node)| retired.contains(&node.name))
             .map(|(id, _)| *id)
             .collect();
         if !voters.is_disjoint(&retired_ids) {

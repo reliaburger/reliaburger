@@ -117,7 +117,7 @@ async fn rotate_issues_a_new_secret_that_works_at_once_while_the_old_one_keeps_w
     assert_eq!(read_with(&fx.app, &new_secret).await, StatusCode::OK);
     assert_eq!(read_with(&fx.app, &ci.plaintext).await, StatusCode::OK);
     // Still one token, under the same name.
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     assert_eq!(tokens.iter().filter(|t| t.name == "ci").count(), 1);
 }
 
@@ -260,7 +260,7 @@ async fn the_last_admin_can_be_rotated() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&fx.app, request).await.0, StatusCode::OK);
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].role, ApiRole::Admin);
 }
@@ -340,7 +340,7 @@ async fn a_token_created_without_a_lifetime_gets_the_default_unless_admin_or_opt
     assert_eq!(status, StatusCode::OK, "{body}");
     let after = SystemTime::now();
 
-    let tokens = fx.council.security_state().await.api_tokens;
+    let tokens = fx.council.security_state().await.api_tokens.clone();
     let ninety_days = Duration::from_secs(90 * 86_400);
     for name in ["ci", "reader"] {
         let expiry = expiry_of(&tokens, name).unwrap();
@@ -528,4 +528,127 @@ async fn a_join_token_for_a_retired_node_is_refused_without_a_secret() {
             .iter()
             .all(|token| token.node_id != "node-7")
     );
+}
+
+/// Serve `app` on an ephemeral port, for tests that need a real streaming
+/// body.
+async fn serve(app: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    address
+}
+
+/// A followed event stream is authenticated once, when it opens. Revoking
+/// the token that opened it must end it too, within one re-check, and a
+/// later event must not reach it (#2399).
+#[tokio::test]
+async fn an_open_event_stream_ends_once_its_token_is_revoked() {
+    use futures_util::StreamExt as _;
+
+    let admin = token("admin", ApiRole::Admin);
+    let reader = token("reader", ApiRole::ReadOnly);
+    let fx = fixture(
+        "revoke-stream",
+        &[admin.token.clone(), reader.token.clone()],
+    )
+    .await;
+    let address = serve(fx.app.clone()).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/v1/events?follow=true&local=true"))
+        .bearer_auth(&reader.plaintext)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, body) = post(
+        &fx.app,
+        "/v1/token/revoke",
+        &admin.plaintext,
+        serde_json::json!({"name": "reader"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The revoke's own audit event may be delivered before the re-check
+    // notices; this one comes after it.
+    tokio::time::sleep(crate::sesame::auth::CREDENTIAL_RECHECK_INTERVAL * 3).await;
+    fx.events.write().await.record(
+        unix_seconds(SystemTime::now()),
+        crate::bun::events::EventKind::Deploy,
+        crate::bun::events::EventSeverity::Info,
+        Some("web".into()),
+        Some("default".into()),
+        None,
+        "after the revoke".into(),
+    );
+
+    let mut body = response.bytes_stream();
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(chunk) = body.next().await {
+            events.extend(decoder.push(&chunk.unwrap()));
+        }
+    })
+    .await
+    .expect("the stream outlived its revoked token");
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("after the revoke")),
+        "an event reached a revoked token: {events:?}"
+    );
+    let last = events.last().expect("the stream ended without saying why");
+    assert_eq!(
+        last.event.as_deref(),
+        Some(crate::ketchup::sse::WARNING_EVENT)
+    );
+    assert!(last.data.contains("revoked or has expired"), "{last:?}");
+}
+
+/// A stream opened with a live token is left alone while the token stays
+/// valid: re-checking must not cut it.
+#[tokio::test]
+async fn an_open_event_stream_outlives_its_recheck_while_the_token_is_valid() {
+    use futures_util::StreamExt as _;
+
+    let admin = token("admin", ApiRole::Admin);
+    let reader = token("reader", ApiRole::ReadOnly);
+    let fx = fixture("live-stream", &[admin.token.clone(), reader.token.clone()]).await;
+    let address = serve(fx.app.clone()).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/v1/events?follow=true&local=true"))
+        .bearer_auth(&reader.plaintext)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::sleep(crate::sesame::auth::CREDENTIAL_RECHECK_INTERVAL * 3).await;
+    fx.events.write().await.record(
+        unix_seconds(SystemTime::now()),
+        crate::bun::events::EventKind::Deploy,
+        crate::bun::events::EventSeverity::Info,
+        Some("web".into()),
+        Some("default".into()),
+        None,
+        "still listening".into(),
+    );
+    let mut body = response.bytes_stream();
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let chunk = body.next().await.expect("the stream ended").unwrap();
+            if let Some(event) = decoder.push(&chunk).into_iter().next() {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("no event within 5s");
+    assert!(event.data.contains("still listening"), "{event:?}");
 }

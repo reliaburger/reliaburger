@@ -264,18 +264,18 @@ pub mod memory_range {
 // PidsLimit
 // ---------------------------------------------------------------------------
 
-/// The most processes and threads one job command may hold at once: the
-/// command cgroup's `pids.max`.
+/// The most processes and threads a container or a job command may hold at
+/// once: its cgroup's `pids.max`. Apps, sidecars and jobs take it as `pids`.
 ///
 /// Written as a bare integer, `pids = 512`. Deserialising refuses 0 and
-/// anything above [`PidsLimit::MAX`], so every path a job spec arrives by
+/// anything above [`PidsLimit::MAX`], so every path a spec arrives by
 /// (TOML, the JSON API, Raft) holds a value in range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct PidsLimit(u32);
 
 impl PidsLimit {
-    /// The largest limit a job may ask for.
+    /// The largest limit an app, a sidecar or a job may ask for.
     pub const MAX: u32 = 32_768;
 
     /// The limit as a number of processes and threads.
@@ -307,6 +307,14 @@ impl From<PidsLimit> for u32 {
 // ---------------------------------------------------------------------------
 // Replicas
 // ---------------------------------------------------------------------------
+
+/// The most replicas an app may ask for (#2368), in its file, through
+/// `relish scale` or through a scale proposal. The leader plans every
+/// replica of a pass in memory, so a count in the billions would exhaust it;
+/// ten thousand is far above anything a cluster runs today. The
+/// deserialiser doesn't enforce it, so desired state that already holds a
+/// larger count still loads and can be scaled back down.
+pub const MAX_REPLICAS: u32 = 10_000;
 
 /// Replica count for an App.
 ///

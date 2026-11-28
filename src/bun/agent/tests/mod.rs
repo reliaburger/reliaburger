@@ -4098,6 +4098,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             state: ContainerState::Stopped,
             health_counters: Default::default(),
             restart_count: 1,
+            backoff_step: 1,
             last_restart: Some(Instant::now()),
             host_port: None,
             container_ip: None,
@@ -8002,7 +8003,7 @@ async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
 
     let first = Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\n").unwrap();
     expect_complete(&drain_deploy(&mut agent, first).await);
-    let fresh = took(&history.read().await);
+    let fresh = took(&history.read().await.entries());
     assert!(
         fresh >= slow,
         "a fresh deploy that took over {slow:?} recorded {fresh:?}"
@@ -8010,7 +8011,7 @@ async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
 
     let second = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
     expect_complete(&drain_deploy(&mut agent, second).await);
-    let entries = history.read().await;
+    let entries = history.read().await.entries();
     assert_eq!(entries.len(), 2, "{entries:?}");
     let rolled = took(&entries);
     assert!(
@@ -8081,7 +8082,7 @@ async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() 
     );
 
     // The deploy is recorded as Halted, not RolledBack.
-    let hist = history.read().await;
+    let hist = history.read().await.entries();
     assert!(
         hist.iter()
             .any(|e| e.result == crate::meat::deploy_types::DeployResult::Halted),
@@ -8183,7 +8184,7 @@ async fn failed_rollout_retains_every_owner_until_cleanup_is_confirmed() {
                 let retained =
                     tokio::time::timeout(std::time::Duration::from_secs(1), status).await;
                 let record_retained = record.exists();
-                let claimed_rollback = history.read().await.iter().any(|entry| {
+                let claimed_rollback = history.read().await.entries().iter().any(|entry| {
                     entry.result == crate::meat::deploy_types::DeployResult::RolledBack
                 });
                 grill.set_fail_kill(false);
@@ -8787,7 +8788,7 @@ async fn deploy_over_failing_replacements(
     )
     .await
     .expect("the aborted rollout must finish");
-    let history = history.read().await.clone();
+    let history = history.read().await.entries();
     shutdown.cancel();
     (task.await.unwrap(), events, history)
 }
@@ -9835,6 +9836,7 @@ fn adoption_record(
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
@@ -9847,6 +9849,9 @@ fn adoption_record(
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -10674,6 +10679,54 @@ async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
     assert_eq!(
         agent.supervisor.get_instance(&healthy).unwrap().state,
         ContainerState::Running
+    );
+    let kept: Vec<_> = crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect();
+    assert_eq!(kept, vec![healthy.0]);
+}
+
+/// #2541: on a loaded edge box after a power cut, re-adopting one surviving
+/// instance took longer than the adoption timeout. The timeout ended
+/// startup, so Bun exited and systemd had to start it again. A slow
+/// adoption is an instance whose ownership is unknown: it's fenced and
+/// retired, so it starts again through reconciliation, and every other
+/// instance on the node is still adopted.
+#[tokio::test(start_paused = true)]
+async fn an_adoption_past_its_timeout_is_fenced_and_retired_and_bun_starts() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    for (index, app) in ["hello", "redis"].into_iter().enumerate() {
+        let mut record = adoption_record(&format!("default__{app}-0"), app, false);
+        record.host_port = Some(30123 + index as u16);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+    }
+    let slow = InstanceId("default__hello-0".into());
+    let healthy = InstanceId("default__redis-0".into());
+    grill.set_adopt_result(&slow, true);
+    grill.set_adopt_result(&healthy, true);
+    grill.set_adopt_delay(&slow, std::time::Duration::from_secs(60));
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    assert!(agent.supervisor.get_instance(&slow).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy).unwrap().state,
+        ContainerState::Running
+    );
+    let slow_calls: Vec<String> = grill
+        .calls()
+        .into_iter()
+        .filter(|(_, id)| *id == slow)
+        .map(|(op, _)| op)
+        .collect();
+    let adopted_at = slow_calls.iter().position(|op| op == "adopt").unwrap();
+    assert!(
+        slow_calls[adopted_at..].iter().any(|op| op == "kill"),
+        "the slow instance was never fenced: {slow_calls:?}"
     );
     let kept: Vec<_> = crate::grill::records::load_records(records.path())
         .unwrap()
@@ -14232,6 +14285,90 @@ async fn identity_rotation_does_not_wait_for_the_leader() {
     assert_eq!(agent.identity_signings.len(), 1);
 }
 
+/// #2533: a workload certificate that expired while the council couldn't
+/// sign is renewed on the normal rotation tick once the signer answers,
+/// not only when the instance restarts. The tick used to log a warning
+/// for an expired identity and never try again.
+#[tokio::test]
+async fn expired_identity_is_renewed_once_the_signer_answers_again() {
+    // The leader hangs up on every CSR: the council can't sign.
+    let mut agent = follower_agent(false).await;
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+        agent.finish_identity_provision(outcome).await;
+    }
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    // The certificate's life ran out during the outage.
+    let mut expired = write_test_identity(volumes.path(), &id.0);
+    let now = SystemTime::now();
+    expired.next_rotation = now - std::time::Duration::from_secs(3600);
+    expired.expires_at = now - std::time::Duration::from_secs(1);
+    agent.supervisor.get_instance_mut(&id).unwrap().identity = Some(expired);
+
+    // While the outage lasts, every tick tries again and fails.
+    for _ in 0..2 {
+        agent.check_identity_rotation();
+        assert_eq!(
+            agent.identity_signings.len(),
+            1,
+            "the rotation tick didn't try to renew an expired identity"
+        );
+        while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+            agent.finish_identity_provision(outcome).await;
+        }
+        let identity = agent.supervisor.get_instance(&id).unwrap().identity.clone();
+        assert_eq!(
+            crate::sesame::identity::rotation_state(&identity.unwrap(), SystemTime::now()),
+            crate::sesame::identity::RotationState::Expired
+        );
+    }
+
+    // The signer is back: the next tick's signing comes back signed.
+    agent.check_identity_rotation();
+    assert_eq!(agent.identity_signings.len(), 1);
+    agent.abandon_identity_signings();
+    let issued = write_test_identity(volumes.path(), "scratch");
+    let result = super::identity_signing::SignedIdentity::for_test(
+        issued.spiffe_uri.clone(),
+        issued.private_key_der.clone(),
+        Ok(crate::cluster::workload_identity::SignedWorkload {
+            cert_der: issued.certificate_der.clone(),
+            workload_ca_cert_der: vec![1],
+            root_ca_cert_der: vec![2],
+            ca_bundle_der: vec![vec![1], vec![2]],
+            jwt_token: Some("renewed-jwt".into()),
+            api_jwt_token: Some("renewed-api-jwt".into()),
+        }),
+    );
+    let task = agent
+        .identity_signing_tasks
+        .spawn(async move { result })
+        .id();
+    agent.identity_signings.insert(
+        task,
+        super::identity_signing::IdentitySigning::for_test(id.clone()),
+    );
+    while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+        agent.finish_identity_provision(outcome).await;
+    }
+
+    let renewed = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .identity
+        .clone()
+        .unwrap();
+    assert_eq!(renewed.jwt_token, "renewed-jwt");
+    assert_eq!(
+        crate::sesame::identity::rotation_state(&renewed, SystemTime::now()),
+        crate::sesame::identity::RotationState::Valid
+    );
+}
+
 /// A deploy and the rotation tick asking for the same instance share one
 /// CSR, and both are answered when it finishes, even when it fails.
 #[tokio::test]
@@ -14632,7 +14769,7 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
         if let Some(id) = &failing {
             grill.set_state(id, ContainerState::Failed);
         }
-        let before = history.read().await.len();
+        let before = history.read().await.entries().len();
         let began = std::time::Instant::now();
         let events = send_deploy(&tx, Config::parse(config).unwrap()).await;
         let took = began.elapsed();
@@ -14648,7 +14785,7 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
                 "the replica must start in place, not roll: {events:?}"
             );
         }
-        let entries = history.read().await.clone();
+        let entries = history.read().await.entries();
         assert_eq!(
             entries.len(),
             before + 1,

@@ -924,6 +924,50 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
     }
 }
 
+/// A comparison page may say it describes the release the public installer
+/// installs only while that's true. They were written against 0.2.2 and
+/// still said so when the installer had moved six releases on (#2496).
+#[test]
+fn comparison_pages_only_claim_the_installed_release_when_they_describe_it() {
+    let default = installer_default();
+    let installed = versions_named(default.trim_start_matches('v'));
+    let directory = repository().join("docs/website/compare");
+    let mut pages: Vec<PathBuf> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "html")
+        })
+        .collect();
+    pages.sort();
+    assert!(!pages.is_empty(), "no comparison pages found");
+    let mut wrong = Vec::new();
+    for page in pages {
+        let text = decode(&strip_tags(&std::fs::read_to_string(&page).unwrap()));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // A full stop ends a sentence only before a space: "0.2.2" stays whole.
+        for sentence in text.split(". ") {
+            if !(sentence.contains("installer installs") || sentence.contains("installs released"))
+            {
+                continue;
+            }
+            let named = versions_named(sentence);
+            if named.is_empty() || named.iter().any(|version| installed[..] != [*version]) {
+                wrong.push(format!(
+                    "{}: {sentence:?}",
+                    page.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "these sentences say the installer ({default}) installs another release:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// Every command snippet gets a copy button from the page's script, so
 /// without JavaScript there's no dead button, just selectable text (#280).
 #[test]
@@ -1573,6 +1617,32 @@ fn the_release_testing_section_shows_the_installed_release() {
             "the release-testing section doesn't link {link}"
         );
     }
+}
+
+/// Release step 9 profiles one release of every minor series against the
+/// last profiled one (#2488): the newest `X.Y.0` in the release log needs a
+/// `docs/qualification/*-vX.Y.*-profile` record, from any release of that
+/// series, so a skipped profile shows up before the next minor release.
+#[test]
+fn the_newest_minor_release_has_a_profile_record() {
+    let log = read("docs/release-log.md");
+    let (major, minor, _) = log
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .filter_map(|line| versions_named(line).into_iter().next())
+        .find(|&(_, _, patch)| patch == 0)
+        .expect("the release log names no minor release");
+    let series = format!("-v{major}.{minor}.");
+    let records: Vec<String> = std::fs::read_dir(repository().join("docs/qualification"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(&series) && name.contains("-profile"))
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "no docs/qualification/*{series}*-profile record for the {major}.{minor} series; \
+         run scripts/release/qualify-profile.sh (docs/releasing.md, step 9)"
+    );
 }
 
 /// Every `<img>` tag in `html`, from `<img` to its closing `>`.

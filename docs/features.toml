@@ -33,7 +33,7 @@
 
 release = "0.3.3"
 released = "27 November 2026"
-reviewed = "10 November 2026"
+reviewed = "27 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
 [milestones]
@@ -114,10 +114,10 @@ name = "Clusters of hundreds of nodes"
 status = "alpha"
 since = "0.1.0"
 summary = "Nothing stops you adding more nodes, but every release is soaked on three, and measurements at 500 and 1,000 simulated nodes found limits."
-restrictions = "The leader refuses report connections from 500 nodes up, its API slows sharply between 500 and 1,000, and gossip at 1,000 doesn't settle within six minutes."
-issues = [1411, 1412, 1413]
+restrictions = "The leader's API slows sharply between 500 and 1,000 nodes, and gossip at 1,000 doesn't settle within six minutes."
+issues = [1412, 1413]
 docs = ["docs/qualification/2026-10-28-hollow-nodes.md"]
-evidence = "Hollow-node record of 28 October 2026 (measurements, not a gate) and #1411-#1413 in Later. Every soak is three nodes (docs/website/index.html, 'What the soaks don't prove')."
+evidence = "Hollow-node record of 28 October 2026 (measurements, not a gate) and #1412-#1413 in Later; since 0.3.4 the leader admits every report from 500 nodes instead of refusing thousands (#1411). Every soak is three nodes (docs/website/index.html, 'What the soaks don't prove')."
 
 [[group.feature]]
 name = "Contributor clusters from a checkout"
@@ -294,7 +294,7 @@ status = "planned"
 milestone = "0.4.0"
 summary = "Cordon, drain and uncordon, and cold moves that carry volumes."
 restrictions = "Today a managed-volume app stays with its node. Keeping memory across a move is planned for VM apps only (0.4.5); container checkpoints by CRIU are in Later (#658)."
-issues = [2106, 656, 657, 659]
+issues = [2106, 656, 657, 658, 659]
 docs = ["docs/roadmap.md#releases-after-010"]
 evidence = "Roadmap 0.4.0; issues in milestone 0.4.0."
 
@@ -538,7 +538,7 @@ evidence = "Every staged install enrols two nodes this way (2026-11-07 record, '
 name = "API tokens with roles and scopes"
 status = "ready"
 since = "0.1.0"
-summary = "Tokens carry a role and namespace scopes, expire after 90 days by default, and rotate with a grace period."
+summary = "Tokens carry a role and namespace scopes and rotate with a grace period. Deployer and read-only tokens expire after 90 days by default; admin tokens don't expire."
 restrictions = "On a plaintext cluster, the first API token needs a master key; `relish token create` refuses it without one."
 issues = []
 docs = ["docs/manual/10_security.md#api-tokens"]
@@ -548,8 +548,8 @@ evidence = "Rotation and lifetimes since 0.1.6. The gate's harness runs with its
 name = "Workload identity"
 status = "ready"
 since = "0.1.0"
-summary = "Every workload gets a SPIFFE certificate that rotates on its own."
-restrictions = ""
+summary = "Every app instance on a cluster gets a SPIFFE certificate that rotates on its own."
+restrictions = "Job tasks don't get an identity yet, and a standalone node issues none."
 issues = []
 docs = ["docs/manual/10_security.md#workload-identity"]
 evidence = "Gate: 9 workload identity rotations per node in the 0.2.7 V02 fast tier (soak-identity app)."
@@ -673,10 +673,10 @@ name = "Snapshots and scheduled backups"
 status = "beta"
 since = "0.1.0"
 summary = "Instant copy-on-write snapshots of managed volumes, on a schedule, uploaded off the node."
-restrictions = "Btrfs only; other filesystems refuse snapshot commands. Test volumes have no snapshots. The uploader hasn't been qualified under power cuts."
+restrictions = "Btrfs only; other filesystems refuse snapshot commands. Test volumes have no snapshots."
 issues = [287]
 docs = ["docs/manual/11_images-and-volumes.md#snapshots"]
-evidence = "The soak schedules snapshots and uploads them to a directory (V02 fast tier, Configuration deviations). V02 leftovers (#287, Later): the snapshot uploader under power cuts."
+evidence = "The soak schedules snapshots and uploads them to a directory (V02 fast tier, Configuration deviations). Power cuts: the uploader passed 20 of 20 on Btrfs (23 November 2026); since 0.3.4 an archive at its key that isn't the archive is replaced, never counted. #287 stays open for the V02 loop reruns."
 
 [[group.feature]]
 name = "Moving volumes between nodes"
@@ -744,7 +744,7 @@ title = "Observability: metrics, logs and alerts"
 name = "Metrics"
 status = "ready"
 since = "0.1.0"
-summary = "Each node scrapes its own workloads, including anything with `prometheus.io` annotations, and `relish metrics`, `relish top`, the TUI and the dashboard read them."
+summary = "Each node scrapes the apps that ask for it with `metrics = {}`, and `relish metrics`, `relish top`, the TUI and the dashboard read them. An imported Kubernetes manifest gets `metrics` from its `prometheus.io` annotations."
 restrictions = "No PromQL: read metrics through `relish metrics`, the dashboards and the API."
 issues = []
 docs = ["docs/manual/04_observability.md#metrics"]
@@ -1067,7 +1067,7 @@ status = "beta"
 since = "0.2.8"
 summary = "Ask the cluster why it did something, with one merged timeline of an incident."
 restrictions = "The `/v1/timeline` endpoint, GitOps and log events are #1084 in 0.4.2."
-issues = []
+issues = [1084]
 docs = ["docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that"]
 evidence = "Shipped in 0.2.8 (#1685); unit and cluster tests on the train, and the five-minute tour's kill step. #1084 (machine-readable timeline) in 0.4.2."
 
@@ -1149,7 +1149,7 @@ name = "Web dashboard"
 status = "beta"
 since = "0.1.0"
 summary = "`relish dashboard` opens a read-only web dashboard through your authenticated CLI session."
-restrictions = "Read-only."
+restrictions = "Read-only through `relish dashboard`. Signed in on the leader's own port, its Proposals page can approve, reject and undo a proposal with your API token."
 issues = []
 docs = ["docs/manual/04_observability.md#events-and-dashboards", "docs/design/ui-brioche.md"]
 evidence = "Documented and tested; not exercised by the release gate."

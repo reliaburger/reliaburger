@@ -258,6 +258,97 @@ pub struct ExpireManifest {
     pub untagged_at_unix_ms: u64,
 }
 
+/// Longest repository name the OCI distribution spec allows.
+const MAX_REPOSITORY_NAME: usize = 255;
+/// Longest tag the OCI distribution spec allows.
+const MAX_TAG: usize = 128;
+
+/// Whether `name` is a repository name the registry stores (#2413).
+///
+/// That is the OCI distribution grammar: one or more `/`-separated
+/// components, each lowercase letters and digits joined by single `.`, `_`,
+/// `__` or runs of `-`, at most 255 bytes in all. Two kinds of name the
+/// cluster makes itself pass as well: the build-context scratch repository
+/// `_buildcontext`, and pull-through cache copies under `cache/`, whose
+/// upstream host segment may carry a port (`cache/localhost:5000/app`).
+/// Clients can't write either (the cache prefix is reserved, and the scratch
+/// repository takes bare blobs only).
+pub fn valid_repository_name(name: &str) -> bool {
+    if name == crate::pickle::build::BUILD_CONTEXT_REPOSITORY {
+        return true;
+    }
+    if name.len() > MAX_REPOSITORY_NAME {
+        return false;
+    }
+    if let Some(upstream) = name.strip_prefix("cache/") {
+        return upstream.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-' | b':')
+                })
+        });
+    }
+    name.split('/').all(valid_name_component)
+}
+
+/// One path component: `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`, checked by hand
+/// so the registry needs no regular-expression engine.
+fn valid_name_component(component: &str) -> bool {
+    let alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    loop {
+        // A run of letters and digits, which must not be empty.
+        let run_start = index;
+        while bytes.get(index).is_some_and(alphanumeric) {
+            index += 1;
+        }
+        if index == run_start {
+            return false;
+        }
+        // Then the end, or one separator followed by another run.
+        match bytes.get(index) {
+            None => return true,
+            Some(b'.') => index += 1,
+            Some(b'_') => {
+                index += 1;
+                if bytes.get(index) == Some(&b'_') {
+                    index += 1;
+                }
+            }
+            Some(b'-') => {
+                while bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+}
+
+/// Whether `tag` is an OCI tag (#2413): a letter, digit or `_`, then up to
+/// 127 letters, digits, `_`, `.` or `-`. A tag can never hold a `:`, so the
+/// catalogue's `repository:tag` key always splits one way.
+pub fn valid_tag(tag: &str) -> bool {
+    let mut bytes = tag.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    tag.len() <= MAX_TAG
+        && (first.is_ascii_alphanumeric() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Whether `reference` may sit in a manifest's tag position: a tag, or a
+/// digest for a push or pull by digest.
+pub fn valid_reference(reference: &str) -> bool {
+    valid_tag(reference) || Digest::new(reference).is_ok()
+}
+
 /// Whether a catalogue "tag" is really a digest. Pushing by digest
 /// (`PUT /v2/<name>/manifests/sha256:…`) records the digest in the tag
 /// position, and a platform manifest of a multi-platform image only ever
@@ -561,6 +652,16 @@ impl ManifestCatalog {
             .collect()
     }
 
+    /// Every tracked blob's holders, keyed by digest, for a caller that looks
+    /// up many digests at once (GC asks about every local blob). One pass
+    /// builds it, so `n` lookups cost `n`, not `n` times the table (#2427).
+    pub fn holder_index(&self) -> std::collections::HashMap<&str, &BTreeSet<u64>> {
+        self.layer_locations
+            .iter()
+            .map(|(digest, holders)| (digest.as_str(), holders))
+            .collect()
+    }
+
     /// Get the set of nodes holding a layer.
     pub fn layer_holders(&self, digest: &str) -> BTreeSet<u64> {
         self.layer_locations
@@ -572,6 +673,13 @@ impl ManifestCatalog {
 
     /// Apply a ManifestCommit.
     pub fn apply_manifest_commit(&mut self, commit: &ManifestCommit) {
+        // The API refuses these with NAME_INVALID or TAG_INVALID before they
+        // reach Raft. Anything that arrives by another path is dropped the
+        // same way on every replica, so it can never share a tag key with a
+        // valid pair (#2413).
+        if !valid_repository_name(&commit.manifest.repository) || !valid_reference(&commit.tag) {
+            return;
+        }
         let digest_str = commit.manifest.digest.0.clone();
         let tag_key = format!("{}:{}", commit.manifest.repository, commit.tag);
 
@@ -798,7 +906,8 @@ impl ManifestCatalog {
     /// Single-node mode has no Raft to remember the catalog, and even
     /// cluster nodes want their local holder view back after a restart.
     pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
-        let json = serde_json::to_vec_pretty(self)
+        // Compact: every push rewrites this file (#2427).
+        let json = serde_json::to_vec(self)
             .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
         let parent = path
             .parent()
@@ -1099,6 +1208,13 @@ pub struct AttachSignature {
 pub enum PickleError {
     #[error("physical image storage quota exceeded")]
     StorageQuotaExceeded,
+    /// The store holds as many payload files as `[images] max_files` allows
+    /// (#2431). Each uploaded blob is two files: the blob and its receipt.
+    #[error(
+        "image store holds {limit} files, the limit set by [images] max_files; \
+         raise it, or let GC reclaim unused images"
+    )]
+    StorageFileLimitExceeded { limit: usize },
     /// Lease authority or exact repository ownership could not be established.
     #[error("repository lease denied: {0}")]
     LeaseDenied(String),
@@ -1567,6 +1683,138 @@ mod tests {
             serde_json::to_value(&catalog).unwrap(),
             serde_json::to_value(saved).unwrap()
         );
+    }
+
+    /// #2413: tags are keyed `repository:tag`, so a repository with a `:`
+    /// or a tag with one could share a key with another pair. The catalogue
+    /// takes only names and tags from the OCI grammar, whatever path a
+    /// commit arrived by, so no two pairs can collide.
+    #[test]
+    fn tags_of_two_repositories_never_share_a_key() {
+        let mut catalog = ManifestCatalog::default();
+        let commit = |repository: &str, suffix: &str, tag: &str| ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest(repository, suffix),
+            tag: tag.into(),
+            holder_nodes: BTreeSet::from([1]),
+        };
+        catalog.apply_manifest_commit(&commit("a", "a", "x"));
+        catalog.apply_manifest_commit(&commit("a:x", "b", "y"));
+        catalog.apply_manifest_commit(&commit("a", "c", "x:y"));
+        assert_eq!(
+            catalog
+                .get_manifest_by_tag("a", "x")
+                .map(|m| m.digest.clone()),
+            Some(test_digest("a"))
+        );
+        assert!(catalog.get_manifest_by_tag("a:x", "y").is_none());
+        assert!(catalog.get_manifest_by_tag("a", "x:y").is_none());
+        assert_eq!(catalog.tags_for_repository("a"), vec!["x".to_string()]);
+        assert_eq!(catalog.manifests.len(), 1);
+    }
+
+    /// #2427: GC asks for the holders of every local blob, so it builds
+    /// one lookup instead of scanning `layer_locations` per blob.
+    #[test]
+    fn layer_holders_is_answered_from_an_index() {
+        let catalog = ManifestCatalog {
+            layer_locations: (0..10_000u64)
+                .map(|index| {
+                    (
+                        test_digest(&format!("{index:x}")).0,
+                        BTreeSet::from([index]),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = catalog.holder_index();
+        assert_eq!(index.len(), 10_000);
+        let last = test_digest(&format!("{:x}", 9_999));
+        assert_eq!(index.get(last.as_str()), Some(&&BTreeSet::from([9_999])));
+        assert_eq!(index.get(test_digest("absent").as_str()), None);
+    }
+
+    /// #2427: every push rewrites the catalogue file, so it's compact JSON,
+    /// not pretty-printed.
+    #[test]
+    fn the_persisted_catalogue_is_compact_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("web", "a"),
+            tag: "v1".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog.persist_to(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert!(!written.contains(&b'\n'), "pretty-printed catalogue");
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert!(reloaded.get_manifest_by_tag("web", "v1").is_some());
+    }
+
+    #[test]
+    fn repository_names_follow_the_oci_grammar() {
+        for name in [
+            "web",
+            "team-a/web",
+            "a/b/c",
+            "web.api",
+            "web_api",
+            "web__api",
+            "web---api",
+            "0web",
+            "reliaburger-bun",
+            "rbtest-1234/web",
+            // Names the cluster makes itself.
+            "_buildcontext",
+            "cache/docker.io/library/redis",
+            "cache/localhost:5000/team/app",
+        ] {
+            assert!(valid_repository_name(name), "{name:?}");
+        }
+        let too_long = format!("{}/web", "a".repeat(252));
+        for name in [
+            "",
+            "Web",
+            "web/",
+            "/web",
+            "team//web",
+            "-web",
+            "web-",
+            "web..api",
+            "web___api",
+            "web._api",
+            "web:x",
+            "Web%20App",
+            "_other",
+            "cache/",
+            "cache/../web",
+            too_long.as_str(),
+        ] {
+            assert!(!valid_repository_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn tags_follow_the_oci_grammar() {
+        let longest = "t".repeat(128);
+        for tag in [
+            "v1",
+            "latest",
+            "_x",
+            "1.2.3-rc.1",
+            "A_b-C.d",
+            longest.as_str(),
+        ] {
+            assert!(valid_tag(tag), "{tag:?}");
+        }
+        let too_long = "t".repeat(129);
+        for tag in ["", ".x", "-x", "x:y", "x/y", "x y", too_long.as_str()] {
+            assert!(!valid_tag(tag), "{tag:?}");
+        }
     }
 
     fn test_manifest(repo: &str, digest_suffix: &str) -> ImageManifest {

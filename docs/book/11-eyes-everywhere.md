@@ -138,16 +138,23 @@ pub enum ReportingMessage {
 The `ReportAggregator` already handles `Report`. We add a case for `MetricsRollup`:
 
 ```rust
-Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+ReportingMessage::MetricsRollup(rollup) => {
     if Self::report_identity_ok(&peer, &rollup.node_id)
-        && let Some(ref store) = self.rollup_store
+        && let Some(tx) = &self.rollup_tx
+        && tx.try_send(rollup).is_err()
     {
-        store.write().await.ingest(&rollup);
+        self.rollups_dropped += 1;
+        // ...and say so in Bun's log, at 1, 2, 4, 8... drops
     }
+    false
 }
 ```
 
 `peer` is the node id the connection's mTLS certificate proves, and `report_identity_ok` refuses a rollup that claims to be from anyone else. Without that check node X could send a rollup for node Y, poisoning Y's metrics and pre-claiming Y's dedup keys so Y's real rollups were dropped as duplicates.
+
+The first version of this arm ingested inline: `store.write().await.ingest(&rollup)`. That looks harmless, since `ingest` only appends to a buffer. The `await` is the problem ([#2443](https://github.com/reliaburger/reliaburger/issues/2443)). This one `select!` loop handles every state, capability and readiness report the leader receives, and three other tasks held the rollup store's lock across slow work: the autoscaler and the metrics API across DataFusion queries, and the flush task across a Parquet write. While the aggregator waited for the write lock, no report was processed, its 16-slot admission queue filled, and workers were refused. Report handling depended on query latency.
+
+So rollups leave the loop. When `run` starts it spawns an ingest task that owns the write side of the store and reads a bounded `mpsc` queue of 1,024 rollups; the arm above only `try_send`s into it. `try_send` never waits: if the queue is full the rollup is dropped and counted, and the worker's five-minute backfill after a failed push covers most such gaps. When `run` returns it drops the sender, and the task ingests whatever is still queued and ends, because `recv()` returns `None` once every sender is gone. The other two holders changed as well. Queries now read a snapshot taken in one statement (see [Watching Everything](06-watching-everything.md)), and the flush task calls `rollup_store::flush_off_lock`, which takes the write lock only to freeze the buffer into a pending batch and again to drop it once the file is written; the Parquet write itself runs with no lock held, and queries read the pending batch from memory until then. `a_report_is_published_while_the_rollup_store_is_locked` holds a read guard on the store, sends a rollup and then a report, and expects the report published within 500 ms and the rollup ingested once the guard is dropped. Measured on a debug build with six hours of rollups from three nodes (360 files), the autoscaler's five-minute aggregate took 9 ms (33 ms for the first, which reads every footer once) and a flush 9 ms: the stall was a structural bug before it was a slow one.
 
 The enum used to have one more variant, `AggregatedReport { reports: HashMap<NodeId, StateReport> }`, for a council member forwarding its workers' reports to the leader. It carried many nodes' reports, so it couldn't be bound to one certificate, and the aggregator stored every report in it unchecked. Production never sent it (every worker reports straight to the leader), but any authenticated peer could, and keep a dead node "fresh" or inject endpoints for it. We deleted it in 0.2.1. If the two-level tree is ever built, the forwarding message comes back with council-peer authentication rather than trust.
 
@@ -207,7 +214,24 @@ In 0.2.8 the two numbers finally sit side by side where people look. `relish sta
 
 ### Reporting has an admission boundary
 
-How big can a report get? Counting series doesn't answer that, since one enormous label can outweigh a thousand small series. So the sender asks postcard for the exact encoded size and refuses anything over 1 MiB before it allocates a buffer; we don't truncate a batch and call it delivered. The receiver runs at most 16 connection tasks in a tokio `JoinSet` (a collection that owns spawned tasks and cancels them when dropped), queues at most 16 reports, and gives each connection ten seconds for handshake and body together.
+How big can a report get? Counting series doesn't answer that, since one enormous label can outweigh a thousand small series. So the sender asks postcard for the exact encoded size and refuses anything over 1 MiB before it allocates a buffer; we don't truncate a batch and call it delivered. The receiver runs its connection tasks in a tokio `JoinSet` (a collection that owns spawned tasks and cancels them when dropped), queues at most 256 reports, and gives each connection ten seconds for handshake and body together.
+
+How many tasks it runs at once took two tries. The first version counted a connection the moment TCP accepted it, against a single budget of 16, so anyone who could reach port 9445 could open 16 sockets, send nothing, and hold every slot for ten seconds at a time, with no certificate. Every node's reports, the leader's own included, were then turned away, and after 30 seconds the leader saw the whole cluster as stale: it published a service catalogue with no backends and stopped placing anything ([#2380](https://github.com/reliaburger/reliaburger/issues/2380)). Raising the budget to 64 for [#1411](https://github.com/reliaburger/reliaburger/issues/1411) (chapter 15) only raised the number of idle sockets needed.
+
+The fix is to spend the report budget only on connections that have proved something. A connection is *pending* from accept until its whole frame has arrived, which under mTLS includes the handshake that checks its client certificate. Pending connections get a budget of their own, `MAX_PENDING_CONNECTIONS` (64), and only a connection with a whole frame in takes one of the `MAX_REPORT_CONNECTIONS` (64) admission slots, where it waits for room in the queue and writes its acknowledgement. Both budgets are `tokio::sync::Semaphore`s. A task hands its pending slot back only once it holds an admission slot, so every task holds at least one slot for its whole life, and there are never more than 128 of them; `stalled_connections_cannot_create_unbounded_receiver_tasks` counts them while 104 idle sockets press on the listener.
+
+A separate budget alone would just move the attack, so two rules keep idle sockets from filling it:
+
+- **The oldest stalled connection makes room.** When the pending budget is full and a new connection is waiting, the accept loop closes the oldest pending connection once it has been pending for a second (`PENDING_EVICTION_AGE`). An honest sender finishes its handshake and frame in milliseconds on a LAN, so the oldest pending connection is the likeliest to be stalled. Under one second, the newcomer waits, and connections behind it wait in the kernel's listen backlog: the backpressure chapter 15 built for #1411 still holds for an honest burst.
+- **One address holds at most four pending slots** (`MAX_PENDING_PER_SOURCE`). A node sends its reports one after another, so it needs one. Loopback is exempt, because the hollow-node harness runs a thousand nodes on 127.0.0.1. Nodes behind one NAT address share its four slots, which is plenty while each finishes in milliseconds.
+
+Each rule alone has a hole: the per-address cap does nothing against many addresses (or one address shared by many nodes), and eviction alone lets a fast flood push out honest handshakes. Together, an attacker needs many addresses and keeps each socket for about a second, while every honest connection that finishes inside that second gets through.
+
+The accept loop needs to know which connections are still pending without asking their tasks. Each task holds the sending half of a `tokio::sync::oneshot` channel and never sends on it; it drops it when its frame is in. The loop keeps the receiving half, and `try_recv` returning `Empty` means "still pending", while `Closed` means the sender is gone. A oneshot used only for its drop is a cheap one-way flag that can't be forgotten on an error path, the same reason chapter 3 ties connection slots to permits. Eviction is a `CancellationToken` the task selects on while it handshakes and reads; once the frame is in, the task stops listening for it.
+
+`stalled_connections_do_not_stop_a_complete_report_being_admitted` opens 96 idle sockets and checks a plain report still gets through within five seconds; `idle_sockets_do_not_take_report_slots_from_mtls_peers`, in `tests/reporting_tcp.rs`, does the same against an mTLS listener with 100 sockets that never start a handshake. Before the fix both waited out their deadlines.
+
+Behind the listener, the aggregator's cost per report has to stay flat too, or its queue fills and the senders wait anyway. It stores every queued report and publishes its view once per burst, and it reconciles its freshness table with gossip's member list only when that list or the leadership epoch changes, not once per report ([#2440](https://github.com/reliaburger/reliaburger/issues/2440)); chapter 15 has the details.
 
 A successful socket write doesn't prove the leader took the report, so the receiver answers with a one-byte acknowledgement once it has decoded and queued it. A lost acknowledgement can cause a duplicate, which is harmless: snapshots replace older ones and rollups are deduplicated by worker and minute. A failed rollup send asks for the same five-minute backfill a reassignment uses. Longer outages leave a gap in the cluster view; the node-local metrics keep the data until retention removes it.
 
@@ -215,6 +239,16 @@ Two related fixes from the same review live in chapter 2, where the aggregator i
 
 The reporting topology stays a flat star: every node reports straight to the leader. The consistent-hash tree this chapter's title promises is real in the library (`assignment.rs`) and deliberately unwired — with the council capped at seven and reports every few seconds, a star to the leader handles thousands of nodes before the maths says otherwise. When it does, the tree slots in behind the same `watch` channel interface without touching the workers. What did change in 12b.2 is who can *find* the star's centre: the gossip directory (chapter 2) now tells every node, voter or not, where the leader's reporting endpoint lives, so the star finally extends past the council.
 
+
+### A minute too big for one message
+
+A rollup carries one entry per series the node had in that minute, and the reporting transport refuses any frame over 1 MiB. We measured an entry at about 149 bytes in postcard, for a series labelled the way an app scrape labels it (`app`, `namespace`, `instance`, `node` and one label of its own), so a node with about 7,000 series, 30 instances of an ordinary instrumented service, crossed the limit ([#2426](https://github.com/reliaburger/reliaburger/issues/2426)). Every push then failed with `ReportTooLarge`. The worker treated that like any failed send and asked for a backfill, which built five rollups of the same size and failed on the first, every minute, for ever. The node vanished from `/v1/metrics/cluster` and the only trace was a line in its stderr.
+
+Now `split_to_fit` cuts a minute into parts that each fit. It measures every entry with `postcard::experimental::serialized_size` (which walks the value without allocating the encoding) and fills a part greedily up to the frame limit, less the part's fixed cost. The split depends only on the entries, which come out of the store sorted by name and labels, so a backfill re-sending the same minute cuts it the same way. That matters because of the dedup above: each part carries a `part` number, and the council's key is now `(node_id, window, part)`. That's a wire format change (`NodeRollup` grew a field), so it moves the protocol version.
+
+A part can still be refused if one entry is over the limit on its own, a label with a megabyte in it say. Retrying can't help, so the worker no longer starts a backfill for `ReportTooLarge`. It counts the part in a node metric, `mayo_rollups_refused_total`, logs it, and sends the minute's other parts. `a_rollup_larger_than_one_report_frame_still_reaches_the_parent` pushes 8,000 series through an in-memory transport that now applies the same frame check as TCP, and expects all 8,000 at the other end in more than one part; `a_rollup_too_large_to_send_does_not_start_a_backfill` and `a_split_is_deterministic_and_every_part_fits` pin the rest.
+
+One edge we chose rather than fixed: after a restart the council seeds its dedup set from the Parquet files, which don't record parts. So any part of a minute already on disk counts as seen, and a part that arrives across a restart is dropped rather than risk counting the minute twice.
 ## Two merge strategies
 
 When results come back from multiple sources, how you combine them depends on the query type.
@@ -285,6 +319,7 @@ These endpoints expose the aggregation:
 
 - `GET /v1/metrics/rollup` -- this aggregator's own summed view of its rollups.
 - `GET /v1/metrics/rollup/owned` -- internal fan-out endpoint returning per-worker contributions.
+- `GET /v1/metrics/rollup/reporters` -- internal fan-out endpoint naming the newest window this aggregator holds from each node.
 - `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to council aggregators, deduplicates ownership, then sums.
 - `GET /v1/metrics/app/{app}/{namespace}` -- single-app query. Queries local metrics filtered by app labels.
 
@@ -299,10 +334,21 @@ pub struct MetricsQueryResult {
 pub enum QueryWarning {
     NodeUnresponsive { node_id: String },
     DataUnavailable { node_id: String, from: u64, to: u64 },
+    QueryRefused { node_id: String, reason: String },
+    Truncated { node_id: String, limit: usize },
+    NodeSilent { node_id: String, last_seen: Option<u64> },
 }
 ```
 
 Graceful degradation is the goal. If one council member is down, you get partial results plus a warning telling you which data is missing. No 500 error, no empty response, no silent data loss. The caller can decide whether partial data is good enough for their use case.
+
+`QueryRefused` arrived with the audit ([#2451](https://github.com/reliaburger/reliaburger/issues/2451)), and it's the log fan-out's lesson below, learned a second time. Each member refused any answer of more than 10,000 contributions, one row per node, minute and series. With no `start`, the window was the whole 24-hour rollup retention, and one unlabelled series on one node is 1,440 rows a day, so a member aggregating seven nodes failed a dashboard's very first request. It answered 500 with "narrow the time range", the fan-out's `error_for_status()` threw that body away, and the operator saw every council member "unresponsive" on a healthy cluster.
+
+Three changes. With no `start`, `/v1/metrics/cluster` reads the last hour. A member answers in pages: `/v1/metrics/rollup/owned` returns at most 10,000 rows ending on a whole minute, plus an `x-reliaburger-next-start` header naming where the next page begins, and the entry node follows it until there's no header. A header rather than a new response type keeps the body the same `Vec<OwnedRollupRow>`. And a member's refusal (past `MAX_OWNED_ROWS`, 200,000 rows, or one minute too big for a page) comes back as `QueryRefused` with the member's own words, read from the error body, instead of `NodeUnresponsive`. A single node with no council refuses the same way, as a 400. `a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds` is 14,400 contributions that used to be refused; `a_member_answer_in_pages_is_read_to_the_end` and `a_member_that_refuses_the_query_is_not_reported_as_unresponsive` drive the fan-out against a small axum server.
+
+`NodeSilent` closes the gap #2426 left ([#2536](https://github.com/reliaburger/reliaburger/issues/2536)). A node whose rollups stopped reaching the council, because its sender died or every frame was refused, simply vanished from the sums, and nothing in the answer said so. The trouble is that a council member only knows who *has* reported, not who *should*. Gossip knows that: every live member runs a rollup worker. So the entry node takes its live members from the table of remembered members, which now also records when each one joined (or came back after being down), and asks every council member a second, cheap question beside the owned rows: `/v1/metrics/rollup/reporters`, the newest window each node has sent it. A member whose newest rollup is more than five minutes older than the end of the window (or now, for a window that hasn't ended) is named, with when it was last heard; five minutes is the span a reassigned worker re-sends, so a shorter gap is ordinary. A member that joined within those five minutes owes nothing yet. The newest window comes from an in-memory map the store updates on every ingest, duplicates included, so the answer doesn't depend on which metric you asked about: a node that runs none of the app whose metric you queried is still reporting. And if any council member can't answer the second question, nobody is called silent, because its workers would all look silent; its failure is already in the warnings.
+
+The two questions go out at once with `tokio::join!`, which polls both futures on the current task and returns both results as a tuple when both have finished. Unlike `tokio::spawn` it needs no `'static` future, so the two can borrow the query and the URL list. `Option::is_none_or` reads as it says: `last_seen.is_none_or(|last| last < due_by)` is true for no rollup at all or one that's too old.
 
 ## Testing hierarchical aggregation
 
@@ -659,6 +705,8 @@ Those tokens live in `brioche.css`:
 ```
 
 A canvas can't read CSS variables, so `brioche.js` reads them once with `getComputedStyle` and hands uPlot plain colours for the tick labels and gridlines. A test in `src/brioche/assets.rs` parses the embedded stylesheet, computes the WCAG contrast ratio of each text token against each background, and fails below 4.5:1 (AA for normal text). The muted grey now sits at about 8.3:1 on the chart panel (the old `#888` managed 4.5:1 by a whisker, and the legend was darker still). Gridlines aren't text, so they only have to show and stay fainter than the labels; the same test checks that too. Change a colour and the build tells you whether people can still read it.
+
+The app page's live log view is the other thing `brioche.js` does, and for a long time it only ever added. Each event became a `<div>`, appended, with the view scrolled to the bottom, and nothing removed a line (#2433). A page left on a wall screen for an app logging 300 lines a second held about a million nodes after an hour, until the browser gave up on the tab, and the jump to the bottom on every line meant nobody could scroll back to read. The handler now keeps the newest `MAX_LOG_LINES` (2,000), removing the oldest as new ones arrive, and follows the tail only when the reader was already at the bottom. It still sets `textContent`, never `innerHTML`, so a log line can't become markup. There's no JavaScript test runner in the repository, so `the_log_viewer_script_trims_old_lines` in `src/brioche/assets.rs` reads the embedded script and checks the cap, the removal and the bottom check are there. It's a text check: it can't tell the code works, only that nobody deleted it.
 
 ### Vendored assets, no build pipeline
 

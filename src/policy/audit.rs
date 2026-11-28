@@ -56,8 +56,9 @@ pub struct CommittedApp {
 ///
 /// An app is judged as an apply would judge it: its declared spec (#1118)
 /// where the cluster kept one, filled in by the defaults, validated, then
-/// every `deny`. A job is judged from its stored definition, its schedule
-/// and run policy put back, with its image read back as the tag it was bound from.
+/// every `deny`. A job is judged by its declared spec (#1322): its stored
+/// definition with its schedule and run policy put back, and the image it
+/// declared before admission bound or pinned it.
 pub fn audit(desired: &DesiredState) -> PolicyAudit {
     audit_visible(desired, |_| true)
 }
@@ -98,9 +99,7 @@ pub fn audit_visible(desired: &DesiredState, visible: impl Fn(&AppId) -> bool) -
             if !visible(&id) {
                 return None;
             }
-            let mut spec = record.definition.to_spec();
-            spec.image = spec.image.as_deref().map(unbound);
-            Some((id, spec))
+            Some((id, record.definition.declared_spec()))
         })
         .collect();
     audit_workloads(&desired.policies, desired.policy_generation, &apps, &jobs)

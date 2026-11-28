@@ -13,7 +13,11 @@
 //! paired with that address, or that the machine's first line on each boot
 //! (its hello) names, when this process answered that MAC ([`Peers`]). A
 //! sender it never answered is named by its address. It also appends the
-//! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it.
+//! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it, or,
+//! for a sender it never answered, to `logs/unserved.log` with the address
+//! in front. Files are capped at 64 MiB each and 64 open at once, so lines
+//! from many forged addresses can't use up relish's file descriptors or the
+//! disk.
 //!
 //! The screen can show less than the file ([`StreamLogs`]). Three machines
 //! booting send hundreds of kernel lines each, so `--stream-logs=units`
@@ -43,6 +47,24 @@ pub const NETLOG_PORT: u16 = crate::os::netlog::DEFAULT_PORT;
 /// The directory under the netboot directory the raw lines go to.
 pub const LOGS_DIRECTORY: &str = "logs";
 
+/// The one file under `logs/` for every sender this process never served,
+/// each line marked with its address: anyone can send from any number of
+/// (forged) addresses, so they don't get a file each.
+pub const UNSERVED_LOG: &str = "unserved.log";
+
+/// The files under `logs/` kept open at once. Past this, the one written
+/// longest ago is closed, and reopened if its machine sends again.
+const MAX_OPEN_LOG_FILES: usize = 64;
+
+/// The most a file under `logs/` grows to; later lines only print. A whole
+/// boot's kernel log is a few hundred KiB.
+const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most machines `relish machines logs` names by their hello alone.
+/// A hello can name any MAC, so past this the senders share
+/// [`UNSERVED_LOG`] like any stranger: the files stay bounded (#2390).
+const MAX_MACHINES_NAMED_BY_HELLO: usize = 64;
+
 /// The largest datagram the listener reads. netconsole sends at most a
 /// few hundred bytes a packet; anything longer is cut there.
 const MAX_DATAGRAM: usize = 2048;
@@ -50,7 +72,8 @@ const MAX_DATAGRAM: usize = 2048;
 /// Who sent a boot log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sender {
-    /// A machine this process answered over DHCP, by its MAC.
+    /// A machine this process answered over DHCP, or, for `relish
+    /// machines logs`, one its hello named, by its MAC.
     Served(MacAddress),
     /// An address this process never answered.
     NotServed(Ipv4Addr),
@@ -61,7 +84,7 @@ impl Sender {
     pub fn file_name(self) -> String {
         match self {
             Sender::Served(mac) => format!("{mac}.log"),
-            Sender::NotServed(address) => format!("{address}.log"),
+            Sender::NotServed(_) => UNSERVED_LOG.to_string(),
         }
     }
 }
@@ -81,9 +104,25 @@ impl fmt::Display for Sender {
 pub struct Peers {
     answered: HashSet<MacAddress>,
     by_address: HashMap<Ipv4Addr, MacAddress>,
+    /// The address each MAC's latest DHCP request came from, or asked the
+    /// LAN's server for. Only DHCP sets it, never a hello, which anyone can
+    /// send.
+    asked_from: HashMap<MacAddress, Ipv4Addr>,
+    /// `relish machines logs` answers nobody, so a hello naming a MAC it
+    /// hasn't seen names a machine, up to [`MAX_MACHINES_NAMED_BY_HELLO`].
+    hello_names_machines: bool,
 }
 
 impl Peers {
+    /// The peers of a listener that serves nothing (`relish machines
+    /// logs`): each machine is named by the MAC in its hello.
+    pub fn listening_only() -> Self {
+        Self {
+            hello_names_machines: true,
+            ..Self::default()
+        }
+    }
+
     /// Remember that this process answered `mac`, asking from `address`. A
     /// later request from the same address replaces it, since leases move.
     /// A request from no address yet (0.0.0.0) only remembers the MAC.
@@ -93,6 +132,28 @@ impl Peers {
             return;
         }
         self.by_address.insert(address, mac);
+        self.asked_from.insert(mac, address);
+    }
+
+    /// `mac` asked the LAN's DHCP server for `address` (option 50 in a
+    /// broadcast DHCPREQUEST, [`super::dhcp::requested_address`]). iPXE
+    /// takes its boot file from this process's proxy offer and its address
+    /// from that server, so this is the address it fetches `boot.ipxe`
+    /// from, and it may not be the one the firmware asked from on 4011.
+    /// Only a machine this process answered moves; a request names any
+    /// MAC it likes.
+    pub fn requested(&mut self, address: Ipv4Addr, mac: MacAddress) {
+        if !self.answered.contains(&mac) || address.is_unspecified() || address.is_broadcast() {
+            return;
+        }
+        self.by_address.insert(address, mac);
+        self.asked_from.insert(mac, address);
+    }
+
+    /// The address `mac`'s latest DHCP request came from or asked for, if
+    /// it named one of its own.
+    pub fn asked_from(&self, mac: MacAddress) -> Option<Ipv4Addr> {
+        self.asked_from.get(&mac).copied()
     }
 
     /// A machine at `address` said hello naming `mac` ([`hello_mac`]).
@@ -101,8 +162,17 @@ impl Peers {
     /// addresses from the LAN's DHCP server with a client ID of their own,
     /// so the address they send from needn't be the one iPXE asked from.
     /// A MAC this process never answered names nothing.
+    ///
+    /// A listener that serves nothing ([`Peers::listening_only`]) has
+    /// answered no MAC, so there a hello names its machine, for at most
+    /// [`MAX_MACHINES_NAMED_BY_HELLO`] machines. It never gives a machine
+    /// an install ticket: only DHCP sets [`Peers::asked_from`].
     pub fn hello(&mut self, address: Ipv4Addr, mac: MacAddress) {
-        if self.answered.contains(&mac) {
+        let named = self.answered.contains(&mac)
+            || (self.hello_names_machines
+                && self.answered.len() < MAX_MACHINES_NAMED_BY_HELLO
+                && self.answered.insert(mac));
+        if named {
             self.by_address.insert(address, mac);
         }
     }
@@ -130,6 +200,14 @@ pub fn learn(peers: &SharedPeers, address: Ipv4Addr, mac: MacAddress) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .learn(address, mac);
+}
+
+/// Remember that `mac` asked the LAN's DHCP server for `address`.
+pub fn requested(peers: &SharedPeers, address: Ipv4Addr, mac: MacAddress) {
+    peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .requested(address, mac);
 }
 
 /// Who sent `line` from `address`, after learning from it if it's a hello.
@@ -307,42 +385,112 @@ pub fn describe(sender: Sender, line: &str) -> String {
     format!("log {sender}: {line}")
 }
 
-/// The files under `logs/` that lines are appended to, kept open.
+/// One file under `logs/`, open for appending.
+struct OpenLog {
+    file: tokio::fs::File,
+    /// Its length so far.
+    length: u64,
+    /// When it was last written, by [`LogFiles`]'s count of writes.
+    last_write: u64,
+}
+
+/// The files under `logs/` that lines are appended to: at most
+/// [`MAX_OPEN_LOG_FILES`] open at once, each growing to `max_bytes`.
 struct LogFiles {
     directory: Option<PathBuf>,
-    open: HashMap<String, tokio::fs::File>,
+    open: HashMap<String, OpenLog>,
+    /// Files that reached `max_bytes`: their lines only print.
+    full: HashSet<String>,
+    /// Writes so far, to tell which open file was written longest ago.
+    writes: u64,
     /// A write failed once, and the operator heard why; later failures
     /// stay quiet so the terminal isn't flooded.
     warned: bool,
+    /// The most a file grows to.
+    max_bytes: u64,
 }
 
 impl LogFiles {
-    async fn append(&mut self, sender: Sender, line: &str) -> std::io::Result<()> {
-        let Some(directory) = &self.directory else {
-            return Ok(());
+    fn new(directory: Option<PathBuf>) -> Self {
+        Self {
+            directory,
+            open: HashMap::new(),
+            full: HashSet::new(),
+            writes: 0,
+            warned: false,
+            max_bytes: MAX_LOG_FILE_BYTES,
+        }
+    }
+
+    /// Append `line` to `sender`'s file. True when this line is the first
+    /// one dropped because the file is full, so the caller can say so once.
+    async fn append(&mut self, sender: Sender, line: &str) -> std::io::Result<bool> {
+        let Some(directory) = self.directory.clone() else {
+            return Ok(false);
         };
         let name = sender.file_name();
+        if self.full.contains(&name) {
+            return Ok(false);
+        }
+        let text = match sender {
+            Sender::Served(_) => format!("{line}\n"),
+            Sender::NotServed(address) => format!("{address} {line}\n"),
+        };
         if !self.open.contains_key(&name) {
-            tokio::fs::create_dir_all(directory).await?;
+            self.close_oldest_if_full();
+            tokio::fs::create_dir_all(&directory).await?;
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(directory.join(&name))
                 .await?;
-            self.open.insert(name.clone(), file);
+            let length = file.metadata().await?.len();
+            self.open.insert(
+                name.clone(),
+                OpenLog {
+                    file,
+                    length,
+                    last_write: 0,
+                },
+            );
         }
-        if let Some(file) = self.open.get_mut(&name) {
-            file.write_all(format!("{line}\n").as_bytes()).await?;
-            // tokio's File hands the write to a blocking thread and returns
-            // before it lands; flush waits for it, so a line that has
-            // printed is in the file too.
-            file.flush().await?;
+        self.writes += 1;
+        let Some(open) = self.open.get_mut(&name) else {
+            return Ok(false);
+        };
+        if open.length + text.len() as u64 > self.max_bytes {
+            self.open.remove(&name);
+            self.full.insert(name);
+            return Ok(true);
         }
-        Ok(())
+        open.file.write_all(text.as_bytes()).await?;
+        // tokio's File hands the write to a blocking thread and returns
+        // before it lands; flush waits for it, so a line that has printed
+        // is in the file too.
+        open.file.flush().await?;
+        open.length += text.len() as u64;
+        open.last_write = self.writes;
+        Ok(false)
+    }
+
+    /// Make room for one more open file by closing the one written longest
+    /// ago. It opens again, appending, if its machine sends another line.
+    fn close_oldest_if_full(&mut self) {
+        if self.open.len() < MAX_OPEN_LOG_FILES {
+            return;
+        }
+        let oldest = self
+            .open
+            .iter()
+            .min_by_key(|(_, open)| open.last_write)
+            .map(|(name, _)| name.clone());
+        if let Some(name) = oldest {
+            self.open.remove(&name);
+        }
     }
 }
 
-/// Append each line that arrives on `socket` to `logs/<sender>.log` under
+/// Append each line that arrives on `socket` to its sender's file under
 /// `directory` when there is one, and print the ones `shown` shows through
 /// `log`, naming the sender from `peers`. Runs until the socket fails.
 pub async fn listen(
@@ -352,11 +500,7 @@ pub async fn listen(
     shown: StreamLogs,
     log: Log,
 ) -> std::io::Result<()> {
-    let mut files = LogFiles {
-        directory: directory.map(|d| d.join(LOGS_DIRECTORY)),
-        open: HashMap::new(),
-        warned: false,
-    };
+    let mut files = LogFiles::new(directory.map(|d| d.join(LOGS_DIRECTORY)));
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     loop {
         let (len, source) = socket.recv_from(&mut buffer).await?;
@@ -366,14 +510,21 @@ pub async fn listen(
         for line in lines(&buffer[..len]) {
             let sender = sender(&peers, *source.ip(), &line);
             // The file first: once a line has printed, it's on disk too.
-            if let Err(error) = files.append(sender, &line).await
-                && !files.warned
-            {
-                files.warned = true;
-                log(format!(
-                    "log: can't write {}: {error}; boot logs only print from now on",
-                    sender.file_name()
-                ));
+            match files.append(sender, &line).await {
+                Ok(true) => log(format!(
+                    "log: {} reached {} MiB; its lines only print from now on",
+                    sender.file_name(),
+                    files.max_bytes / (1024 * 1024)
+                )),
+                Ok(false) => {}
+                Err(error) if !files.warned => {
+                    files.warned = true;
+                    log(format!(
+                        "log: can't write {}: {error}; boot logs only print from now on",
+                        sender.file_name()
+                    ));
+                }
+                Err(_) => {}
             }
             if shown.shows(&line) {
                 log(describe(sender, &line));
@@ -400,15 +551,12 @@ pub async fn run_listener(
     );
     if let Some(directory) = &directory {
         println!(
-            "  appending each machine's lines to {}",
-            directory
-                .join(LOGS_DIRECTORY)
-                .join("<machine>.log")
-                .display()
+            "  appending each machine's lines to {}, named by the MAC in its hello; lines from senders without one go to {UNSERVED_LOG}",
+            directory.join(LOGS_DIRECTORY).join("<mac>.log").display()
         );
     }
     let log: Log = Arc::new(|line| println!("{line}"));
-    let peers = SharedPeers::default();
+    let peers: SharedPeers = Arc::new(Mutex::new(Peers::listening_only()));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("relish machines logs: stopped");
@@ -476,7 +624,7 @@ mod tests {
             "log 192.168.1.99 (not served): hello"
         );
         assert_eq!(peers.sender(address).file_name(), "52:54:00:12:34:56.log");
-        assert_eq!(peers.sender(stranger).file_name(), "192.168.1.99.log");
+        assert_eq!(peers.sender(stranger).file_name(), "unserved.log");
     }
 
     #[test]
@@ -488,6 +636,35 @@ mod tests {
             peers.sender(Ipv4Addr::UNSPECIFIED),
             Sender::NotServed(Ipv4Addr::UNSPECIFIED)
         );
+    }
+
+    /// The reinstall boot in CI (#2389, run 46076493713): the firmware
+    /// asked on 4011 from 10.42.0.111, then iPXE took 10.42.0.110 from the
+    /// LAN's server and fetched boot.ipxe from there. The address iPXE
+    /// requested is the machine's latest, so it's the one with the ticket.
+    #[test]
+    fn the_address_ipxe_requests_replaces_the_one_the_firmware_asked_from() {
+        let mut peers = Peers::default();
+        peers.learn(Ipv4Addr::UNSPECIFIED, MAC);
+        peers.learn(Ipv4Addr::new(10, 42, 0, 111), MAC);
+        peers.requested(Ipv4Addr::new(10, 42, 0, 110), MAC);
+        assert_eq!(peers.asked_from(MAC), Some(Ipv4Addr::new(10, 42, 0, 110)));
+    }
+
+    /// A request names any MAC it likes: it only moves a machine this
+    /// process answered, and an address-less request moves nothing.
+    #[test]
+    fn a_requested_address_only_counts_for_a_machine_this_process_answered() {
+        let mut peers = Peers::default();
+        peers.requested(Ipv4Addr::new(10, 42, 0, 110), MAC);
+        assert_eq!(peers.asked_from(MAC), None);
+        let stranger = Ipv4Addr::new(10, 42, 0, 110);
+        assert_eq!(peers.sender(stranger), Sender::NotServed(stranger));
+
+        peers.learn(Ipv4Addr::new(10, 42, 0, 111), MAC);
+        peers.requested(Ipv4Addr::UNSPECIFIED, MAC);
+        peers.requested(Ipv4Addr::BROADCAST, MAC);
+        assert_eq!(peers.asked_from(MAC), Some(Ipv4Addr::new(10, 42, 0, 111)));
     }
 
     /// The line `/usr/lib/reliaburger/netlog` sends first on every boot.
@@ -541,12 +718,99 @@ mod tests {
 
     #[test]
     fn a_hello_naming_a_mac_this_server_never_answered_names_nothing() {
-        // `relish machines logs` answers nobody, so every sender stays
-        // marked, whatever its hello says.
+        // `relish netboot` names only machines it answered: a hello naming
+        // another MAC stays marked, whatever it says.
         let mut peers = Peers::default();
         let stranger = Ipv4Addr::new(192, 168, 1, 99);
         peers.hello(stranger, MAC);
         assert_eq!(peers.sender(stranger), Sender::NotServed(stranger));
+    }
+
+    /// `relish machines logs` answers nobody, so a hello is all it has to
+    /// name a machine by (#2149): an installed node streams there after
+    /// `relish os boot-logs --to`, and the OS-update test reads its lines
+    /// from `logs/<mac>.log`.
+    #[test]
+    fn the_listener_alone_names_a_machine_by_its_hello() {
+        let mut peers = Peers::listening_only();
+        let node = Ipv4Addr::new(10, 42, 0, 31);
+        assert_eq!(peers.sender(node), Sender::NotServed(node));
+        peers.hello(node, MAC);
+        assert_eq!(peers.sender(node), Sender::Served(MAC));
+        assert_eq!(peers.sender(node).file_name(), "52:54:00:12:34:56.log");
+        // A hello names a machine, never an install ticket's address.
+        assert_eq!(peers.asked_from(MAC), None);
+    }
+
+    /// Anyone can send a hello naming any MAC, so the listener names at
+    /// most [`MAX_MACHINES_NAMED_BY_HELLO`] machines that way (#2390).
+    /// Later strangers share `unserved.log`; a named machine that moves
+    /// keeps its name.
+    #[test]
+    fn the_listener_names_a_bounded_number_of_machines_by_hello() {
+        let mut peers = Peers::listening_only();
+        for i in 0..MAX_MACHINES_NAMED_BY_HELLO {
+            let index = u8::try_from(i).unwrap();
+            peers.hello(
+                Ipv4Addr::new(10, 1, 0, index),
+                MacAddress([2, 0, 0, 0, 0, index]),
+            );
+        }
+        let late = Ipv4Addr::new(10, 42, 0, 31);
+        peers.hello(late, MAC);
+        assert_eq!(peers.sender(late), Sender::NotServed(late));
+
+        let moved = Ipv4Addr::new(10, 2, 0, 1);
+        peers.hello(moved, MacAddress([2, 0, 0, 0, 0, 0]));
+        assert_eq!(
+            peers.sender(moved),
+            Sender::Served(MacAddress([2, 0, 0, 0, 0, 0]))
+        );
+    }
+
+    /// The OS-update test's stream (run 46082879273): the node's hello,
+    /// then its lines, land in `logs/<mac>.log` of `relish machines logs`.
+    #[tokio::test]
+    async fn the_listener_alone_files_a_machines_lines_under_the_mac_in_its_hello() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = socket.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let log: Log = Arc::new(move |line| {
+            let _ = tx.send(line);
+        });
+        let task = tokio::spawn(listen(
+            socket,
+            Arc::new(Mutex::new(Peers::listening_only())),
+            Some(directory.path().to_path_buf()),
+            StreamLogs::All,
+            log,
+        ));
+        let node = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = "reliaburger: bun healthy on OS 2026.48.358";
+        node.send_to(format!("{HELLO}\n{healthy}\n").as_bytes(), listener)
+            .await
+            .unwrap();
+        let mut printed = Vec::new();
+        while printed.len() < 2 {
+            printed.push(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        task.abort();
+        assert_eq!(printed[1], format!("log 52:54:00:12:34:56: {healthy}"));
+        let written = tokio::fs::read_to_string(
+            directory
+                .path()
+                .join(LOGS_DIRECTORY)
+                .join("52:54:00:12:34:56.log"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, format!("{HELLO}\n{healthy}\n"));
     }
 
     #[tokio::test]
@@ -652,6 +916,57 @@ mod tests {
             "reliaburger: bun not healthy after 120 s\nreliaburger: counted boot failed, rebooting\n"
         );
         task.abort();
+    }
+
+    /// Anyone on the LAN can send a line, from as many (forged) source
+    /// addresses as it likes. A file and an open handle each would run
+    /// relish, and the netboot servers in the same process, out of file
+    /// descriptors. Lines from senders this process never served share one
+    /// file, each marked with its address.
+    #[tokio::test]
+    async fn lines_from_addresses_this_server_never_answered_share_one_bounded_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = LogFiles::new(Some(directory.path().to_path_buf()));
+        for n in 0..300u16 {
+            let address = Ipv4Addr::new(10, 0, (n / 256) as u8, (n % 256) as u8);
+            files.append(Sender::NotServed(address), "x").await.unwrap();
+        }
+        assert!(files.open.len() <= MAX_OPEN_LOG_FILES);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let shared = std::fs::read_to_string(directory.path().join("unserved.log")).unwrap();
+        assert!(shared.starts_with("10.0.0.0 x\n10.0.0.1 x\n"), "{shared}");
+
+        // Served machines each have a file, but not each an open handle.
+        for n in 0..100u8 {
+            let mac = MacAddress([0x52, 0x54, 0x00, 0x00, 0x01, n]);
+            files.append(Sender::Served(mac), "y").await.unwrap();
+        }
+        assert!(files.open.len() <= MAX_OPEN_LOG_FILES);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 101);
+        // A machine whose file was closed is appended to again.
+        let first = MacAddress([0x52, 0x54, 0x00, 0x00, 0x01, 0]);
+        files.append(Sender::Served(first), "z").await.unwrap();
+        let written =
+            std::fs::read_to_string(directory.path().join(Sender::Served(first).file_name()))
+                .unwrap();
+        assert_eq!(written, "y\nz\n");
+    }
+
+    #[tokio::test]
+    async fn a_log_file_stops_growing_at_its_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = LogFiles::new(Some(directory.path().to_path_buf()));
+        files.max_bytes = 1000;
+        for _ in 0..100 {
+            files
+                .append(Sender::Served(MAC), &"a".repeat(49))
+                .await
+                .unwrap();
+        }
+        let file = directory.path().join(Sender::Served(MAC).file_name());
+        let length = std::fs::metadata(&file).unwrap().len();
+        assert!(length <= 1000, "{length}");
+        assert!(length >= 950, "it filled up to the cap: {length}");
     }
 
     // `--stream-logs=units` (#2149 follow-up): what the screen keeps.

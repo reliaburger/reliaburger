@@ -31,7 +31,9 @@ pub(crate) async fn bind_images(
 /// stream's `Error` event instead (#2157), so both paths name the same one.
 pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
     match error {
-        BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+        BindError::InvalidReference { .. } | BindError::Unpackable { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         BindError::NotInPickle { .. } | BindError::NoSuchImage { .. } => StatusCode::NOT_FOUND,
         BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
         BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
@@ -42,7 +44,7 @@ pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
 /// which every node shares, or this node's own when it runs standalone.
 async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
     match (&state.council, &state.pickle_catalog) {
-        (Some(council), _) => council.manifest_catalog().await,
+        (Some(council), _) => (*council.manifest_catalog().await).clone(),
         (None, Some(catalog)) => catalog.read().await.clone(),
         (None, None) => ManifestCatalog::default(),
     }
@@ -76,6 +78,7 @@ pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 pub(super) const APPLY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(super) async fn apply_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
     binder: Option<axum::Extension<ImageBinder>>,
@@ -88,6 +91,9 @@ pub(super) async fn apply_handler(
     {
         return resp;
     }
+    // `apply --wait` follows the deploy's progress for as long as it runs;
+    // a token revoked meanwhile ends the stream, not the deploy (#2399).
+    let watch = watch.map(|extension| extension.0);
     let mut config = match Config::parse(&body) {
         Ok(c) => c,
         Err(e) => {
@@ -421,7 +427,7 @@ pub(super) async fn apply_handler(
     // Every job, leased or not, takes the common job lifecycle: the leader
     // admits it as an indexed run and grants it to a node with room.
     if !config.job.is_empty() {
-        return crate::bun::job_apply::apply(
+        let response = crate::bun::job_apply::apply(
             state,
             auth.as_deref(),
             binder.as_deref(),
@@ -432,6 +438,11 @@ pub(super) async fn apply_handler(
             image_lease.as_ref(),
         )
         .await;
+        return crate::sesame::auth::end_with_credential(
+            response,
+            watch,
+            credential_ended_apply_event(),
+        );
     }
     let _standalone_gate = if state.council.is_none() {
         Some(state.task_arrays.apply_gate.clone().lock_owned().await)
@@ -464,7 +475,7 @@ pub(super) async fn apply_handler(
             || !config.policy.is_empty()
             || !config.build.is_empty())
     {
-        return cluster_apply(
+        let response = cluster_apply(
             state.clone(),
             Arc::clone(council),
             config,
@@ -476,6 +487,11 @@ pub(super) async fn apply_handler(
             auth.map(|extension| extension.0),
         )
         .await;
+        return crate::sesame::auth::end_with_credential(
+            response,
+            watch,
+            credential_ended_apply_event(),
+        );
     }
     if capacity_probe {
         return (
@@ -585,9 +601,27 @@ pub(super) async fn apply_handler(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
 
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+    crate::sesame::auth::end_with_credential(
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response(),
+        watch,
+        credential_ended_apply_event(),
+    )
+}
+
+/// The last event of a deploy's progress stream whose token ended while
+/// it ran: an [`ApplyEvent::Error`] that says the deploy itself carries on.
+pub(super) fn credential_ended_apply_event() -> axum::body::Bytes {
+    let event = ApplyEvent::Error {
+        status: None,
+        message: format!(
+            "{}; the deploy carries on: follow it with `relish status`",
+            crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE
+        ),
+    };
+    let json = serde_json::to_string(&event).unwrap_or_default();
+    axum::body::Bytes::from(format!("data: {json}\n\n"))
 }
 
 /// One progress line per host-path `source` in `config`: the API can't see

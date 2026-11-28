@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -353,6 +354,7 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         ));
     }
     become_subreaper()?;
+    let wakeup = Wakeup::install()?;
     exec::install_cancellation_handler()?;
     let socket_path = socket_path(record);
     let parent = socket_path
@@ -378,6 +380,18 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(directory.join(format!("output.{suffix}")))
     };
+    // A workload writes straight into its capture files, which Ketchup
+    // follows and reclaims. An exec helper's command writes into pipes this
+    // owner drains, so its files stay under the exec output limit (#2392).
+    let mut drains = Vec::new();
+    let (stdout, stderr) = if exec::is_helper_directory(directory) {
+        let (stdout, stdout_sink) = exec::OutputDrain::new(log("stdout")?)?;
+        let (stderr, stderr_sink) = exec::OutputDrain::new(log("stderr")?)?;
+        drains = vec![stdout, stderr];
+        (Stdio::from(stdout_sink), Stdio::from(stderr_sink))
+    } else {
+        (Stdio::from(log("stdout")?), Stdio::from(log("stderr")?))
+    };
     // The gate's stdin is one end of a socket pair, not a pipe, so the gate
     // can answer on it: activation goes one way, its report the other.
     let (mut channel, gate_end) = UnixStream::pair()?;
@@ -386,8 +400,8 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         .arg(directory)
         .process_group(0)
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(gate_end)))
-        .stdout(log("stdout")?)
-        .stderr(log("stderr")?)
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()?;
     let mut owned = OwnedChild {
         child,
@@ -406,6 +420,9 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
     let mut exit_code = None;
     let mut executions = Vec::new();
     loop {
+        // Clear the wake-ups before looking, so one that lands while the
+        // loop looks stays pending and ends the next wait at once.
+        wakeup.clear();
         if exec::cancelled() {
             owned.signal(Signal::SIGKILL)?;
         }
@@ -417,11 +434,18 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
         }
+        for drain in &mut drains {
+            drain.drain();
+        }
         let executions_retired = exec::poll(&mut executions, exit_code.is_some())?;
         if let Some(code) = exit_code
             && executions_retired
             && retire_children(&mut owned)?
         {
+            // Every writer the group held has gone: keep its last words.
+            for drain in &mut drains {
+                drain.drain();
+            }
             record.phase = OwnerPhase::Retiring { exit_code: code };
             persist(directory, record)?;
             drop(listener);
@@ -435,8 +459,116 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             complete_retirement(directory, record)?;
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Exec helpers and retirement are written as polling state
+        // machines, so they keep the short tick. An owner with nothing in
+        // flight sleeps until a client connects, a child exits, the command
+        // writes or the owner is cancelled (#2447).
+        let busy = exit_code.is_some() || !executions.is_empty() || exec::cancelled();
+        let mut sources = vec![listener.as_fd(), wakeup.receiver.as_fd()];
+        sources.extend(drains.iter().filter_map(exec::OutputDrain::source));
+        wait_for_any(&sources, if busy { BUSY_TICK } else { IDLE_WAIT })?;
     }
+}
+
+/// How often the owner's loop turns while an exec or a retirement is in
+/// flight.
+const BUSY_TICK: Duration = Duration::from_millis(10);
+
+/// Longest an idle owner sleeps without an event. Every event it waits for
+/// wakes it, so this is a safety net: a missed wake-up delays work, but
+/// never loses it.
+const IDLE_WAIT: Duration = Duration::from_secs(5);
+
+/// Where the owner's signal handlers write to wake its loop: the write end
+/// of [`Wakeup`]'s channel, or -1 before one is installed.
+static WAKE_SENDER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Wake the owner's loop from a signal handler: the self-pipe trick. Only
+/// async-signal-safe calls: an atomic load and `write(2)`, with `errno`
+/// saved around them so the interrupted code sees its own.
+pub(super) extern "C" fn wake(_: nix::libc::c_int) {
+    let saved = nix::errno::Errno::last_raw();
+    let sender = WAKE_SENDER.load(std::sync::atomic::Ordering::Relaxed);
+    if sender >= 0 {
+        // SAFETY: `sender` is the open, non-blocking write end that
+        // `Wakeup` keeps for the owner's whole life, and the buffer is a
+        // one-byte static. A full channel already holds a wake-up, so a
+        // failed write loses nothing.
+        unsafe { nix::libc::write(sender, b"!".as_ptr().cast(), 1) };
+    }
+    nix::errno::Errno::set_raw(saved);
+}
+
+/// The owner's wake-up channel. SIGCHLD, for the workload, an exec helper
+/// or an adopted orphan exiting, and SIGTERM, for cancellation, each write
+/// a byte to it, so a loop sleeping in [`wait_for_any`] wakes at once.
+struct Wakeup {
+    receiver: UnixStream,
+    /// Kept open for the handlers, which write to its descriptor.
+    _sender: UnixStream,
+}
+
+impl Wakeup {
+    /// Open the channel and route SIGCHLD to it.
+    fn install() -> io::Result<Self> {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, sigaction};
+        use std::os::fd::AsRawFd;
+        let (receiver, sender) = UnixStream::pair()?;
+        receiver.set_nonblocking(true)?;
+        sender.set_nonblocking(true)?;
+        WAKE_SENDER.store(sender.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+        // A stopped or continued child changes nothing the loop acts on.
+        let action = SigAction::new(
+            SigHandler::Handler(wake),
+            SaFlags::SA_RESTART | SaFlags::SA_NOCLDSTOP,
+            SigSet::empty(),
+        );
+        // SAFETY: this pre-Tokio helper is single-threaded, and `wake` only
+        // makes async-signal-safe calls.
+        unsafe { sigaction(Signal::SIGCHLD, &action) }.map_err(io::Error::from)?;
+        Ok(Self {
+            receiver,
+            _sender: sender,
+        })
+    }
+
+    /// Read every pending wake-up byte.
+    fn clear(&self) {
+        let mut bytes = [0u8; 64];
+        while matches!((&self.receiver).read(&mut bytes), Ok(read) if read > 0) {}
+    }
+}
+
+/// Sleep until one of `sources` is readable (or hung up), or `timeout`
+/// passes. A signal that interrupts the wait counts as a wake-up.
+fn wait_for_any(sources: &[std::os::fd::BorrowedFd<'_>], timeout: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut polled: Vec<nix::libc::pollfd> = sources
+        .iter()
+        .map(|source| nix::libc::pollfd {
+            fd: source.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let milliseconds =
+        nix::libc::c_int::try_from(timeout.as_millis()).unwrap_or(nix::libc::c_int::MAX);
+    // SAFETY: `polled` is a live array of `polled.len()` initialised
+    // `pollfd`s, each naming a descriptor its borrow keeps open for the call.
+    let result = unsafe {
+        nix::libc::poll(
+            polled.as_mut_ptr(),
+            polled.len() as nix::libc::nfds_t,
+            milliseconds,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Wait for the execution gate to say whether its `exec` worked: silence
@@ -575,7 +707,6 @@ fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
 /// EOF, malformed activation or a mismatched durable child identity refuses
 /// before user code. The gate PID remains the workload PID across `exec`.
 pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
-    use std::os::fd::AsFd;
     // A close-on-exec copy of the owner's channel. A successful `exec`
     // closes it silently; a failure is written on it below (#905).
     let report = io::stdin()
@@ -794,6 +925,10 @@ fn respond(
     child: &OwnedChild,
     executions: &mut Vec<exec::Execution>,
 ) -> io::Result<()> {
+    // macOS hands out accepted sockets non-blocking, like the listener.
+    // The owner now accepts the moment a client connects, often before its
+    // request has arrived, so the read must wait for it, up to its timeout.
+    socket.set_nonblocking(false)?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     socket.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut bytes = Vec::new();
@@ -1109,6 +1244,7 @@ mod tests {
                         readonly: false,
                     },
                     process: OciProcess {
+                        no_new_privileges: false,
                         rlimits: Vec::new(),
                         args: vec!["true".into()],
                         env: vec![],
@@ -1121,6 +1257,9 @@ mod tests {
                     },
                     mounts: vec![],
                     linux: OciLinux {
+                        seccomp: None,
+                        masked_paths: Vec::new(),
+                        readonly_paths: Vec::new(),
                         namespaces: vec![],
                         resources: None,
                         cgroups_path: None,

@@ -93,7 +93,10 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   macOS runs on the newest train every night instead
   ([`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), maintainer
   decision of 24 November 2026). A group that changes
-  only documentation runs no code job: its code is its base's. When the
+  only documentation (plans, talks, research notes, the changelog; not the
+  book, the manual or anything else a test or relish reads,
+  [which jobs run](testing.md#which-jobs-a-pull-request-runs)) runs no code
+  job: its code is its base's. When the
   queue drops a group, `queue-sweep.yml` cancels its run
   ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
 - **The push to the train** runs nothing but CI policy when the queue's run
@@ -107,10 +110,29 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   freeze, label it `release-gate`: from then on it runs everything, and the
   evidence gate refuses it without every owner, macOS included. Merging it
   pushes to `main`, which runs everything again, and that run is the one the
-  candidate build reuses.
+  candidate build reuses. The gate PR is opened as a draft, and once it's
+  ready for review the evidence gate refuses it until it carries the
+  label, so it can't merge on the light set
+  ([#2483](https://github.com/reliaburger/reliaburger/issues/2483)).
 
 So nothing reaches a train without every Linux job having passed on that
-exact commit, and nothing reaches `main` without the full set. macOS runs on
+exact commit, and nothing reaches `main` without the full set. What enforces
+each half:
+
+- **The train**: ruleset 25015244 ("release trains merge queue") requires the
+  merge queue and the `ignored-test evidence` check on every named train.
+- **`main`**: `ignored-test evidence` is red on a ready gate PR without the
+  `release-gate` label, and on any run missing an owner its selection needs.
+  It blocks the merge only where a ruleset requires it: ruleset 13556416
+  ("protect main") must list `pull_request` and `required_status_checks`
+  for that check. Changing a ruleset is the maintainer's; until it lists
+  both, merging a red gate PR is possible and the rule above is a
+  convention, with `ci_reuse.py` as the backstop (a candidate never rests on
+  a run that skipped a job). Check what `main` enforces with:
+
+  ```
+  gh api repos/reliaburger/reliaburger/rules/branches/main --jq '[.[].type]'
+  ``` macOS runs on
 the push to `main` and on `main`'s nightly, on the newest train every night,
 on the release gate PR and on the candidate build, but not on ordinary pull
 requests or in the merge queue: the organisation's plan runs at most five
@@ -136,6 +158,18 @@ The qualification scripts install staged builds on the hosts in the matrix
 and never read a merge-queue run, so nothing there relied on the queue's
 macOS job.
 
+**A schedule-only workflow lives on `main`.** GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of
+the workflow only. `macos-nightly.yml`, `fuzz.yml` and `mutants.yml` pick
+the newest train themselves once they run, but a change to one of them takes
+effect only when it's on `main`: `macos-nightly.yml` sat on the 0.3.3 train
+for days, never ran, and couldn't be dispatched
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). So a new
+or changed schedule-only workflow goes to `main` in its own small PR, not
+with the train, and the train carries the same copy so the gate PR doesn't
+undo it. `open_train.py` refuses to open a train while the local tree has a
+schedule-only workflow `main` lacks.
+
 Drafts, and pull requests from a `0-4-0/` branch, run only select jobs, CI
 policy and lint until they're marked ready for review
 ([which jobs run](testing.md#which-jobs-a-pull-request-runs)).
@@ -158,7 +192,11 @@ python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z [--from re
 The dry run reads what it needs and prints every write it would make,
 including the ruleset's new body, and makes none. Without `--dry-run`, the
 script does the four steps in order and skips any that's already done, so
-running it again finishes what a failed run started:
+running it again finishes what a failed run started. Before step 1 it lists
+`main`'s workflows and stops if a schedule-only one in the local tree (only
+`schedule` or `workflow_dispatch` starts it) isn't there, naming it; the dry
+run names it and goes on
+([a schedule-only workflow lives on `main`](#merge-trains-and-their-ci)):
 
 1. **Create the branch** `release-X-Y-Z` from `--from`: the previous
    train's frozen tip, or `main` (the default) once the previous release is
@@ -344,6 +382,23 @@ candidate and new checksums; never replace an existing release's binaries.
 The compiler pin does not promise identical bytes across different linkers or
 host operating systems.
 
+### Third-party actions are pinned to a commit
+
+Every action outside `actions/*` is referenced by a full commit SHA with its
+tag in a trailing comment, `uses: Swatinem/rust-cache@<40 hex> # v2.9.3`
+(#2405). A tag is a pointer its owner can move, and `build-binaries` runs
+`rust-cache` and the toolchain action before it compiles what `candidate`
+signs and attests: a moved tag would give a truthfully signed release that
+isn't what the source says. `ActionPinTests` in
+`scripts/ci/test_ci_workflow.py` refuses an unpinned `uses:`.
+
+Dependabot's weekly "Actions" PR moves a pin and its comment together. The one
+exception is `dtolnay/rust-toolchain`, which Dependabot ignores: its commit is
+pinned the same way, and each step names the compiler in its `toolchain:`
+input (1.97.0 for the minimum-Rust job, 1.98.0 everywhere else). Move that
+commit by hand, with the compiler, under the policy above. First-party
+`actions/*` stay on tags.
+
 ## Release profile and binary size
 
 `[profile.release]` sets `strip = true` and `codegen-units = 1`. Release builds
@@ -383,6 +438,10 @@ packs it at level 19, which adds about 10 seconds to the release build. The
 build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
 exactly its commit.
+
+Bun decodes zstd image layers with the same `zstd` crate
+([#2465](https://github.com/reliaburger/reliaburger/issues/2465)), so the
+release targets must keep building it with `default-features = false`.
 
 From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
 ([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
@@ -850,6 +909,56 @@ running the applied image, and says so on stderr
 
 If a walk fails, a fresh cluster, as [from 0.2.0](#upgrading-from-020),
 still works.
+
+### Upgrading from 0.3.3
+
+0.3.4 can't roll onto a 0.3.2 or 0.3.3 cluster, which both speak protocol 61
+and state format 76. The council's snapshot chunks travel as base64 instead
+of a JSON array of numbers
+([#2367](https://github.com/reliaburger/reliaburger/issues/2367)), so nodes
+on either side of the change can't hand each other a snapshot; the full list
+is in `src/compatibility.rs`. The release makes one bump for all its audit
+fixes, at its first wire or state change: the protocol moved from 61 to 62
+and the state format from 76 to 77. Nodes refuse 61/76 peers and data
+directories, and a 0.3.3 leader refuses `relish upgrade start v0.3.4` before
+it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
+Six things to check before you start the fresh cluster:
+
+- **Node names.** `[node] name` must be one DNS label: 1 to 63 lowercase
+  letters, digits and `-`. Bun refuses to start otherwise, and
+  `relish join-token create` and `relish join` refuse such a name
+  ([#2394](https://github.com/reliaburger/reliaburger/issues/2394)). Rename
+  any node that breaks the rule.
+- **Joining.** `relish join` needs `--ca-fingerprint` (or
+  `--insecure-trust-first-ca`, which prints the offered fingerprint), and
+  writes `council.json` beside the node's identity. Keep the identity
+  directory whole when you move it: a node with no council seat takes Raft
+  replication only from the council that file names
+  ([#2397](https://github.com/reliaburger/reliaburger/issues/2397),
+  [#2410](https://github.com/reliaburger/reliaburger/issues/2410)).
+- **Self-upgrade.** `bun --compatibility` now prints the binary's version
+  too, which a 0.3.3 Bun can't read, so a 0.3.3 node can't stage a 0.3.4
+  binary with `relish upgrade` even apart from the format bump
+  ([#2403](https://github.com/reliaburger/reliaburger/issues/2403)).
+- **Process limits.** An image app's container and each sidecar now get a
+  limit of 4,096 processes and threads unless they set `pids` (up to
+  32,768). Set `pids` on any app or sidecar that runs more before you apply
+  it to the new cluster
+  ([#2386](https://github.com/reliaburger/reliaburger/issues/2386)).
+- **Set-uid binaries.** Rootful runc containers run with no-new-privileges
+  under Docker's default seccomp filter, so an image that starts as a
+  non-root user and relies on `sudo` or another set-uid binary must start as
+  root instead
+  ([#2402](https://github.com/reliaburger/reliaburger/issues/2402)).
+- **Council backups.** A backup's ciphertext is now stored as base64, and
+  `relish council recover --from` skips a backup written before 0.3.4.
+  Don't plan to carry state over through an old backup; take new ones once
+  the 0.3.4 cluster runs
+  ([#2452](https://github.com/reliaburger/reliaburger/issues/2452)).
 
 ## Signing identity
 
@@ -1642,8 +1751,16 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
-   Linux x86_64 and Linux arm64. From a checkout of the same `main`:
+3. **Qualify the staged install on Apple silicon**, twice. Before
+   promotion this is the only host the staged install runs on; it covers
+   `relish-macos-aarch64` and, inside the quickstart's VMs,
+   `bun-linux-aarch64`. The x86-64 pair is run by the candidate's own
+   `build.yml`: before uploading them, `build-binaries` starts each Linux
+   target's release `bun` with its `relish` and runs one app
+   ([`smoke-release-bun.sh`](../scripts/release/smoke-release-bun.sh),
+   [#2486](https://github.com/reliaburger/reliaburger/issues/2486)), so a
+   green build run is that check. The Linux cold installs come after
+   promotion (below). From a checkout of the same `main`:
 
    ```sh
    scripts/release/qualify-staged-install.sh \
@@ -1670,11 +1787,13 @@ the real `curl … | sh` install against it on every host we advertise.
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 
-   Run it at least twice per host for V04: once with nothing cached (the
-   script always starts empty) and again for repeatability.
+   Run it at least twice for V04: once with nothing cached (the script
+   always starts empty) and again for repeatability.
 
-   The Linux rows of V04 measure the published release on a clean host, once
-   it's promoted. `scripts/release/qualify-cold-install.sh --prepare` installs
+   The Linux rows of V04 measure the published release on a clean host,
+   after promotion, for every minor release; the closure record says whether
+   they ran, or why not, and names the build run whose release-bun step
+   passed. `scripts/release/qualify-cold-install.sh --prepare` installs
    QEMU and opens `/dev/kvm`, pipes `https://reliaburger.com/install.sh` to
    `bash -s -- --laptop --timings` in the real home, checks the cluster,
    destroys it, uninstalls, and diffs the host against how it started. Run it
@@ -2101,9 +2220,21 @@ the real `curl … | sh` install against it on every host we advertise.
    whether a release got slower, or why. The [0.2.3 host-job
    profile](qualification/2026-10-20-host-job-profile/README.md) found a
    GitOps loop burning a core and grants running in lockstep that no test or
-   soak had noticed. This step runs that profile on every release and
-   compares it with the previous one. The staging pre-release is gone by now,
-   so point it at the published release:
+   soak had noticed. This step runs that profile and compares it with the
+   last profiled release.
+
+   It runs on every minor release (`X.Y.0`), and on a patch release that
+   changes the job path or follows a throughput regression. The step said
+   "every release" until November 2026, and with releases two to four days
+   apart six of the eight releases after 0.2.4 went without one, so #2209
+   (0.3.1's jobs 22 to 28% slower than 0.2.8's) had no profile to answer it
+   until [0.3.3's](qualification/2026-11-28-v0.3.3-profile/README.md)
+   ([#2488](https://github.com/reliaburger/reliaburger/issues/2488)). The
+   closure record says which: the profile's record, or why there is none.
+   `the_newest_minor_release_has_a_profile_record` in
+   `tests/suite/website.rs` fails while the newest minor series in the
+   [release log](release-log.md) has no `-vX.Y.*-profile` record. The
+   staging pre-release is gone by now, so point it at the published release:
 
    ```sh
    scripts/release/qualify-profile.sh \
@@ -2114,7 +2245,8 @@ the real `curl … | sh` install against it on every host we advertise.
    It creates a disposable Lima VM `rb-profile-<random>` with the profile
    record's shape (VZ, 4 vCPUs, 8 GiB, 60 GiB, `template:ubuntu-24.04`),
    and installs two versions in it: the candidate, and the previous release
-   (the patch number one lower; `--previous vX.Y.Z` names another). Every
+   (by default the patch number one lower; name the last profiled release
+   with `--previous vX.Y.Z`, which a `.0` release must). Every
    binary is checked against its `candidate.json`. Rates come from those
    release binaries, unchanged. Attribution comes from each version's
    profiling build: `build.yml` builds `bun` and `relish` for Linux arm64
@@ -2252,11 +2384,26 @@ the real `curl … | sh` install against it on every host we advertise.
     fixed. `scripts/ci/test_features_page.py` fails while the TOML names a
     release other than the bootstrap's default.
 
+    Don't leave those rows for after the release. At code freeze, run
+    `python3 scripts/ci/features_page.py check-issues` and
+    `python3 scripts/ci/features_page.py check-closing N...` with the gate
+    PR's `Fixes` numbers, and update every row that links an issue the gate
+    closes on the train before the gate PR merges: `features.yml`'s
+    `closing` job refuses the gate PR otherwise. A row fix after the release
+    goes to main directly, not to the next train
+    ([#2492](https://github.com/reliaburger/reliaburger/issues/2492)).
+
     Add the release's paragraph to the top of the
     [release log](release-log.md): the promotion date, how long qualifying it
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+
+    For a minor release, revisit the coverage floor: read the line coverage
+    of the release commit's last green `portable Linux` run (the `coverage`
+    artefact's `lcov.info`; [how](design/test-harness.md#benchmarks-and-coverage)), and when
+    it sits more than about a point above `COVERAGE_MIN_LINES`, raise the floor
+    to the figure minus one point. Never lower it.
     `scripts/ci/test_changelog.py` fails while a release in the log has no
     dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 

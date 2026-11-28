@@ -356,6 +356,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Get, "/v1/metrics/keys", AnyToken, Cluster(METRICS)),
     gated(Get, "/v1/metrics/rollup", AnyToken, Cluster(METRICS)),
     gated(Get, "/v1/metrics/rollup/owned", AnyToken, Cluster(METRICS)),
+    gated(
+        Get,
+        "/v1/metrics/rollup/reporters",
+        AnyToken,
+        Cluster(METRICS),
+    ),
     gated(Get, "/v1/metrics/cluster", AnyToken, Cluster(METRICS)),
     gated(
         Get,

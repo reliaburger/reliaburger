@@ -286,13 +286,66 @@ pub struct Compatibility {
 /// after the apply's stream has answered `200`, so `relish apply` on a
 /// cluster reports an image nobody built as `404`, not `500` (#2157).
 ///
+/// 0.3.4, audit fixes (62/77): one bump for the whole release, made by its
+/// first wire or state change. Each later 0.3.4 change adds its line below
+/// this one.
+/// `RaftRpc::InstallSnapshot` carries its chunk's `data` as a base64
+/// string, not a JSON array of numbers (`snapshot_chunk_wire` in
+/// `src/council/network.rs`), so nodes on either side of the change can't
+/// exchange snapshots (#2367).
+/// `JoinBundle` carries `council`, the expected council's voters and their
+/// Raft addresses, and `RaftRpcResponse::CouncilVoters` names each voter
+/// with its address (`CouncilNodeInfo`), not just its name. A node keeps the
+/// expected council in a new `council.json` in its identity directory and,
+/// with no council seat, takes Raft replication only from that council
+/// (#2397).
+/// The state machine admits a `SchedulingDecisions` pass of a single
+/// decision whatever its placement count, where 0.3.3 refused one above
+/// 131,072 placements, so the two would apply the same entry differently
+/// (#2366).
+/// `NodeRollup` carries a `part` number, so a minute too large for one
+/// report frame goes out in parts and the council's rollup dedup key is
+/// `(node, window, part)` (#2426).
+/// `RaftRequest::PublishEndpoints` carries `EndpointChanges`, only the
+/// services that changed and the ones removed, instead of the whole endpoint
+/// catalogue, so an old node can't read a new log entry and a new node
+/// refuses an old log (#2438).
+/// A council backup's `SealedBackup.ciphertext` is one base64 string, not a
+/// JSON array of numbers; `BACKUP_ENVELOPE_VERSION` follows `CURRENT.state`,
+/// so a backup written before 0.3.4 doesn't restore (#2452).
+/// `ArrayAssignment` carries `template_known` and `ArrayProgress`
+/// `template_unknown`, so the leader sends a run's template to a node once;
+/// empty `template`, `program`, `args`, `env` and `held` are no longer
+/// serialised, and an older node would read a template-less assignment as a
+/// host job with an empty binary (#2444).
+/// `AppSpec` and `SidecarSpec` carry `pids`, a process and thread limit, and
+/// refuse unknown fields, so the app spec on the wire and in the replicated
+/// desired state changes (#2386).
+/// An `ArrayAssignment` that carries a `template` no longer carries
+/// `program`, `args` or `env`; the node derives them from the template, so
+/// an older node would read the run as a host job with an empty binary
+/// (#2532).
+/// `SecurityView`, the body of `/v1/cluster/security-view`, carries a
+/// required `permissions` map, the leader's `[permission]` blocks, so a node
+/// with no Raft seat can enforce them; old and new nodes can't read each
+/// other's view (#2538).
+/// Jobs keep their declared spec for the policy audit:
+/// `JobDefinition::declared_image`, `DeploymentRecord::declared_images` and
+/// the `declared_images` on `TaskArrayWrite::RegisterJobs` and `DeployBegin`
+/// are new. `JobDefinition` and `DeploymentRecord` refuse unknown fields, so
+/// an older replica can't read them (#1322).
+/// Gossip `Sync` carries the sender's member count, so joiners get pages of
+/// the table (#2442).
+/// The gossip directory extension carries the leader hint's age, so a hint
+/// nobody re-advertises expires (#2406).
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 61,
-    state: 76,
+    protocol: 62,
+    state: 77,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -603,6 +656,28 @@ mod tests {
             ensure_state_compatible(directory.path()),
             Err(CompatibilityError::StateMismatch { found, expected, .. })
                 if found == BEFORE_APPLIANCE.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    /// 0.3.2's and 0.3.3's generation, which 0.3.4's audit fixes left
+    /// behind (#2367's snapshot chunks, among others).
+    const BEFORE_AUDIT_FIXES: Compatibility = Compatibility {
+        protocol: 61,
+        state: 76,
+    };
+
+    #[test]
+    fn peers_and_state_from_0_3_3_are_refused() {
+        assert!(BEFORE_AUDIT_FIXES.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_AUDIT_FIXES.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_AUDIT_FIXES.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }

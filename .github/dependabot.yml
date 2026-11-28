@@ -44,9 +44,13 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
-    # The toolchain action's tag is the compiler pin (1.97.0 for the MSRV
-    # job, 1.98.0 for release builds). Moving it is a policy change with its
-    # own requalification ("Compiler baseline" in docs/releasing.md).
+    # Every third-party action is pinned to a commit with its tag in a
+    # trailing comment (#2405); Dependabot moves the SHA and the comment
+    # together. The toolchain action is left out: its `toolchain:` input is
+    # the compiler pin (1.97.0 for the MSRV job, 1.98.0 for everything
+    # else), and moving the compiler is a policy change with its own
+    # requalification ("Compiler baseline" in docs/releasing.md). Its commit
+    # moves by hand, with the compiler.
     ignore:
       - dependency-name: dtolnay/rust-toolchain
       - dependency-name: "*"

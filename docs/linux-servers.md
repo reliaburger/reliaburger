@@ -72,7 +72,13 @@ Ensure the following ports are open:
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
 cluster members can reach the container host ports, and only they and the
-`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports.
+It closes the whole `10000`-`32767` range, not just the ports Bun hands out, so
+move `[network] port_range` if another service on the node listens inside it;
+Bun warns about each one it finds at start-up. A graceful stop that stops
+every workload removes the perimeter again; otherwise
+`sudo nft delete table ip reliaburger_fw` and
+`sudo nft delete table ip6 reliaburger_fw` remove it by hand. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
@@ -92,6 +98,12 @@ chain's policy to `DROP`. Bun enables IPv4 forwarding but doesn't override
 another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
+
+Containers on a node get addresses from a `/23` inside `10.0.0.0/8`. Bun
+picks it the first time it starts containers, passing over any `/23` that
+overlaps a network the host is on, and keeps it from then on, so renaming a
+host doesn't strand its containers. Container addresses never leave their
+node.
 
 Bun's own check for published container ports is a forward-hook chain at
 priority -10 in its `reliaburger_fw` table. nftables runs every table's chain
@@ -165,6 +177,24 @@ from a repository checkout, the same build the release uses. Then install
 sudo install -d -m 0700 /etc/reliaburger /etc/reliaburger/identity
 sudo install -d -m 0755 /var/lib/reliaburger
 ```
+
+`/var/lib/reliaburger` stays world-traversable on purpose; the directories
+inside it that hold container files don't. Every container on a node maps its
+ids onto one host range starting at uid 2,000,000,000, and unpacked images,
+container writable layers and managed volumes are owned by that range, set-uid
+binaries included. A local user who could reach one of those binaries could
+run it as the range's root, the owner of every container's files. So Bun
+makes the unpacked image store (`images/rootfs`), the bundle directory and
+the volumes directory mode `0710`, owned by root with group 2,000,000,000:
+container root, which is how runc gets through, and nobody else. A loop-mounted
+volume (one with a `size`) is mounted `nosuid,nodev`. Bun tightens these
+directories when it next uses them, so a node upgraded from 0.3.3, where they
+were `0755` and `0711`, needs nothing done by hand.
+
+This only matters on a node with unprivileged local accounts: a jump host, a
+CI runner's user, a shared lab machine. The appliance image has none. If yours
+does, also keep that group out of your directory service: no real user should
+have gid 2,000,000,000.
 
 ---
 
@@ -928,7 +958,7 @@ names any node that's missing it.
 | List one app's instances | `relish apps hello` |
 | View cluster membership | `relish nodes` |
 | View Raft council status | `relish council` |
-| Inspect app or node details | `relish inspect <app-or-node>` |
+| List an app's instances on every node | `relish inspect <app>` |
 | Stream application logs | `relish logs <app>` |
 | Apply application configuration | `relish apply <file.toml>` |
 | Stop an application | `relish stop <app>` |

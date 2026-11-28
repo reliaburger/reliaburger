@@ -8,7 +8,7 @@ Reliaburger keeps reconciling application placement after deployment, with metri
 
 ## The verdict
 
-**Which Reliaburger.** Installation examples and capability comparisons both describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. Its node-by-node rollouts and `RolloutFailed` handling arrived in 0.2.1. [Deployment contract](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/01_deploy-an-app.md#rolling-deploys) · [Compatibility policy](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/releasing.md#compatibility-before-100).
+**Which Reliaburger.** Installation examples and capability comparisons both describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), re-checked on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Its node-by-node rollouts and `RolloutFailed` handling arrived in 0.2.1. [Deployment contract](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/01_deploy-an-app.md#rolling-deploys) · [Compatibility policy](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/releasing.md#compatibility-before-100).
 
 ### Where Reliaburger leads
 
@@ -123,7 +123,7 @@ Both projects use Apache-2.0. [Uncloud licence](https://github.com/psviderski/un
 
 ## Evidence and limits
 
-Uncloud citations are pinned to [v0.21.0](https://github.com/psviderski/uncloud/tree/v0.21.0); Reliaburger citations to the [v0.2.2](https://github.com/reliaburger/reliaburger/tree/v0.2.2/) tag, the release the installer installs, re-checked on 21 October 2026. We prioritised the versioned deployment guide and code over the older README sentence saying automatic rollback was still forthcoming.
+Uncloud citations are pinned to [v0.21.0](https://github.com/psviderski/uncloud/tree/v0.21.0); Reliaburger citations to the [v0.2.2](https://github.com/reliaburger/reliaburger/tree/v0.2.2/) tag, re-checked on 21 October 2026. We prioritised the versioned deployment guide and code over the older README sentence saying automatic rollback was still forthcoming.
 
 This is a documentation and source comparison. No matched performance, outage-recovery or penetration test was run. A WireGuard mesh is a connectivity mechanism, not evidence by itself of tenant isolation; a rolling deployment feature is not proof that every stateful application can update without downtime. See the [shared review method](https://reliaburger.com/compare/methodology#method).
 

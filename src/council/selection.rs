@@ -479,6 +479,12 @@ pub struct CouncilObservation<'a> {
 ///   seat in one change, so quorum never depends on the dead node's vote;
 /// - applies hysteresis: eviction requires `dead_window` of continuous
 ///   death, candidacy requires `candidate_alive_window` of continuous life.
+/// - an even council that must shrink sheds, in order: a voter dead past
+///   `dead_window`, a voter under disk pressure, any other voter that is
+///   down (dead inside the window, suspect or unseen), and only then the
+///   highest-numbered live voter that isn't the leader (#2374). Shrinking
+///   removes a seat either way, so it never keeps a down voter over a live
+///   one; that is the one place the hysteresis rule above gives way.
 ///
 /// When the leader itself must leave (disk pressure, T3), a leadership
 /// transfer action will hang off this seam; openraft 0.9 has no graceful
@@ -581,10 +587,22 @@ pub fn plan_council_action(
                 return CouncilAction::Promote(*id);
             }
         } else {
+            // A voter that is down but still inside `dead_window` goes
+            // before a live one (#2374): the council loses a seat either
+            // way, and keeping the down voter would leave it one failure
+            // from losing quorum. If the node comes back, it rejoins as a
+            // learner and is promoted the normal way.
             let leaving = dead_voters
                 .first()
                 .or(pressured_voters.first())
                 .copied()
+                .or_else(|| {
+                    voters
+                        .iter()
+                        .copied()
+                        .rev()
+                        .find(|id| *id != leader_id && !alive(*id))
+                })
                 .or_else(|| voters.iter().copied().rev().find(|id| *id != leader_id));
             if let Some(id) = leaving {
                 let action = CouncilAction::RemoveVoter(id);
@@ -1726,6 +1744,35 @@ mod tests {
     /// D12: an even council (left by an older release or a decommission)
     /// returns to odd: up by one when a caught-up learner and the live
     /// nodes allow it, otherwise down by one, a dead voter first.
+    /// #2374: an even council that must shrink sheds a voter that is down,
+    /// even one inside `dead_window` or only suspect, before a live one.
+    /// Shedding the live one would leave three voters with one of them
+    /// down, one failure from losing quorum.
+    #[test]
+    fn an_even_council_sheds_a_voter_that_is_down_before_a_live_one() {
+        let now = Instant::now();
+        let even_four = || {
+            let mut fixture = healthy_three(now);
+            fixture.voters.insert(4);
+            fixture.replication.insert(4, Some(100));
+            fixture.candidates.clear();
+            fixture.health.remove(&5);
+            fixture
+        };
+        let mut just_died = even_four();
+        just_died.health.insert(2, dead_for(now, 10));
+        let mut suspect = even_four();
+        suspect.health.insert(2, MemberHealth::Suspect);
+        let mut unseen = even_four();
+        unseen.health.remove(&2);
+        for fixture in [just_died, suspect, unseen] {
+            assert_eq!(
+                fixture.plan(&roomy_config(), now),
+                CouncilAction::RemoveVoter(2)
+            );
+        }
+    }
+
     #[test]
     fn even_council_after_eviction_returns_to_odd() {
         let now = Instant::now();

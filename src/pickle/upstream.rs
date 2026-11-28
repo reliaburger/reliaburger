@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::grill::image::{ImageMirrors, ImageReference};
 use crate::grill::oci_pull::{
-    LAYER_READ, METADATA_READ, VerifiedImageManifest, VerifiedRoot,
+    BUFFERED_BLOB_READ, METADATA_READ, VerifiedImageManifest, VerifiedRoot,
     pull_verified_manifest_for_architecture, pull_verified_root, retry_registry_read,
 };
 
@@ -150,12 +150,28 @@ pub trait UpstreamRegistry: Send + Sync {
     /// config blob, or an index with its runnable platform manifests.
     fn fetch_root<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, UpstreamRoot>;
 
-    /// One layer blob, digest-verified by the caller's blob store.
+    /// One small blob read into memory: a cosign signature, a test fixture.
+    /// Image layers go through [`Self::store_blob`] instead, which never holds
+    /// a layer in memory (#2424).
     fn fetch_blob<'a>(
         &'a self,
         image: &'a ImageReference,
         layer: &'a LayerDescriptor,
     ) -> UpstreamFuture<'a, Vec<u8>>;
+
+    /// One layer blob, written into `store` and published there only once
+    /// its digest and size match `layer`.
+    fn store_blob<'a>(
+        &'a self,
+        image: &'a ImageReference,
+        layer: &'a LayerDescriptor,
+        store: &'a super::store::BlobStore,
+    ) -> UpstreamFuture<'a, ()> {
+        Box::pin(async move {
+            let bytes = self.fetch_blob(image, layer).await?;
+            store.write_blob_async(bytes, layer.digest.clone()).await
+        })
+    }
 }
 
 /// Per-host credentials for upstream registries, resolved once at
@@ -366,6 +382,23 @@ impl UpstreamRegistry for OciUpstream {
             self.fetch_blob_from(image, layer).await
         })
     }
+
+    fn store_blob<'a>(
+        &'a self,
+        image: &'a ImageReference,
+        layer: &'a LayerDescriptor,
+        store: &'a super::store::BlobStore,
+    ) -> UpstreamFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(mirror) = self.mirrors.mirror_for(image) {
+                match self.store_blob_from(&mirror, layer, store).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => report_mirror_failure(image, &mirror, &error),
+                }
+            }
+            self.store_blob_from(image, layer, store).await
+        })
+    }
 }
 
 fn report_mirror_failure(image: &ImageReference, mirror: &ImageReference, error: &PickleError) {
@@ -493,31 +526,49 @@ fn upstream_manifest(verified: VerifiedImageManifest) -> Result<UpstreamManifest
     })
 }
 
+/// The largest blob [`UpstreamRegistry::fetch_blob`] reads into memory.
+/// Signatures are a few kilobytes; layers go to a blob store instead.
+pub const MAX_BUFFERED_BLOB: u64 = 64 << 20;
+
 impl OciUpstream {
-    /// Read one layer from `image`'s registry, checking its advertised size.
-    async fn fetch_blob_from(
-        &self,
-        image: &ImageReference,
+    /// The registry descriptor for `layer`, refusing a size OCI can't express.
+    fn descriptor(
         layer: &LayerDescriptor,
-    ) -> Result<Vec<u8>, PickleError> {
-        let reference = Self::oci_reference(image)?;
+    ) -> Result<oci_client::manifest::OciDescriptor, PickleError> {
         let size = i64::try_from(layer.size).map_err(|_| {
             PickleError::ReplicationFailed(format!(
                 "upstream layer size is out of range for {}",
                 layer.digest
             ))
         })?;
-        let descriptor = oci_client::manifest::OciDescriptor {
+        Ok(oci_client::manifest::OciDescriptor {
             digest: layer.digest.as_str().to_string(),
             media_type: layer.media_type.clone(),
             size,
             ..Default::default()
-        };
+        })
+    }
+
+    /// Read one small blob from `image`'s registry into memory, checking its
+    /// advertised size, which may be at most [`MAX_BUFFERED_BLOB`].
+    async fn fetch_blob_from(
+        &self,
+        image: &ImageReference,
+        layer: &LayerDescriptor,
+    ) -> Result<Vec<u8>, PickleError> {
+        let reference = Self::oci_reference(image)?;
+        let descriptor = Self::descriptor(layer)?;
+        if layer.size > MAX_BUFFERED_BLOB {
+            return Err(PickleError::ReplicationFailed(format!(
+                "upstream blob {} is {} bytes, more than the {MAX_BUFFERED_BLOB} read into memory",
+                layer.digest, layer.size
+            )));
+        }
         let client = self.client()?;
-        let bytes = retry_registry_read(LAYER_READ, || async {
+        let bytes = retry_registry_read(BUFFERED_BLOB_READ, || async {
             // Each attempt owns an empty buffer; partial responses cannot leak
-            // into the next attempt. Metadata is not an allocation budget.
-            let mut bytes = Vec::new();
+            // into the next attempt. The size was bounded above.
+            let mut bytes = Vec::with_capacity(layer.size as usize);
             client
                 .pull_blob(&reference, &descriptor, &mut bytes)
                 .await?;
@@ -536,6 +587,24 @@ impl OciUpstream {
             )));
         }
         Ok(bytes)
+    }
+
+    /// Stream one layer from `image`'s registry into `store` (#2424).
+    async fn store_blob_from(
+        &self,
+        image: &ImageReference,
+        layer: &LayerDescriptor,
+        store: &super::store::BlobStore,
+    ) -> Result<(), PickleError> {
+        let reference = Self::oci_reference(image)?;
+        let descriptor = Self::descriptor(layer)?;
+        let client = self.client()?;
+        crate::grill::oci_pull::pull_layer_to_store(client, &reference, &descriptor, store)
+            .await
+            .map_err(|error| match error {
+                crate::grill::oci_pull::LayerPullError::Store(error) => error,
+                other => PickleError::ReplicationFailed(format!("upstream {other}")),
+            })
     }
 }
 

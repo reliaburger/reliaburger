@@ -25,7 +25,9 @@ rule it applies is here and tested (scripts/release/test_power_cut_endurance.py)
   summary --evidence DIR                           summary.json from run.json and cuts.jsonl;
                                                    "aborted" unless every cut made was recorded
 
-Every invariant check prints a JSON object with a `pass` field. The numbering
+Every invariant check prints a JSON object with a `pass` field: true, false,
+or null when it couldn't judge (an unreachable writer), which `record` lists
+as undecided rather than as a violation. The numbering
 (I1, I2, I4, I6, I7) is the plan's,
 docs/plans/2026-11-18-plan-power-cut-endurance.md.
 """
@@ -124,7 +126,8 @@ def seq_check(text, acked_value):
             fields[parts[0]] = parts[1] if len(parts) > 1 else ""
     result = {"acked": acked_value}
     if "MAX" not in fields or "LAST" not in fields:
-        return {**result, "pass": False, "reason": "no sequence summary (the writer wasn't reachable)"}
+        # Nothing was read, so nothing is judged: undecided, not lost data (#2542).
+        return {**result, "pass": None, "reason": "no sequence summary (the writer wasn't reachable)"}
     maximum, last = int(fields["MAX"]), int(fields["LAST"])
     result.update({"max": maximum, "lines": last})
     for problem in ("BAD", "DUP", "MISSING"):
@@ -302,12 +305,23 @@ def timing_check(recovery):
     return {**result, "pass": True}
 
 
+def undecided(result):
+    """Whether a check said it couldn't judge (`"pass": null`), rather than pass or fail."""
+    return "pass" in result and result["pass"] is None
+
+
 def judge(cut, detail, invariants):
-    """One cut's line for cuts.jsonl: the detail, every invariant's result and the violations."""
+    """One cut's line for cuts.jsonl: the detail, every invariant's result, the violations
+    and the checks that couldn't judge (an unreachable writer, #2542).
+
+    A result with no `pass` at all is a violation: only an explicit null is undecided.
+    """
     invariants = dict(invariants)
     invariants["I6"] = timing_check(detail.get("recovery", {}))
-    violations = sorted(name for name, result in invariants.items() if not result.get("pass"))
-    return {"cut": cut, **detail, "invariants": invariants, "violations": violations}
+    violations = sorted(name for name, result in invariants.items()
+                        if not result.get("pass") and not undecided(result))
+    unjudged = sorted(name for name, result in invariants.items() if undecided(result))
+    return {"cut": cut, **detail, "invariants": invariants, "violations": violations, "undecided": unjudged}
 
 
 def bound95(cuts):
@@ -329,7 +343,8 @@ def summarise(run, lines, unreadable=0):
     The run is aborted, not passed, when the harness stopped early (run.json's
     `aborted`), when a cut it made (`cuts_started`) has no line in cuts.jsonl,
     or when UNREADABLE lines of it couldn't be parsed. A violation still
-    fails it.
+    fails it. A cut with an undecided check and no violation is listed, and
+    left out of the bound: it proved nothing either way (#2542).
     """
     topologies = {}
     retries = forwarder = 0
@@ -337,7 +352,8 @@ def summarise(run, lines, unreadable=0):
     port_taken = [line.get("cut") for line in lines if "host port taken" in line.get("environment", [])]
     for line in lines:
         topology = topologies.setdefault(str(line.get("topology", "1")), {
-            "cuts": 0, "violations": 0, "by_kind": {}, "api": [], "settled": [], "violated": [], "extra": 0})
+            "cuts": 0, "violations": 0, "by_kind": {}, "api": [], "settled": [], "violated": [], "extra": 0,
+            "undecided": []})
         topology["cuts"] += 1
         topology["extra"] += line.get("extra_power_offs", 0)
         topology["by_kind"][line.get("kind", "site")] = topology["by_kind"].get(line.get("kind", "site"), 0) + 1
@@ -351,6 +367,8 @@ def summarise(run, lines, unreadable=0):
         if line.get("violations"):
             topology["violations"] += 1
             topology["violated"].append({"cut": line["cut"], "violations": line["violations"]})
+        elif line.get("undecided"):
+            topology["undecided"].append({"cut": line["cut"], "undecided": line["undecided"]})
     result = {}
     for name, topology in sorted(topologies.items()):
         result[name] = {
@@ -359,7 +377,8 @@ def summarise(run, lines, unreadable=0):
             # spinning forwarder): power cuts too, judged with the cut's own.
             "extra_power_offs": topology["extra"],
             "violations": topology["violations"],
-            "bound95": bound95(topology["cuts"]) if topology["violations"] == 0 else None,
+            "bound95": bound95(topology["cuts"] - len(topology["undecided"])) if topology["violations"] == 0 else None,
+            "undecided_cuts": topology["undecided"],
             "by_kind": topology["by_kind"],
             "api_seconds": {"p50": percentile(topology["api"], 0.5), "p95": percentile(topology["api"], 0.95),
                             "max": max(topology["api"], default=None)},
@@ -370,6 +389,7 @@ def summarise(run, lines, unreadable=0):
         }
     cuts = sum(t["cuts"] for t in result.values())
     violations = sum(t["violations"] for t in result.values())
+    unjudged = sum(len(t["undecided_cuts"]) for t in result.values())
     aborted = run.get("aborted") or None
     if aborted is None and unreadable:
         aborted = f"{unreadable} unreadable lines in cuts.jsonl"
@@ -388,9 +408,9 @@ def summarise(run, lines, unreadable=0):
         **{key: run.get(key) for key in ("release", "relish", "bun", "host", "hypervisor", "tier", "seed",
                                          "started", "ended", "paused_seconds")},
         "topologies": result,
-        "pooled": {"cuts": cuts, "violations": violations,
+        "pooled": {"cuts": cuts, "violations": violations, "undecided": unjudged,
                    "power_offs": cuts + sum(t["extra_power_offs"] for t in result.values()),
-                   "bound95": bound95(cuts) if violations == 0 and not aborted else None},
+                   "bound95": bound95(cuts - unjudged) if violations == 0 and not aborted else None},
         "environment_events": {"vz_start_retries": retries, "lima_forwarder_retries": forwarder,
                                "restarts_between_cuts": between,
                                "host_port_taken": port_taken},
@@ -572,8 +592,9 @@ def parse_want(text):
 
 
 def emit(result):
+    """Print a check's result; non-zero only when it failed (undecided is not a failure)."""
     print(json.dumps(result))
-    return 0 if result.get("pass", True) else 1
+    return 0 if result.get("pass", True) or undecided(result) else 1
 
 
 def main(argv):

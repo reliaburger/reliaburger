@@ -2026,7 +2026,7 @@ async fn follower_of_a_recording_leader(
 /// own deploy records.
 async fn follower_with_history_of_a_recording_leader(
     token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
 ) -> (
     Router,
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
@@ -2095,7 +2095,7 @@ async fn three_council_nodes() -> Vec<Arc<crate::council::CouncilNode>> {
 /// shut down.
 async fn follower_of_the_leader_api_on(
     token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     leader_port: u16,
 ) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
     let nodes = three_council_nodes().await;
@@ -2249,10 +2249,11 @@ async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target
         )),
         ..sample_history_entry(image)
     };
-    let history = Arc::new(RwLock::new(vec![
-        deployed(1, "nginx:1.26"),
-        deployed(2, "nginx:1.27"),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![deployed(1, "nginx:1.26"), deployed(2, "nginx:1.27")]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (follower, seen, nodes) =
         follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
 
@@ -2320,6 +2321,62 @@ async fn a_follower_forwards_a_scale_to_the_leader_with_its_body() {
         assert!(marked);
         assert_eq!(forwarded, body);
     }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A scale's progress stream ends once the token that started it expires,
+/// as apply's and rollback's do (#2399), with the farewell that says the
+/// scale carries on (#2526). The leader here streams for ever, so only the
+/// credential check can end the follower's answer.
+#[tokio::test]
+async fn a_scale_progress_stream_ends_once_its_token_expires() {
+    let created = crate::sesame::token::create_token(
+        "brief",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() + std::time::Duration::from_secs(2)),
+    )
+    .unwrap();
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let leader = axum::Router::new().fallback(|| async {
+        let first = futures_util::stream::once(async {
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .data(r#"{"type":"progress","message":"web: committed"}"#),
+            )
+        });
+        Sse::new(first.chain(futures_util::stream::pending())).into_response()
+    });
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) =
+        follower_of_the_leader_api_on(created.token.clone(), None, leader_port).await;
+
+    let request = axum::http::Request::post("/v1/scale/web/default")
+        .header("authorization", format!("Bearer {}", created.plaintext))
+        .extension(axum::extract::ConnectInfo(
+            "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(Body::from(r#"{"replicas":3}"#))
+        .unwrap();
+    let response = follower.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("the scale stream outlived its expired token")
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("web: committed"), "{text}");
+    assert!(
+        text.contains(crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE),
+        "{text}"
+    );
     for node in nodes {
         node.shutdown().await.unwrap();
     }
@@ -3176,7 +3233,7 @@ async fn a_settled_leader_rotates_the_signing_key_after_a_missed_heartbeat_round
     assert_eq!(status, StatusCode::OK, "rotate: {reply}");
     let rotated = nodes[0].security_state().await;
     assert_ne!(
-        rotated.oidc_signing_config.unwrap().key_id,
+        rotated.oidc_signing_config.as_ref().unwrap().key_id,
         old.key_id,
         "the signing key didn't change"
     );
@@ -3872,6 +3929,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     let mut catalog = EndpointCatalog::default();
     let mut originals = Vec::new();
     for generation in 1..=3_u64 {
+        let previous = catalog.clone();
         catalog = catalog
             .reconcile([(
                 ServiceId::new("default", "web"),
@@ -3892,7 +3950,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
             council
                 .write(RaftRequest::PublishEndpoints {
                     expected_generation: generation - 1,
-                    catalog: Box::new(catalog.clone()),
+                    changes: Box::new(previous.changes_to(&catalog)),
                 })
                 .await
                 .unwrap(),
@@ -3970,7 +4028,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation: 3,
-                catalog: Box::new(EndpointCatalog::default()),
+                changes: Box::new(catalog.changes_to(&EndpointCatalog::default())),
             })
             .await
             .unwrap(),
@@ -5315,7 +5373,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
         keys
     };
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 0, true),
@@ -5334,7 +5392,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 1, false),
@@ -6637,7 +6695,7 @@ fn sample_history_entry(image: &str) -> DeployHistoryEntry {
 /// Router with a seeded deploy history and no token store, so the
 /// namespace filter can be checked without an auth layer in the way.
 async fn setup_with_deploy_history(
-    history: Arc<RwLock<Vec<DeployHistoryEntry>>>,
+    history: Arc<RwLock<crate::bun::agent::DeployHistory>>,
 ) -> (Router, CancellationToken) {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
@@ -7264,6 +7322,344 @@ async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
     (status, bytes.to_vec())
 }
 
+/// A router over `store` whose agent names every app as its own log
+/// selection, so the log query routes reach the store (#2382).
+fn log_router_over(store: crate::ketchup::log_store::LogStore) -> Router {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            if let AgentCommand::ResolveExecutionLogs {
+                app_name,
+                instance,
+                response,
+                ..
+            } = command
+            {
+                let _ = response.send(Ok(crate::bun::agent::LogExecutionSelection {
+                    logical_name: app_name,
+                    instances: Vec::new(),
+                    selected_instance: instance,
+                }));
+            }
+        }
+    });
+    router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    )
+}
+
+/// A log store holding `lines` lines of `web` in `default`, unflushed.
+fn log_store_with_lines(lines: usize) -> (crate::ketchup::log_store::LogStore, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::ketchup::log_store::LogStore::new(dir.path().to_path_buf());
+    for _ in 0..lines {
+        store.append(
+            "web",
+            "default",
+            crate::ketchup::types::LogStream::Stdout,
+            "x",
+        );
+    }
+    (store, dir)
+}
+
+/// #2382: a tail far above the maximum (here `u64::MAX`) is clamped to it,
+/// never handed to the query engine as asked.
+#[tokio::test]
+async fn a_tail_above_the_maximum_is_refused_or_clamped() {
+    use crate::ketchup::log_store::MAX_LOG_QUERY_ROWS;
+    let (store, _dir) = log_store_with_lines(MAX_LOG_QUERY_ROWS + 5);
+    let app = log_router_over(store);
+    let (status, body) = get_bytes(
+        app,
+        "/v1/logs/entries/web/default?tail=18446744073709551615",
+    )
+    .await;
+    if status == StatusCode::BAD_REQUEST {
+        return;
+    }
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let entries: Vec<LogEntry> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.len(), MAX_LOG_QUERY_ROWS);
+}
+
+/// #2382: `relish logs` with no `--tail` gets the newest lines up to the
+/// default cap, and a warning saying the answer was cut.
+#[tokio::test]
+async fn a_log_query_cut_at_the_default_cap_says_so() {
+    use crate::ketchup::log_store::DEFAULT_LOG_QUERY_ROWS;
+    let (store, _dir) = log_store_with_lines(DEFAULT_LOG_QUERY_ROWS + 5);
+    let app = log_router_over(store);
+    let (status, body) = get_bytes(app.clone(), "/v1/logs/query/web/default").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: LogQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.entries.len(), DEFAULT_LOG_QUERY_ROWS);
+    assert_eq!(
+        result.warnings,
+        [LogQueryWarning::Truncated {
+            limit: DEFAULT_LOG_QUERY_ROWS
+        }]
+    );
+
+    // An explicit tail the answer fits is not a cut.
+    let (_, body) = get_bytes(app, "/v1/logs/query/web/default?tail=10").await;
+    let result: LogQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.entries.len(), 10);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+}
+
+/// #2449: the metrics handlers held the store's read guard through their
+/// queries, so one slow dashboard request stalled the collector's write and
+/// every read queued behind it. A write now goes through while a metrics
+/// query runs.
+#[tokio::test]
+async fn the_metrics_query_handler_releases_the_store_before_it_queries() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::mayo::store::MayoStore::new(dir.path().to_path_buf());
+    store.insert(
+        &crate::mayo::types::MetricKey::simple("cpu"),
+        crate::mayo::types::Sample::at(1, 1.0),
+    );
+    let gate = Arc::new(crate::mayo::store::QueryGate::default());
+    store.set_query_gate(Arc::clone(&gate));
+    let mayo = Arc::new(RwLock::new(store));
+    let app = router(
+        cmd_tx,
+        Some(Arc::clone(&mayo)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let request = tokio::spawn(get_bytes(app, "/v1/metrics?name=cpu"));
+    gate.entered.notified().await;
+    let write = tokio::time::timeout(std::time::Duration::from_millis(200), mayo.write()).await;
+    assert!(write.is_ok(), "a write waited for the query to finish");
+    drop(write);
+    gate.release.notify_one();
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
+/// #2530: `relish top`'s local rows held the metrics store's read guard
+/// through their query, so the collector's write waited for it. A write
+/// now goes through while that query runs.
+#[tokio::test]
+async fn relish_top_releases_the_metrics_store_before_it_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::mayo::store::MayoStore::new(dir.path().to_path_buf());
+    store.insert(
+        &crate::mayo::types::MetricKey::simple(crate::bun::top::CPU_METRIC),
+        crate::mayo::types::Sample::at(1, 1.0),
+    );
+    let gate = Arc::new(crate::mayo::store::QueryGate::default());
+    store.set_query_gate(Arc::clone(&gate));
+    let mayo = Arc::new(RwLock::new(store));
+    let reader = Arc::clone(&mayo);
+    let query = tokio::spawn(async move { super::status::latest_local_usage(&reader, 0).await });
+    gate.entered.notified().await;
+    let write = tokio::time::timeout(std::time::Duration::from_millis(200), mayo.write()).await;
+    assert!(
+        write.is_ok(),
+        "a write waited for relish top's query to finish"
+    );
+    drop(write);
+    gate.release.notify_one();
+    query.await.unwrap();
+}
+
+/// #2451: `/v1/metrics/cluster` with no `start` read the whole rollup
+/// retention, which is what a dashboard's first request looks like. It now
+/// reads the last hour.
+#[tokio::test]
+async fn a_cluster_query_without_a_start_reads_the_last_hour() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rollups = crate::mayo::rollup_store::RollupStore::new(dir.path().to_path_buf());
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    for timestamp in [60, now - now % 60 - 60] {
+        rollups.ingest(&crate::mayo::rollup::NodeRollup {
+            node_id: crate::meat::NodeId::new("w1"),
+            timestamp,
+            part: 0,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "cpu".into(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        });
+    }
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(rollups))),
+        None,
+        None,
+        9117,
+        None,
+    );
+    let (status, body) = get_bytes(app, "/v1/metrics/cluster?name=cpu").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.data.len(), 1, "{:?}", result.data);
+    assert_eq!(result.data[0].timestamp, now - now % 60 - 60);
+}
+
+fn roster_member(name: &str, state: crate::mustard::state::NodeState) -> RosterMember {
+    RosterMember {
+        info: NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new(name),
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 19117)),
+            api_advertised: true,
+            jobs: None,
+        },
+        gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], 19114)),
+        state,
+        incarnation: 1,
+        labels: std::collections::BTreeMap::new(),
+    }
+}
+
+/// #2536: a cluster metric query names the live member whose rollups
+/// stopped, and not the one that joined a minute ago. Three nodes have
+/// been members for ten minutes; w3's rollup sender stopped eight minutes
+/// ago, and w4 has just joined.
+#[tokio::test]
+async fn a_cluster_query_names_a_member_whose_rollups_stopped() {
+    use crate::mustard::state::NodeState::Alive;
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rollups = crate::mayo::rollup_store::RollupStore::new(dir.path().to_path_buf());
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    let minute = now - now % 60;
+    for (node, timestamp) in [
+        ("w1", minute - 60),
+        ("w2", minute - 120),
+        ("w3", minute - 480),
+    ] {
+        rollups.ingest(&crate::mayo::rollup::NodeRollup {
+            node_id: crate::meat::NodeId::new(node),
+            timestamp,
+            part: 0,
+            entries: Vec::new(),
+        });
+    }
+    let known = KnownMembers::default();
+    // Ten minutes, not an hour: a monotonic clock starts at boot, and a
+    // fresh CI runner may not have been up for an hour.
+    let ten_minutes_ago = std::time::Instant::now() - std::time::Duration::from_secs(600);
+    let founders = || {
+        ["w1", "w2", "w3"]
+            .into_iter()
+            .map(|name| roster_member(name, Alive))
+            .collect::<Vec<_>>()
+    };
+    known
+        .refresh(founders(), &Default::default(), ten_minutes_ago)
+        .await;
+    let mut roster = founders();
+    roster.push(roster_member("w4", Alive));
+    known
+        .refresh(roster, &Default::default(), std::time::Instant::now())
+        .await;
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(rollups))),
+        None,
+        None,
+        9117,
+        None,
+    )
+    .layer(axum::Extension(known));
+    let (status, body) = get_bytes(app, "/v1/metrics/cluster?name=cpu").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        result.warnings,
+        [QueryWarning::NodeSilent {
+            node_id: "w3".into(),
+            last_seen: Some(minute - 480),
+        }]
+    );
+}
+
+/// A member that was down and comes back joins again: it owes no rollup
+/// for the time it was away.
+#[tokio::test]
+async fn a_member_back_from_down_counts_as_newly_joined() {
+    use crate::mustard::state::NodeState::{Alive, Dead};
+    let known = KnownMembers::default();
+    let start = std::time::Instant::now();
+    let later = start + std::time::Duration::from_secs(600);
+    let back = start + std::time::Duration::from_secs(1_200);
+    let refresh = |state, at| {
+        let known = known.clone();
+        async move {
+            known
+                .refresh(
+                    vec![roster_member("w1", Alive), roster_member("w2", state)],
+                    &Default::default(),
+                    at,
+                )
+                .await;
+        }
+    };
+    refresh(Alive, start).await;
+    refresh(Dead, later).await;
+    refresh(Alive, back).await;
+    let mut joined = known.live_since().await;
+    joined.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    assert_eq!(
+        joined,
+        [
+            (crate::meat::NodeId::new("w1"), start),
+            (crate::meat::NodeId::new("w2"), back)
+        ]
+    );
+}
+
 /// #1499: `relish logs-export` copies a node's archive to the operator's
 /// machine through these two routes. The listing names each Parquet file
 /// with its size and SHA-256, the file route serves those exact bytes, and
@@ -7421,6 +7817,7 @@ async fn scoped_token_is_refused_cluster_wide_metrics() {
         "/v1/metrics/keys",
         "/v1/metrics/rollup",
         "/v1/metrics/rollup/owned",
+        "/v1/metrics/rollup/reporters",
         "/v1/metrics/cluster",
     ] {
         let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
@@ -7464,10 +7861,11 @@ async fn deploy_history_is_filtered_by_namespace() {
         },
         ..sample_history_entry(image)
     };
-    let history = Arc::new(RwLock::new(vec![
-        entry("team-a", "a:1"),
-        entry("team-b", "b:1"),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![entry("team-a", "a:1"), entry("team-b", "b:1")]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (app, shutdown) = setup_with_deploy_history(history).await;
 
     let body = get_body(app, "/v1/deploys/history/web?namespace=team-a").await;
@@ -7976,7 +8374,7 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
 
     // The token landed in Raft, and the returned plaintext validates
     // against the stored hash.
-    let stored = council.security_state().await.api_tokens;
+    let stored = council.security_state().await.api_tokens.clone();
     let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
     assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
 }
@@ -8071,7 +8469,7 @@ async fn join_token_create_returns_two_distinct_plaintexts_and_stores_only_hashe
     }
     assert_ne!(plaintexts[0], plaintexts[1]);
 
-    let stored = council.security_state().await.join_tokens;
+    let stored = council.security_state().await.join_tokens.clone();
     assert_eq!(stored.len(), 2, "init mints none; two new tokens");
     for plaintext in &plaintexts {
         assert!(
@@ -10020,29 +10418,33 @@ async fn webhook_rejects_a_bad_signature_without_triggering_a_sync() {
 #[tokio::test]
 async fn webhook_full_queue_is_bounded_and_delivery_can_be_retried() {
     let (app, mut receiver, shutdown) = webhook_setup("hooksecret", 100);
-    let body = br#"{"after":"abc123"}"#;
+    // Each delivery is a distinct push: a repeated body is a replay (#2408).
+    let body = |id: usize| format!(r#"{{"after":"abc{id}"}}"#).into_bytes();
     let headers = |id: usize| {
         vec![
-            ("x-hub-signature-256", github_signature("hooksecret", body)),
+            (
+                "x-hub-signature-256",
+                github_signature("hooksecret", &body(id)),
+            ),
             ("x-github-delivery", format!("queue-{id}")),
         ]
     };
     for id in 0..4 {
         assert_eq!(
-            post_webhook(&app, body, &headers(id)).await,
+            post_webhook(&app, &body(id), &headers(id)).await,
             StatusCode::ACCEPTED
         );
     }
     let status = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        post_webhook(&app, body, &headers(4)),
+        post_webhook(&app, &body(4), &headers(4)),
     )
     .await
     .expect("full queue must not stall the request");
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     receiver.recv().await.unwrap();
     assert_eq!(
-        post_webhook(&app, body, &headers(4)).await,
+        post_webhook(&app, &body(4), &headers(4)).await,
         StatusCode::ACCEPTED
     );
     shutdown.cancel();
@@ -10147,13 +10549,15 @@ async fn webhook_rate_limit_trips_on_a_flood() {
         .await,
         StatusCode::ACCEPTED
     );
-    // Second, fresh delivery id but the per-minute slot is used → 429.
+    // Second, a new push with a fresh delivery id, but the per-minute
+    // slot is used → 429.
+    let second = br#"{"after":"def"}"#;
     assert_eq!(
         post_webhook(
             &app,
-            body,
+            second,
             &[
-                ("x-hub-signature-256", sig),
+                ("x-hub-signature-256", github_signature(secret, second)),
                 ("x-github-delivery", "d-2".to_string())
             ]
         )
@@ -11016,6 +11420,7 @@ async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
             crate::meat::task_array_store::TaskArrayWrite::DeployBegin {
                 operation_id: "55555555555555555555555555555555".into(),
                 config: Box::new(competing),
+                declared_images: Default::default(),
                 now_epoch_secs: 1,
             },
         )))
@@ -11099,6 +11504,7 @@ async fn seed_finished_hook(council: &crate::council::CouncilNode, failed: bool)
             TaskArrayWrite::DeployBegin {
                 operation_id: HUNG_DEPLOYMENT_ID.into(),
                 config: Box::new(crate::config::Config::parse(HUNG_DEPLOYMENT_MANIFEST).unwrap()),
+                declared_images: Default::default(),
                 now_epoch_secs: 1,
             },
         )))
@@ -11675,6 +12081,86 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
     }
 }
 
+/// A single-node council that leads, with a GitOps config whose webhook
+/// secret is `secret`, sealed under the cluster master key.
+async fn council_with_gitops_secret(tag: &str, secret: &str) -> Arc<crate::council::CouncilNode> {
+    let council = seeded_council_with_ikm(tag).await;
+    let config: crate::lettuce::types::GitOpsConfig = toml::from_str(&format!(
+        "repo = \"https://example.invalid/config\"\nwebhook_secret = \"{secret}\"\n"
+    ))
+    .unwrap();
+    let stored = crate::lettuce::types::StoredGitOpsConfig::seal(
+        &config,
+        council.wrapping_ikm().map(|key| key.as_slice()),
+    )
+    .unwrap();
+    council
+        .write(crate::council::types::RaftRequest::GitOpsConfigSet {
+            config: Some(Box::new(stored)),
+            seed: false,
+        })
+        .await
+        .unwrap();
+    council
+}
+
+/// #2388: the webhook route is public, so a request that fails the
+/// signature check must cost the node as little as possible. It used to
+/// clone the whole desired state to read one field before checking.
+#[tokio::test]
+async fn a_webhook_with_a_bad_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-bad-sig-clone", "secret").await;
+    let (app, mut receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        br#"{"after":"abc"}"#,
+        &[
+            ("x-hub-signature-256", "sha256=00".to_string()),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "a junk webhook cloned the whole desired state"
+    );
+    assert!(receiver.try_recv().is_err());
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// #2388: a genuine delivery reads only the GitOps config too, and is
+/// checked against the cluster's secret, not this node's.
+#[tokio::test]
+async fn a_webhook_with_a_good_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-good-sig-clone", "secret").await;
+    let (app, _receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc"}"#;
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        body,
+        &[
+            ("x-hub-signature-256", github_signature("secret", body)),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "an admitted webhook cloned the whole desired state"
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
 fn webhook_boundary_setup(
     secret: &str,
     rate_limit: u32,
@@ -12008,7 +12494,10 @@ async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
     assert_ne!(rotated.key_id, old.key_id);
 
     let after = council.security_state().await;
-    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(
+        after.oidc_signing_config.as_ref().unwrap().key_id,
+        rotated.key_id
+    );
     assert_eq!(after.retiring_oidc_keys.len(), 1);
     assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
 

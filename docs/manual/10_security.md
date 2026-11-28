@@ -20,6 +20,15 @@ and CA, but an explicit endpoint doesn't borrow them. Plain `http://` is
 allowed only to a loopback address, so a bearer token never crosses the network
 in the clear.
 
+Over `https://`, `relish` accepts the server only if its certificate chains to
+that CA *and* is a cluster node's: it carries a node identity
+(`spiffe://reliaburger/node/<id>`), which only the Node CA issues. Workload and
+ingress certificates chain to the same root, so a workload that answers on
+the API port is refused before your token is sent. `relish` doesn't check the
+node's name against the address you gave it, and it has no revocation list: a
+removed node's certificate passes until it expires
+([#362](https://github.com/reliaburger/reliaburger/issues/362)).
+
 ### Reaching a node from another machine
 
 A clustered Linux node runs its own nftables perimeter firewall. Out of the box
@@ -49,6 +58,22 @@ Container host ports (`[network] port_range`, 10000-32767 by default) answer
 only cluster members and the node itself. That holds for ports published to
 containers too, which the node's own containers can also reach. Clients
 outside the cluster reach apps through Wrapper's ingress ports instead.
+
+The perimeter closes the whole range, including ports Bun never allocated.
+If another service on the node listens inside it (a monitoring agent on
+10050, memcached on 11211), clients outside the cluster can't reach it while
+Bun runs. Bun names each such listener in a warning when it starts. Move
+`[network] port_range` away from it, or move the service.
+
+A graceful stop (`systemctl stop`) that stops every workload also removes the
+perimeter's nftables tables. After a crash, or a stop that left something
+running, they stay, guarding the workloads' ports. To remove them by hand
+once nothing of Reliaburger's runs:
+
+```sh
+sudo nft delete table ip reliaburger_fw
+sudo nft delete table ip6 reliaburger_fw
+```
 
 Bun never publishes a workload on one of its own ports, and its own ports keep
 their usual policy inside the range. Put the API port there
@@ -91,6 +116,14 @@ relish token revoke ci-deploy
 | `deployer` | apply, deploy, stop and roll back workloads, inject workload faults |
 | `read-only` | status, logs, metrics and diagnostics (the default role) |
 
+No token reads an app's secrets back. The app's spec
+(`/v1/apps/{app}/{namespace}/spec`), the specs in its deploy history
+(`relish history`, `/v1/deploys/history/{app}`) and the dashboard's env page
+all show `[redacted]` for every env value, plain or encrypted, and for each
+inline config file's content, whatever the role. A `PROVIDER[...]` reference
+stays, because it names where the secret lives, not the secret. Only the
+nodes themselves read history whole, for a rollback.
+
 `--apps` and `--namespaces` narrow a token to those apps and namespaces. In the
 image registry that means repositories named `<namespace>/<app>` inside the
 scope; a scoped token can't push or pull a bare name like `api` at all (see
@@ -120,6 +153,16 @@ five seconds, so point a script at one node until then.
 you asked and on the leader, and on the others within about five seconds. If
 the node you asked is more than two seconds behind the leader, the message says
 so, and that node may accept the token until it catches up.
+
+A stream that is already open ends too. A followed log (`relish logs -f`), the
+event stream (`/v1/events?follow=true`), their WebSocket versions, the
+dashboard's live panes and the progress of `relish apply`, `relish rollback` or
+`relish scale` re-check the token that opened them every 15 seconds. Once it's revoked or
+expired, the stream ends with a warning, `the token that opened this stream was
+revoked or has expired`, and a WebSocket closes with code 1008 (policy). A
+deploy whose progress stream ended this way carries on; follow it with
+`relish status`. A token rotated with a grace period keeps its streams open
+until the grace ends.
 
 If the leader doesn't answer within 20 seconds you get a `504`, and the write
 may have happened anyway. Repeating a `revoke` is safe, and a lost join token
@@ -232,11 +275,13 @@ namespaces = ["shop"]   # omit for every namespace
 A permission can only take away: the token still needs the role and scope for
 anything it does. A token with no block is governed by its role and scope
 alone, so permissions are opt-in per token. Once a token has a block, it may
-do only what the block lists:
+do only what the block lists, on every node. A node with no Raft seat gets the
+blocks from the council leader along with the tokens, so a new or changed
+block reaches it within one security refresh (five seconds):
 
 | Action | What it covers |
 |--------|----------------|
-| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and push images to their repositories, with `relish build` or any registry client (see `images-and-volumes`) |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
 | `host-exec` | jobs and process workloads that run host commands, apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`), and apps with `[runtime]` knobs (each node also lists each knob; see "Runtime knobs" below) |
@@ -554,7 +599,7 @@ An expression sees three things and nothing else:
 |------|---------------|
 | `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
 | `job` | The same for a job, every `[job.*]` field plus `job.name` and `job.namespace`, in a policy that applies to jobs |
-| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `env`, `firewall` and `egress` |
+| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `pids`, `env`, `firewall` and `egress` |
 | `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
 | `source` | `apply` or `gitops` |
 
@@ -684,10 +729,11 @@ the definitions the cluster keeps, with their schedules put back: scheduled
 jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
 one-off job's last run is pruned its definition goes, and so does the job
 from the audit: it won't run again, and the next submission is judged when
-it arrives. The cluster keeps no declared spec for a job, so a job pinned by
-tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
-a tag the cluster bound would be. `relish wtf` shows the same
-denials and audit findings as warnings.
+it arrives. A job is judged by the image it declared, as an app is: the
+cluster keeps that beside the digest it bound the tag to. So `report:latest`
+is judged as `report:latest` though it runs a digest, and a job pinned by tag
+and digest (`report:v1@sha256:…`) is judged by both, the way you wrote it.
+`relish wtf` shows the same denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
 only those: the counts and findings leave out everything else, so a
@@ -747,6 +793,49 @@ declared it beside the filled-in spec it runs. GitOps compares the
 repository with the declared spec, so a filled-in field never looks like a
 change and a sync doesn't re-apply the app. A new or changed default
 reaches an app the next time the app itself is applied.
+
+## What a container can reach
+
+On a rootful runc node every container (an app, its init containers and
+sidecars, a fresh job container and a shared-runc executor) gets these,
+with no configuration:
+
+- **Its own user namespace.** Container ids 0 to 65,535 map onto host ids
+  from 2,000,000,000, so root in the container is an unprivileged user on
+  the node (see `images-and-volumes`). Every container on a node shares
+  that range, so its files, set-uid binaries included, are what a local
+  user must not reach: the unpacked image store, the bundle directory and
+  the volumes directory are `0710`, root's with group 2,000,000,000, so
+  only root and container root pass through, and sized volumes are mounted
+  `nosuid,nodev`. That only matters on a node with unprivileged local
+  accounts; the appliance has none.
+- **Docker's default capability set**, which acts only on what the
+  container's own namespaces own. The next section has the details.
+- **Docker's default seccomp filter.** About 370 system calls are allowed
+  and the rest fail with "operation not permitted": `keyctl`, `bpf`,
+  `userfaultfd`, `kexec_load`, module loading and, without
+  `CAP_SYS_ADMIN`, `mount`, `unshare` and `setns`. It's Moby's
+  `seccomp/v0.3.0` profile, unchanged, so an image that runs under Docker
+  runs here. A capability added with a runtime knob brings the calls it
+  guards, as `docker run --cap-add` does.
+- **No new privileges.** A set-uid binary or file capability can't raise
+  a process's privileges. An image that starts as root and drops to a
+  service user (Redis, nginx) doesn't notice; one that starts as
+  a non-root user and runs `sudo` or `su` fails, and needs to start as
+  root instead.
+- **Masked and read-only `/proc` and `/sys`.** `/proc/kcore`,
+  `/proc/keys`, `/proc/timer_list`, `/sys/firmware`,
+  `/sys/kernel/security`, `/sys/fs/bpf` and the rest of Docker's list read
+  as empty, and `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`,
+  `/proc/fs` and `/proc/irq` are read-only.
+- **Its own cgroup.** `/sys/fs/cgroup` shows the container's own cgroup
+  as its root, never the node's tree or another app's statistics. A
+  shared-runc executor's `/sys/fs/cgroup` is empty.
+- **A process limit** (`pids.max`) of 4,096 processes and threads unless
+  the app sets `pids` (see `reference`).
+
+A host workload (`exec` or `script`) gets none of this. It runs on the
+node as an ordinary process, which is why it needs the node's allowlist.
 
 ## Runtime knobs
 
@@ -842,7 +931,9 @@ What each kind accepts:
   `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`) are allowed only when listed by name.
   Bun warns at startup for each one it finds. A container's root is still
   an unprivileged user on the host (see `images-and-volumes`), so these act
-  on the container's own namespaces. As in Docker and Kubernetes, a
+  on the container's own namespaces. An added capability also lets through
+  the system calls the seccomp filter keeps for it: `CAP_SYS_ADMIN` brings
+  `mount` and `unshare`, `CAP_SYS_PTRACE` brings `process_vm_readv`. As in Docker and Kubernetes, a
   capability reaches a process that runs as root in the container; a
   non-root user needs file capabilities on its binary.
 
@@ -1059,8 +1150,17 @@ cluster running:
 ```sh
 relish secret pubkey                  # ask the cluster
 relish secret pubkey cluster          # offline, from `relish init` output
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
+printf %s "$DB_PASSWORD" | relish secret encrypt --pubkey "$(relish secret pubkey)"
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input
+when you give it neither a file nor a value. At a terminal it asks for the
+value without echoing it. One trailing newline is dropped, so a file written
+by an editor or `echo` works. A value can also go on the command line
+(`relish secret encrypt --pubkey KEY VALUE`), but other users on the
+machine can see it in the process list while the command runs, and your shell
+history keeps it, so keep that form for values that aren't secret.
 
 `examples/phase-1/container-secrets.toml` is a job that reads an encrypted
 value and prints its length, never the value; its header has the commands.
@@ -1119,7 +1219,7 @@ starting:
 
 ```sh
 relish secret pubkey --namespace team-a
-relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" --value-file db-password.txt
 ```
 
 The re-seal covers apps only. Encrypt a job's values in an opted-in
@@ -1375,11 +1475,12 @@ Rotating the root itself isn't supported yet.
 
 ## Workload identity
 
-Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
-(or `/job/NAME`), and its credentials appear read-only in
+Every app instance on a cluster gets a SPIFFE identity,
+`spiffe://CLUSTER/ns/NAMESPACE/app/NAME`, and its credentials appear read-only in
 `/run/reliaburger/identity/`: `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`,
 `token`, an OIDC JWT, and `api-token`, a second JWT for the Reliaburger API
-alone. Use the certificate for mTLS between your services.
+alone. Use the certificate for mTLS between your services. Job tasks don't
+get an identity yet, and a standalone node issues none.
 `ca.pem` is a bundle: every Workload CA the cluster trusts, then the root.
 Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not

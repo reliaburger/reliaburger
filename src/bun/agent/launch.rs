@@ -720,6 +720,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 state: ContainerState::Preparing,
                 health_counters: Default::default(),
                 restart_count: 0,
+                backoff_step: 0,
                 last_restart: None,
                 host_port,
                 container_ip: None,
@@ -944,6 +945,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     state: crate::grill::state::ContainerState::Running,
                     health_counters: crate::bun::health::HealthCounters::new(),
                     restart_count: 0,
+                    backoff_step: 0,
                     last_restart: None,
                     host_port,
                     container_ip: new_ips.get(new_id).copied().flatten(),
@@ -996,7 +998,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             new_ids.len(),
             new_ids.len(),
         );
-        super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
+        self.deploy_history.write().await.record(entry);
         Ok(())
     }
 

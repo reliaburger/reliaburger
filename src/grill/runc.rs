@@ -8,9 +8,10 @@
 /// Supports rootless mode via user namespaces and `--rootless` flag,
 /// and pulls real OCI images from Docker Hub when the spec's root
 /// path looks like an image reference.
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -22,6 +23,50 @@ use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
 mod owned;
+
+/// How often a node that keeps creating containers looks for image
+/// generations nothing uses (#2423). A full image filesystem looks at the
+/// next create whatever the interval.
+const IMAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long a generation a pull handed out, or a tree an unpack left
+/// without its marker, is spared by the collector.
+const IMAGE_COLLECTION_GRACE: Duration = Duration::from_secs(3600);
+
+/// Every image generation a bundle under `bundle_base` uses: the lower of a
+/// writable overlay (its `rootfs-lower` marker) or the root a read-only
+/// container runs straight from (its config.json). An error means the set
+/// may be incomplete, and the caller must not collect with it.
+pub(crate) fn live_image_generations(bundle_base: &Path) -> std::io::Result<HashSet<PathBuf>> {
+    let mut live = HashSet::new();
+    let entries = match std::fs::read_dir(bundle_base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(live),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let bundle = entry.path();
+        if let Some(lower) = super::rootfs::lower_generation(&bundle) {
+            live.insert(lower);
+        }
+        let bytes = match std::fs::read(bundle.join("config.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let spec: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if let Some(root) = spec.pointer("/root/path").and_then(|path| path.as_str()) {
+            let root = PathBuf::from(root);
+            live.insert(std::fs::canonicalize(&root).unwrap_or(root));
+        }
+    }
+    Ok(live)
+}
 
 /// Runc-based Grill implementation.
 ///
@@ -78,15 +123,38 @@ impl RuncGrill {
         state_dir: PathBuf,
         owner_executable: PathBuf,
     ) -> std::io::Result<Self> {
-        // Default node index from hostname. Will be overridden when
-        // the node joins a cluster and gets a proper node ID.
         let hostname = std::fs::read_to_string("/etc/hostname")
             .unwrap_or_else(|_| "localhost".to_string())
             .trim()
             .to_string();
-        let node_index = netns::node_index_from_id(&hostname);
+        Self::for_hostname(
+            bundle_base,
+            image_store,
+            rootless,
+            state_dir,
+            owner_executable,
+            &hostname,
+        )
+    }
 
+    /// [`RuncGrill::new`] on a host named `hostname`. The name only seeds
+    /// the container subnet the first time this runtime's directories are
+    /// used; after that the subnet stays, whatever the host is called
+    /// (#2420).
+    pub(crate) fn for_hostname(
+        bundle_base: PathBuf,
+        image_store: ImageStore,
+        rootless: bool,
+        state_dir: PathBuf,
+        owner_executable: PathBuf,
+        hostname: &str,
+    ) -> std::io::Result<Self> {
         let bundle_base = std::path::absolute(&bundle_base)?;
+        let node_index = super::network_leases::persisted_node_index(
+            &bundle_base,
+            hostname,
+            &super::network_leases::host_networks_on_this_node(),
+        )?;
         let state_dir = std::path::absolute(&state_dir)?;
         // Rootful containers run in the node's user namespace, so their
         // image files must be owned by ids that namespace maps (D1).
@@ -204,14 +272,19 @@ impl RuncGrill {
         let bundle_dir = self.bundle_base.join(&instance.0);
         // The bundle will hold the decrypted environment: root-only.
         let private = bundle_dir.clone();
-        tokio::task::spawn_blocking(move || super::bundle::create_private_directory(&private))
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|result| result)
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to create bundle dir: {e}"),
-            })?;
+        // Container root's host group passes through a rootful bundle; a
+        // rootless container's root is the bundle's owner (#2412).
+        let group = (!self.rootless).then_some(super::userns::HOST_ID_BASE);
+        tokio::task::spawn_blocking(move || {
+            super::bundle::create_private_directory(&private, group)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result)
+        .map_err(|e| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("failed to create bundle dir: {e}"),
+        })?;
 
         let mut spec = spec.clone();
         let mut rootfs_mount = None;
@@ -326,7 +399,8 @@ impl RuncGrill {
         }
 
         // If root.path looks like an image reference, pull and unpack it
-        if looks_like_image_ref(&spec.root.path) {
+        let from_image = looks_like_image_ref(&spec.root.path);
+        if from_image {
             let pulled = self
                 .image_store
                 .pull_and_unpack(&spec.root.path)
@@ -485,8 +559,45 @@ impl RuncGrill {
         if let Some(mounted) = rootfs_mount {
             mounted.commit();
         }
+        if from_image {
+            self.collect_images_in_background();
+        }
 
         Ok(())
+    }
+
+    /// Start an image collection pass on its own task when one is due
+    /// (#2423). Unpacking is what grows the image store, so a create from
+    /// an image is the time to look.
+    fn collect_images_in_background(&self) {
+        let store = self.image_store.clone();
+        let bundle_base = self.bundle_base.clone();
+        tokio::spawn(async move {
+            let Some(_pass) = store.start_collection(IMAGE_COLLECTION_INTERVAL).await else {
+                return;
+            };
+            let live = tokio::task::spawn_blocking(move || live_image_generations(&bundle_base))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|live| live);
+            // `run_collection` records how the pass went for `relish wtf`
+            // (#2524), including a live set it couldn't read.
+            let now = crate::meat::batch_ids::epoch_now_secs();
+            if let Some(report) = store
+                .run_collection(live, IMAGE_COLLECTION_GRACE, now)
+                .await
+                && report != super::image::RootfsGcReport::default()
+            {
+                eprintln!(
+                    "grill: image collection removed {} generation(s), {} partial tree(s), \
+                     {} manifest(s) and {} metadata file(s)",
+                    report.generations_removed,
+                    report.partials_removed,
+                    report.manifests_removed,
+                    report.metadata_removed
+                );
+            }
+        });
     }
 }
 
@@ -918,7 +1029,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(bundle), 0o711, "bundle directory mode");
+        // Root's, and at most container root's group may pass through
+        // (#2412): 0710 on a rootful grill, 0700 on a rootless one.
+        assert_eq!(mode(bundle) & 0o767, 0o700, "bundle directory mode");
         assert_eq!(mode(&bundle.join("config.json")), 0o600, "config.json mode");
     }
 
@@ -1075,6 +1188,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1087,6 +1201,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1146,6 +1263,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
@@ -1158,6 +1276,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1221,6 +1342,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
@@ -1233,6 +1355,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1323,6 +1448,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1348,6 +1474,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1447,6 +1576,145 @@ mod tests {
         responder_task.await.ok();
     }
 
+    #[test]
+    fn live_generations_are_overlay_lowers_and_read_only_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundles = tmp.path().join("bundles");
+        let writable_lower = tmp.path().join("images/rootfs/a/gen-0123456789abcdef");
+        let read_only_root = tmp.path().join("images/rootfs/b/gen-fedcba9876543210");
+        std::fs::create_dir_all(&writable_lower).unwrap();
+        std::fs::create_dir_all(&read_only_root).unwrap();
+        let writable = bundles.join("default__web-0");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::write(
+            writable.join("rootfs-lower"),
+            writable_lower.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let read_only = bundles.join("default__cache-0");
+        std::fs::create_dir_all(&read_only).unwrap();
+        std::fs::write(
+            read_only.join("config.json"),
+            serde_json::json!({"root": {"path": read_only_root, "readonly": true}}).to_string(),
+        )
+        .unwrap();
+        // A bundle that exited cleanly keeps its upper but not its spec.
+        std::fs::create_dir_all(bundles.join("default__done-0")).unwrap();
+
+        let live = live_image_generations(&bundles).unwrap();
+        assert!(live.contains(&writable_lower));
+        assert!(live.contains(&std::fs::canonicalize(&read_only_root).unwrap()));
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_spec_refuses_the_whole_live_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundles/default__web-0");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"not json").unwrap();
+        assert!(
+            live_image_generations(&tmp.path().join("bundles")).is_err(),
+            "a set missing a running container's root must never drive a collection"
+        );
+    }
+
+    /// A long-running container of `image` that checks a file of its image
+    /// is still there before it exits.
+    fn sleeping_image_spec(image: &str, readonly: bool) -> OciSpec {
+        let mut spec = preparation_spec("/bin/sh");
+        spec.root = crate::grill::oci::OciRoot {
+            path: image.to_string(),
+            readonly,
+        };
+        spec.process.args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 20; test -s /bin/sh".to_string(),
+        ];
+        spec.process.env = vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+        spec.mounts = crate::grill::oci::standard_mounts();
+        spec.linux.namespaces = crate::grill::oci::standard_namespaces(None);
+        spec
+    }
+
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, pinned OCI images (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones() {
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning rootful runc"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let store = pinned_image_store(tmp.path());
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            store.clone(),
+            false,
+            tmp.path().join("state"),
+            test_owner(),
+        )
+        .unwrap();
+        let web = InstanceId("runc-image-gc-web-0".to_string());
+        let cache = InstanceId("runc-image-gc-cache-0".to_string());
+        for id in [&web, &cache] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![web.clone(), cache.clone()]);
+        let bundles = tmp.path().join("bundles");
+
+        // The first version of `web`, then its replacement on another image.
+        grill
+            .create(&web, &sleeping_image_spec(ALPINE_IMAGE, false))
+            .await
+            .unwrap();
+        let replaced = crate::grill::rootfs::lower_generation(&bundles.join(&web.0)).unwrap();
+        grill.kill(&web).await.ok();
+        grill.forget_retired(&web).await.unwrap();
+        grill
+            .create(&web, &sleeping_image_spec(REDIS_IMAGE, false))
+            .await
+            .unwrap();
+        grill.start(&web).await.unwrap();
+        let running = crate::grill::rootfs::lower_generation(&bundles.join(&web.0)).unwrap();
+        assert_ne!(replaced, running);
+        // A read-only container runs straight from its generation.
+        grill
+            .create(&cache, &sleeping_image_spec(NGINX_IMAGE, true))
+            .await
+            .unwrap();
+        grill.start(&cache).await.unwrap();
+        let config: OciSpec = serde_json::from_slice(
+            &std::fs::read(bundles.join(&cache.0).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let read_only = PathBuf::from(config.root.path);
+
+        let live = live_image_generations(&bundles).unwrap();
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!replaced.exists(), "the replaced image's generation stays");
+        assert!(report.generations_removed >= 1);
+        assert!(running.join("bin/sh").exists());
+        assert!(read_only.join("bin/sh").exists());
+        for id in [&web, &cache] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
+                assert!(std::time::Instant::now() < deadline, "{id} did not exit");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                grill.exit_code(id).await.unwrap(),
+                Some(0),
+                "{id} lost its image files: {}",
+                grill.logs(id).await.unwrap_or_default()
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires rootful runc, overlayfs, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
     async fn runc_replicas_cannot_observe_each_others_rootfs_writes() {
@@ -1492,6 +1760,7 @@ mod tests {
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
+                    no_new_privileges: false,
                     rlimits: Vec::new(),
                     args: vec![
                         "/bin/sh".to_string(),
@@ -1511,6 +1780,9 @@ mod tests {
                 },
                 mounts: crate::grill::oci::standard_mounts(),
                 linux: crate::grill::oci::OciLinux {
+                    seccomp: None,
+                    masked_paths: Vec::new(),
+                    readonly_paths: Vec::new(),
                     namespaces: crate::grill::oci::standard_namespaces(None),
                     resources: None,
                     cgroups_path: None,
@@ -1667,6 +1939,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1679,6 +1952,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1736,6 +2012,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1752,6 +2029,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1941,6 +2221,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
@@ -1953,6 +2234,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -2103,6 +2387,337 @@ mod tests {
         );
 
         grill.kill(&id).await.unwrap();
+    }
+
+    /// #2402: a container runs under the default seccomp filter with
+    /// `no_new_privs` set, sees its own cgroup at `/sys/fs/cgroup` rather
+    /// than the node's tree, and can't read `/proc/kcore`.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_container_runs_under_seccomp_without_new_privileges() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__confined-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, mut spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3608\"]\n"),
+        );
+        // A cgroup of its own, as Bun gives every instance, so the cgroup
+        // namespace has something to hide.
+        spec.linux.cgroups_path = Some(format!("/reliaburger-test/{}", id.0));
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let probe = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "grep -E '^(Seccomp|NoNewPrivs):' /proc/1/status; \
+                     echo listing-start; ls /sys/fs/cgroup; echo listing-end; \
+                     [ -s /proc/kcore ] && echo kcore-visible; \
+                     unshare -U true 2>/dev/null && echo nested-userns"
+                        .to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .output;
+        grill.kill(&id).await.unwrap();
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert!(probe.contains("Seccomp:\t2"), "{probe}");
+        assert!(probe.contains("NoNewPrivs:\t1"), "{probe}");
+        let listing = probe
+            .split("listing-start")
+            .nth(1)
+            .and_then(|rest| rest.split("listing-end").next())
+            .unwrap_or_default();
+        assert!(!listing.contains("reliaburger"), "{probe}");
+        assert!(listing.contains("cgroup.procs"), "{probe}");
+        assert!(!probe.contains("kcore-visible"), "{probe}");
+        assert!(!probe.contains("nested-userns"), "{probe}");
+    }
+
+    /// #2386: an app's container gets a `pids.max` by default, a fork bomb
+    /// fills its own limit, and the node still starts the next container.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let ids: Vec<InstanceId> = ["default__quiet-0", "default__bomb-0", "default__after-0"]
+            .iter()
+            .map(|id| InstanceId(id.to_string()))
+            .collect();
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.clone());
+        let cgroup = |id: &InstanceId| format!("/reliaburger-test/{}", id.0);
+        let host_cgroup =
+            |id: &InstanceId| std::path::PathBuf::from(format!("/sys/fs/cgroup{}", cgroup(id)));
+        let (grill, _) = image_app(tmp.path(), &ids[0], &format!("image = \"{ALPINE_IMAGE}\""));
+        let start = |id: &InstanceId, toml: String| {
+            // One grill for all three, as on a node; only the spec is new.
+            let (_, mut spec) = image_app(tmp.path(), id, &toml);
+            spec.linux.cgroups_path = Some(cgroup(id));
+            let (grill, id) = (&grill, id.clone());
+            async move {
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+            }
+        };
+
+        start(
+            &ids[0],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3609\"]\n"),
+        )
+        .await;
+        let default_limit = std::fs::read_to_string(host_cgroup(&ids[0]).join("pids.max")).unwrap();
+
+        // A small limit of its own keeps the bomb cheap for the test host.
+        // The bomb runs through exec, so the shell that dies on a failed
+        // fork isn't the container's init. Its children let go of exec's
+        // output, or exec would wait for them.
+        start(
+            &ids[1],
+            format!("image = \"{ALPINE_IMAGE}\"\npids = 32\ncommand = [\"sleep\", \"3614\"]\n"),
+        )
+        .await;
+        let _ = grill
+            .exec(
+                &ids[1],
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "for i in $(seq 1 64); do sleep 600 >/dev/null 2>&1 & done; true".to_string(),
+                ],
+            )
+            .await;
+        let events = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.events")).unwrap();
+        let refused: u64 = events
+            .lines()
+            .find_map(|line| line.strip_prefix("max "))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0);
+        let bomb_limit = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.max")).unwrap();
+
+        // The node can still fork runc for another container.
+        start(
+            &ids[2],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3610\"]\n"),
+        )
+        .await;
+        let after_state = grill.state(&ids[2]).await.ok();
+
+        for id in &ids {
+            grill.kill(id).await.unwrap();
+        }
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert_eq!(
+            default_limit.trim(),
+            crate::grill::oci::DEFAULT_CONTAINER_PIDS.to_string()
+        );
+        assert_eq!(bomb_limit.trim(), "32");
+        assert!(refused > 0, "the bomb never reached its limit");
+        assert_eq!(after_state, Some(ContainerState::Running));
+    }
+
+    /// #2420: renaming the host doesn't strand its containers. A runtime
+    /// built after the rename, over the same directories, still stops the
+    /// container the first one started.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_hostname_change_leaves_live_containers_under_control() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__renamed-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let runtime = |hostname: &str| {
+            RuncGrill::for_hostname(
+                tmp.path().join("bundles"),
+                pinned_image_store(tmp.path()),
+                false,
+                tmp.path().join("state"),
+                test_owner(),
+                hostname,
+            )
+            .unwrap()
+        };
+        // The first runtime over these directories picks the subnet.
+        let before = runtime("ip-10-0-3-17");
+        assert_eq!(before.node_index, netns::node_index_from_id("ip-10-0-3-17"));
+        let (_, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3621\"]\n"),
+        );
+        before.create(&id, &spec).await.unwrap();
+        before.start(&id).await.unwrap();
+        assert_ne!(
+            netns::node_index_from_id("ip-10-0-3-17"),
+            netns::node_index_from_id("web-node-3")
+        );
+
+        // Bun restarts after the rename: the old runtime goes first, as the
+        // old process would.
+        let pinned = before.node_index;
+        drop(before);
+        let after = runtime("web-node-3");
+        let killed = after.kill(&id).await;
+        if killed.is_err() {
+            let _ = runtime("ip-10-0-3-17").kill(&id).await;
+        }
+        killed.unwrap();
+        assert_eq!(after.state(&id).await.unwrap(), ContainerState::Stopped);
+        assert_eq!(after.node_index, pinned);
+    }
+
+    /// #2392: `runc exec` goes through the same exec helper as a host
+    /// command, so a container's chatty command is cut at 1 MiB too.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__chatty-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3620\"]\n"),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let result = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "yes a | head -c 4194304".to_string(),
+                ],
+            )
+            .await;
+        grill.kill(&id).await.unwrap();
+
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, 0);
+        let marker = crate::grill::process_owner::exec::CUT_MARKER;
+        let limit = crate::grill::process_owner::exec::OUTPUT_LIMIT as usize;
+        assert!(result.output.ends_with(marker), "not cut");
+        assert!(result.output.len() <= limit + 1 + marker.len());
+        assert!(result.output.starts_with("a\na\n"));
+    }
+
+    /// #2412: a set-uid file a container writes, and the unpacked image it
+    /// runs from, are out of reach of an unprivileged local user, while the
+    /// container itself still starts from both a writable and a read-only
+    /// root.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, setpriv, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_local_user_cannot_reach_a_containers_set_id_files() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        // Like /var/lib/reliaburger: any user may pass through the top.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writable = InstanceId("default__setid-0".to_string());
+        let read_only = InstanceId("default__setid-ro-0".to_string());
+        for id in [&writable, &read_only] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![writable.clone(), read_only.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &writable,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\n\
+                 command = [\"/bin/sh\", \"-c\", \"cp /bin/busybox /pwn && chmod 4755 /pwn && sleep 3611\"]\n"
+            ),
+        );
+        grill.create(&writable, &spec).await.unwrap();
+        grill.start(&writable).await.unwrap();
+        let (_, mut read_only_spec) = image_app(
+            tmp.path(),
+            &read_only,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3612\"]\n"),
+        );
+        read_only_spec.root.readonly = true;
+        grill.create(&read_only, &read_only_spec).await.unwrap();
+        grill.start(&read_only).await.unwrap();
+
+        let planted = tmp
+            .path()
+            .join("bundles")
+            .join(&writable.0)
+            .join("rootfs-upper/pwn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !planted.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the container never wrote /pwn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mode = std::fs::metadata(&planted).unwrap().permissions().mode();
+        let as_nobody = |path: &std::path::Path| {
+            std::process::Command::new("setpriv")
+                .args([
+                    "--reuid",
+                    "65534",
+                    "--regid",
+                    "65534",
+                    "--clear-groups",
+                    "stat",
+                ])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let upper = as_nobody(&planted);
+        // Something inside the store: reaching it needs search permission
+        // on `rootfs`, which stat of `rootfs` itself doesn't.
+        let unpacked = std::fs::read_dir(tmp.path().join("images/rootfs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let images = as_nobody(&unpacked);
+        let writable_state = grill.state(&writable).await.ok();
+        let read_only_state = grill.state(&read_only).await.ok();
+        for id in [&writable, &read_only] {
+            grill.kill(id).await.unwrap();
+        }
+
+        assert_eq!(
+            mode & 0o4000,
+            0o4000,
+            "the container's file is set-uid: {mode:o}"
+        );
+        for (what, output) in [("the writable layer", &upper), ("the image store", &images)] {
+            let said = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "a local user reached {what}: {said}"
+            );
+            assert!(said.contains("Permission denied"), "{said}");
+        }
+        assert_eq!(writable_state, Some(ContainerState::Running));
+        assert_eq!(read_only_state, Some(ContainerState::Running));
     }
 
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their

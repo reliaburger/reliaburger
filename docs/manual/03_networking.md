@@ -8,6 +8,11 @@ a healthy backend, wherever it runs. Services are TCP-only. The hook rewrites
 `connect()` calls, so UDP sent with `sendto()` to a VIP never reaches a
 backend, and published host ports are DNAT'd for TCP alone.
 
+Apps that open IPv6 sockets and reach IPv4 addresses through them (Java and
+.NET do by default) work too: the hook also rewrites a VIP written as
+`::ffff:127.128.x.y`. Before 0.3.4 it didn't, and those apps needed
+`-Djava.net.preferIPv4Stack=true` or `DOTNET_SYSTEM_NET_DISABLEIPV6=1`.
+
 ```sh
 relish resolve web                    # VIP and healthy backends for an app
 relish resolve web --namespace shop   # needed when two namespaces both run a web
@@ -38,6 +43,58 @@ split-horizon and corporate DNS keep working and nothing leaks to a public
 resolver. Set `upstream` to send them somewhere else. If DNS is on and there's
 no usable resolver (no `nameserver` lines, or only Bun's own address), Bun
 refuses to start and names `[dns] upstream`.
+
+Bun forwards at most 64 external lookups at once per node, and one container
+(one source address) can hold at most 16 of them; past that it gets SERVFAIL
+straight away. A resolver that didn't answer is tried after the others for
+10 seconds. Positive answers are cached for their TTL, at most 30 seconds, so
+a changed external record can take that long to reach containers.
+
+### When the council has no leader
+
+Each node routes to instances on other nodes only while the council leader
+keeps answering it. If no leader answers for 60 seconds (the council lost its
+quorum, or this node is cut off from it), the node stops routing to other
+nodes until one answers again. The reason is safety: once the leader can't
+hear from a node, it may let another node reuse an address that node still
+routes to, and a call landing on whatever got that address is worse than a
+call that fails.
+
+What keeps working:
+
+- calls that an instance on the same node can serve, through the VIP, DNS
+  and the ingress;
+- connections that were already open.
+
+What stops after 60 seconds:
+
+- a call whose only instances run on other nodes: `connect()` fails with
+  `EPERM` (permission denied);
+- an ingress route with no instance on the node the request reached: it
+  answers 503.
+
+Two things stay stuck for the whole outage. A Bun restarted during it routes
+nothing, local instances included, until a leader answers. And an instance
+that crashes can't restart, because releasing its old address needs the
+leader. Everything comes back on the leader's first answer.
+
+An app with an instance on every node (enough replicas, spread out) rides out
+a council outage untouched. `relish wtf` reports the outage as `no-leader` or
+`quorum-loss` ([Diagnostics](07_diagnostics.md)).
+
+## Container addresses
+
+On a rootful runc node, each container gets an address from a `/23` of
+`10.0.0.0/8` that belongs to that node. Bun picks the `/23` the first time
+it starts containers, from a hash of the hostname, passing over any that
+overlaps a network the host is on, and keeps it in
+`<data_dir>/instances/runc/bundles/.network-leases.json`. Renaming the host later doesn't
+move it, so running containers stay under Bun's control. Container
+addresses never leave their node: traffic out of it is masqueraded to the
+node's own address.
+
+To move a node to another `/23`, stop its workloads first, then delete
+`.network-leases.json`; Bun picks again on its next start.
 
 ## Who may connect
 
@@ -198,18 +255,65 @@ If a route that slipped past those checks reaches the cluster anyway (say, one
 written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
+Each ingress node also checks every backend it routes to: every 5 seconds it
+sends `GET /` and waits up to 2 seconds. Any HTTP answer counts, a 404 or a
+503 included, because the check asks only whether this node can reach the
+instance; your app's own health check (`[app.web.health]`) decides whether
+it's well. After three checks in a row get no answer (connection refused,
+timed out or closed unanswered), the node stops sending that instance
+requests and logs
+`wrapper: web-1 at 10.0.0.5:30001 is unreachable from this node: ...`. Two
+answered checks bring it back, with another log line. The other nodes decide
+for themselves. When no instance of a route is left, the route answers 502.
+If the council has had no leader for 60 seconds, a node routes only to
+instances it runs itself and answers 503 for a route with none ([When the
+council has no leader](#when-the-council-has-no-leader)).
+
+A request body is read whole before the ingress contacts your app, so it can
+retry another instance if the first one can't be reached. Three limits guard
+that buffer. A body over `[ingress] max_request_body_bytes` (10 MiB) gets 413.
+A body that sends nothing for 30 seconds gets 408. And all the bodies a node is
+buffering share `[ingress] request_body_budget_bytes` (256 MiB): a request
+whose declared body won't fit in what's left gets 503 before any of it is
+read, so a crowd of slow uploads can't pin the node's memory. The node picks a
+backend only once the body has arrived, so a slow upload doesn't hold up a
+rollout.
+
+```toml
+[ingress]
+enabled = true
+max_request_body_bytes = 1048576     # 1 MiB
+request_body_budget_bytes = 67108864 # 64 MiB shared by every upload
+```
+
+A node holds at most `[ingress] max_open_connections` (32,768) connections
+across its two ingress listeners and closes any past that at once.
+`max_connections` (10,000) counts requests in flight, not connections. One
+client address may have 16 TLS handshakes in progress
+(`max_tls_handshakes_per_source`); behind a load balancer that doesn't pass the
+client's address through, every client shares the balancer's address, so raise
+it there.
+
 Streaming responses pass through, and so do WebSockets on routes that allow
-them. A stopping instance drains its connections before it goes. A WebSocket
+them. A response is cut when your app sends nothing for 30 seconds, before
+its headers (the client gets 502) or in the middle of its body, so give a
+long-lived stream such as server-sent events a heartbeat. A quiet WebSocket
+is never cut for being idle. If your app refuses a WebSocket upgrade (a 401 for a missing token, say),
+the client gets your status, headers and up to 64 KiB of the body, not a 502. A stopping instance drains its connections before it goes. A WebSocket
 still open when the drain timeout ends gets a Close frame with code 1001
 (Going Away), so a well-behaved client reconnects to another instance rather
 than reporting an error.
 
-Your app sees the client's address in `X-Forwarded-For` and `X-Real-IP`, and
-`X-Forwarded-Proto` says whether the client came over HTTPS. The ingress sets
-all three itself and drops any a client sent, so your app can trust them. Each
-request also carries an `X-Request-ID`: the client's own, or a new random one,
-for matching your app's logs to the client's. WebSocket upgrades get the same
-headers.
+Your app sees the `Host` the client asked for (`web.example.com`, not the
+instance's own address), so absolute links, cookie domains and virtual hosts
+work without any proxy setting. The client's address is in `X-Forwarded-For`
+and `X-Real-IP`, `X-Forwarded-Proto` says whether the client came over HTTPS,
+`X-Forwarded-Host` repeats the client's `Host`, and `X-Forwarded-Port` is the
+ingress port it connected to (80 or 443 unless you moved them). The ingress
+sets all five itself and drops any a client sent, so your app can trust them.
+Each request also carries an `X-Request-ID`: the client's own, or a new random
+one, for matching your app's logs to the client's. WebSocket upgrades get the
+same headers.
 
 ## Fault injection lives nearby
 

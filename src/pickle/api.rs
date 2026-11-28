@@ -27,8 +27,18 @@ const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Admission bounds open writers and the small buffers retained by each stream.
 const MAX_CONCURRENT_WRITES: usize = 4;
-/// How long a write over that limit waits for a slot before a 429.
-const WRITE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Slots for the internal storage routes (`/copies/`, `/replicas/`), kept
+/// apart so a heal copy, which can hold its request for `REPLICA_TIMEOUT`,
+/// never takes a client's slot (#2466).
+const MAX_CONCURRENT_INTERNAL_WRITES: usize = 4;
+/// How long a write over that limit waits for a slot before a 429. At least
+/// as long as a slot can be held, a body upload of up to `UPLOAD_TIMEOUT`,
+/// plus a minute to verify and store it: docker pushes layers in parallel and
+/// never retries a 429, so a layer queued behind four slow ones must outlast
+/// them (#2466).
+const WRITE_ADMISSION_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(UPLOAD_TIMEOUT.as_secs() + 60);
+/// Longest a single upload or manifest request may take to arrive.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared state for Pickle API handlers.
@@ -108,6 +118,8 @@ impl PickleState {
         {
             Ok(principal) => {
                 scope_refusal(principal.as_ref(), repository, access)?;
+                self.permission_refusal(principal.as_ref(), repository, access)
+                    .await?;
                 Ok(principal)
             }
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
@@ -121,6 +133,40 @@ impl PickleState {
                 "insufficient permissions to push to the registry".to_string(),
             )),
         }
+    }
+
+    /// The 403 for a writer whose `[permission]` block doesn't grant
+    /// `deploy` on `repository` (#2398). The block comes from this node's
+    /// replica of the desired state, or from the leader's view on a node
+    /// with no Raft seat (#2538); only the writer's own entry is copied
+    /// out. Without a council handle (a standalone registry) there are no
+    /// blocks to apply.
+    // `Response` is large but it IS the HTTP reply to send on failure.
+    #[allow(clippy::result_large_err)]
+    async fn permission_refusal(
+        &self,
+        principal: Option<&crate::sesame::auth::AuthContext>,
+        repository: &str,
+        access: RepositoryAccess,
+    ) -> Result<(), Response> {
+        let (Some(principal), Some(council)) = (principal, &self.council) else {
+            return Ok(());
+        };
+        if access == RepositoryAccess::Read
+            || principal.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL
+        {
+            return Ok(());
+        }
+        let name = principal.token_name.clone();
+        let block = council.permission(&name).await;
+        let permissions = block.map(|spec| (name, spec)).into_iter().collect();
+        super::registry_auth::check_repository_permission(
+            Some(principal),
+            repository,
+            access,
+            &permissions,
+        )
+        .map_err(|denied| oci_error(StatusCode::FORBIDDEN, "DENIED", denied.to_string()))
     }
 
     #[allow(clippy::result_large_err)]
@@ -331,13 +377,16 @@ async fn record_commit_owned(
                 return Err(PickleError::MissingLayer(digest.clone()));
             }
         }
+        // One copy, kept for rollback; the guarded catalogue changes in
+        // place, and goes back to that copy if it can't be persisted (#2427).
         let previous = catalog.clone();
-        let mut next = catalog.clone();
-        next.apply_manifest_commit(&local_commit);
-        if let Some(path) = &persist {
-            next.persist_to(path)?;
+        catalog.apply_manifest_commit(&local_commit);
+        if let Some(path) = &persist
+            && let Err(error) = catalog.persist_to(path)
+        {
+            *catalog = previous;
+            return Err(error);
         }
-        *catalog = next;
         Ok((catalog, previous))
     })
     .await
@@ -503,6 +552,7 @@ impl PickleState {
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));
+    let internal_writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INTERNAL_WRITES));
     Router::new()
         .route("/v2/", get(v2_check))
         .route(
@@ -516,7 +566,11 @@ pub fn router(state: PickleState) -> Router {
         )
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let writers = Arc::clone(&writers);
+                let writers = if is_internal_storage_route(request.uri().path()) {
+                    Arc::clone(&internal_writers)
+                } else {
+                    Arc::clone(&writers)
+                };
                 async move {
                     let _permit = if matches!(
                         *request.method(),
@@ -552,6 +606,14 @@ pub fn router(state: PickleState) -> Router {
         .layer(axum::middleware::from_fn(standard_client_credentials))
         .layer(axum::middleware::from_fn(api_version_header))
         .with_state(state)
+}
+
+/// Whether `path` is one of the routes only other cluster nodes call: a copy
+/// confirmation or a heal copy. They queue for their own write slots.
+fn is_internal_storage_route(path: &str) -> bool {
+    path.strip_prefix("/v2/")
+        .and_then(parse_v2_route)
+        .is_some_and(|route| matches!(route, V2Route::Copy { .. } | V2Route::Replica { .. }))
 }
 
 /// Mark every answer as coming from a v2 registry, as the distribution spec
@@ -767,6 +829,24 @@ async fn dispatch_v2(
     let Some(route) = parse_v2_route(rest) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #2413: names and tags follow the OCI grammar before anything reads,
+    // stores or authorises them.
+    if !super::types::valid_repository_name(route.repository()) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "NAME_INVALID",
+            format!("invalid repository name {:?}", route.repository()),
+        );
+    }
+    if let V2Route::Manifest { reference, .. } = &route
+        && !super::types::valid_reference(reference)
+    {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "TAG_INVALID",
+            format!("invalid tag {reference:?}"),
+        );
+    }
 
     // O1: writes authorise per handler (they have different role bars and
     // quota checks); reads are uniform, so one gate covers every GET/HEAD.
@@ -1380,7 +1460,10 @@ async fn blob_upload_complete(
         Err(super::types::PickleError::InvalidUploadId(_)) => {
             StatusCode::BAD_REQUEST.into_response()
         }
-        Err(error @ super::types::PickleError::StorageQuotaExceeded) => registry_write_error(error),
+        Err(
+            error @ (super::types::PickleError::StorageQuotaExceeded
+            | super::types::PickleError::StorageFileLimitExceeded { .. }),
+        ) => registry_write_error(error),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1494,7 +1577,10 @@ const INDEX_MEDIA_TYPES: [&str; 2] = [
 
 fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
-        super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+        super::types::PickleError::StorageQuotaExceeded
+        | super::types::PickleError::StorageFileLimitExceeded { .. } => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
         super::types::PickleError::ReplicationFailed(_)
         | super::types::PickleError::RegistryNeedsMtls => StatusCode::SERVICE_UNAVAILABLE,
@@ -2066,14 +2152,17 @@ impl PickleState {
             if !council.is_leader().await {
                 return Ok(Vec::new());
             }
-            let desired = council.desired_state().await;
             let mut pinned = pinned.clone();
-            pinned.extend(desired.pinned_image_digests());
+            let candidates = council
+                .read_desired(|desired| {
+                    pinned.extend(desired.pinned_image_digests());
+                    desired
+                        .manifest_catalog
+                        .expirable_manifests(now_unix_ms, retain, &pinned)
+                })
+                .await;
             let mut expired = Vec::new();
-            for expire in desired
-                .manifest_catalog
-                .expirable_manifests(now_unix_ms, retain, &pinned)
-            {
+            for expire in candidates {
                 match council
                     .write(crate::council::RaftRequest::ExpireManifest(expire.clone()))
                     .await
@@ -2370,6 +2459,82 @@ mod tests {
         let response = waiting.await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         drop(writers);
+    }
+
+    /// #2520: a stock client sends a layer in one request, so the manual
+    /// has to say how big and how slow that request may be, and how many
+    /// run at once. The numbers come from the constants, so they can't drift.
+    #[test]
+    fn the_manual_states_the_registry_push_limits() {
+        let manual = include_str!("../../docs/manual/11_images-and-volumes.md");
+        let size = format!("{} MiB", MAX_REQUEST_BYTES / (1024 * 1024));
+        let timeout = format!("{} minutes", UPLOAD_TIMEOUT.as_secs() / 60);
+        let writers = format!("{} write requests", number_word(MAX_CONCURRENT_WRITES));
+        let wait = format!("{} minutes", WRITE_ADMISSION_WAIT.as_secs() / 60);
+        for fact in [size, timeout, writers, wait] {
+            assert!(manual.contains(&fact), "the manual doesn't say {fact:?}");
+        }
+    }
+
+    fn number_word(number: usize) -> &'static str {
+        ["zero", "one", "two", "three", "four", "five", "six"]
+            .get(number)
+            .copied()
+            .unwrap_or("many")
+    }
+
+    /// #2466: a slot can be held for a whole upload (`UPLOAD_TIMEOUT`), so a
+    /// queued writer waits at least that long. A layer pushed beside four
+    /// slow ones mustn't fail with a 429 that docker never retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_writer_outlasts_a_slow_but_live_upload() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        let mut waiting = Box::pin(app.clone().oneshot(start_upload()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+        drop(writers.pop());
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(writers);
+    }
+
+    /// #2466: a heal copy (`/replicas/`) can hold its request for
+    /// `REPLICA_TIMEOUT`; it takes an internal slot, never a client's.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_replica_copy_leaves_every_client_write_slot_free() {
+        let (state, _dir) = test_state();
+        let app = router(state).layer(axum::Extension(super::super::replication::ReplicaClient(
+            reqwest::Client::new(),
+        )));
+        let digest = compute_sha256(b"image");
+        let replica = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/web/replicas/{}", digest.as_str()))
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let mut replica = Box::pin(app.clone().oneshot(replica));
+        assert!(futures_util::poll!(replica.as_mut()).is_pending());
+        let mut writers = stalled_writers(&app);
+        writers.truncate(MAX_CONCURRENT_WRITES - 1);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        // Three client slots are taken; the fourth is still free.
+        // Were the copy holding a client slot, this would queue until the
+        // admission wait ran out and answer 429.
+        let response = app.clone().oneshot(start_upload()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(writers);
+        drop(replica);
     }
 
     async fn serve_peer_body(
@@ -4250,6 +4415,93 @@ mod tests {
         }
     }
 
+    /// A single-member in-memory council, initialised and leading, so a
+    /// test can write replicated state (a `[permission]` block) through Raft.
+    async fn leading_council(node_raft_id: u64) -> Arc<crate::council::CouncilNode> {
+        use crate::council::CouncilNode;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        let network = InMemoryRaftRouter::new();
+        let council = Arc::new(
+            CouncilNode::new(
+                node_raft_id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(node_raft_id, network.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(node_raft_id, &council).await;
+        council
+            .initialize(std::collections::BTreeMap::from([(
+                node_raft_id,
+                CouncilNodeInfo {
+                    addr: "127.0.0.1:19001".parse().unwrap(),
+                    name: "registry".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !council.is_leader().await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        council
+    }
+
+    /// #2398: a `[permission]` block narrows what a token may push, on the
+    /// registry port exactly as on `/v1/build`.
+    #[tokio::test]
+    async fn a_push_outside_the_tokens_permission_block_is_refused() {
+        let (mut state, _dir, deployer, _reader) = standard_client_state().await;
+        let council = leading_council(state.node_raft_id).await;
+        council
+            .write(crate::council::RaftRequest::PermissionSpec {
+                name: "ci".into(),
+                spec: Box::new(crate::config::PermissionSpec {
+                    actions: vec!["deploy".into()],
+                    apps: vec!["web".into()],
+                    namespaces: Some(vec!["shop".into()]),
+                }),
+            })
+            .await
+            .unwrap();
+        state.council = Some(council.clone());
+        let app = test_router(state);
+        let bearer = format!("Bearer {deployer}");
+        let refused = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/shop/api/blobs/uploads/",
+                Some(&bearer),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(refused).await).unwrap();
+        assert_eq!(body["errors"][0]["code"], "DENIED", "body: {body}");
+        let allowed = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/shop/web/blobs/uploads/",
+                Some(&bearer),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(allowed.status().is_success(), "{}", allowed.status());
+        council.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn malformed_registry_credentials_are_refused_before_hashing() {
         let (state, _dir, _deployer, _reader) = standard_client_state().await;
@@ -4572,7 +4824,9 @@ mod tests {
                 StatusCode::CREATED,
                 "own namespace, envelope {index}"
             );
-            for elsewhere in ["team-b/web", "web", "library/redis", "team-a//web"] {
+            // `team-a//web` no longer gets this far: the OCI name grammar
+            // refuses it with NAME_INVALID first (#2413).
+            for elsewhere in ["team-b/web", "web", "library/redis"] {
                 let response = app
                     .clone()
                     .oneshot(client_request(
@@ -5417,6 +5671,105 @@ mod tests {
         )
         .await;
         assert_oci_error(resp, "MANIFEST_BLOB_UNKNOWN").await;
+    }
+
+    /// #2413: a tag follows the OCI grammar, so it can never hold a `:` and
+    /// make its catalogue key ambiguous with another repository's.
+    #[tokio::test]
+    async fn a_tag_with_a_colon_is_refused_with_tag_invalid() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let config = push_blob(&app, "web", b"config").await;
+        for tag in ["x:y", ".hidden", "-dash", &"t".repeat(129)] {
+            let resp = put_manifest(
+                &app,
+                &format!("/v2/web/manifests/{tag}"),
+                manifest_body(&config, 6),
+            )
+            .await;
+            assert_oci_error(resp, "TAG_INVALID").await;
+        }
+        // The longest valid tag and a digest reference still pass.
+        let resp = put_manifest(
+            &app,
+            &format!("/v2/web/manifests/{}", "t".repeat(128)),
+            manifest_body(&config, 6),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// #2413: a repository name follows the OCI grammar.
+    #[tokio::test]
+    async fn a_repository_name_outside_the_oci_grammar_is_refused_with_name_invalid() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        for name in [
+            "Web%20App",
+            "web:x",
+            "Web",
+            "team//web",
+            "web/",
+            "-web",
+            "web..x",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/{name}/blobs/uploads/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_oci_error(resp, "NAME_INVALID").await;
+        }
+        // The internal names relish and the cluster use still pass.
+        for name in [
+            "_buildcontext",
+            "reliaburger-bun",
+            "cache/docker.io/library/redis",
+            "team-a/web.api__x/v-1",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/{name}/blobs/uploads/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{name}");
+        }
+    }
+
+    /// #2431: a push refused for the file count tells the client which
+    /// limit it hit and the setting that raises it.
+    #[tokio::test]
+    async fn a_push_refused_for_the_file_count_names_the_limit() {
+        let (state, _dir) = test_state();
+        state.store.configure_file_limit(0).unwrap();
+        let app = test_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let message = body["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("0 files"), "{message}");
+        assert!(message.contains("[images] max_files"), "{message}");
     }
 
     #[tokio::test]

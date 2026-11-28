@@ -13,6 +13,12 @@ name: Fuzz
 # which nothing in ci.yml uses, and the evidence gate there waits on every
 # job it holds. The stable half (every target over its checked-in corpus)
 # runs in ci.yml's portable suite, on every pull request.
+#
+# It fuzzes the newest release train that has work main doesn't, else main,
+# the way mutants.yml and macos-nightly.yml pick their branch: train work
+# lands on release-* first, and a scheduled run checks out main (#2482).
+# GitHub runs a scheduled workflow from main's copy only, so a change to
+# this file takes effect once it's on main (docs/releasing.md).
 
 on:
   schedule:
@@ -22,6 +28,9 @@ on:
       seconds:
         description: Seconds per target
         default: "300"
+      ref:
+        description: Branch or commit to fuzz (empty means the newest train, else main)
+        default: ""
 
 permissions:
   contents: read
@@ -47,10 +56,29 @@ jobs:
     # fuzz/fuzz_targets/). Cached, only reliaburger itself rebuilds (14
     # minutes): a path dependency's fingerprint is its files' mtimes, which
     # every checkout resets.
-    timeout-minutes: 185
+    timeout-minutes: 205
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+        with:
+          fetch-depth: 0
+      # Release trains are release-<x>-<y>-<z>; sort -V puts the newest last.
+      - name: Choose what to fuzz
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          ref=${REF:-}
+          if [ -z "$ref" ]; then
+            ref=origin/main
+            train=$(git branch -r --list 'origin/release-*' | sed 's/^ *//' | sort -V | tail -n 1)
+            if [ -n "$train" ] && [ -n "$(git rev-list -1 origin/main.."$train")" ]; then
+              ref=$train
+            fi
+          elif git rev-parse --verify --quiet "origin/$ref" >/dev/null; then
+            ref=origin/$ref
+          fi
+          git checkout --quiet --detach "$ref"
+          echo "fuzzing $ref at $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       # rust-cache hashes every installed toolchain into its key, and the
@@ -65,11 +93,15 @@ jobs:
             esac
           done
           rustup toolchain list
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-fuzz@0.13.2
       # The sanitizer build of the whole crate is most of the job. One key
-      # serves the nightly run and runs by hand, and both save it.
+      # serves the nightly run and runs by hand, and both save it. A run
+      # that fuzzes a train saves under main's scope too, which is what we
+      # want: this workflow is the cache's only reader, and the next night
+      # fuzzes the same train. rust-cache's key hashes the lockfiles, so a
+      # train's build is an entry beside main's, never a replacement.
       #
       # The key also names the coverage wrapper, since Cargo doesn't
       # fingerprint a RUSTC_WRAPPER. From 17 Nov 2026, main's nightly saved
@@ -79,7 +111,7 @@ jobs:
       # the whole crate (33 minutes instead of 11) and then took about 20
       # minutes per 30-second target, so every one hit the job's limit
       # (#2125).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz -> target
           shared-key: fuzz

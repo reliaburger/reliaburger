@@ -11,7 +11,7 @@
 //! can run beside each other, beside the other cluster suites and beside
 //! another worktree's run of this binary (#840).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -257,10 +257,14 @@ fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> 
     }
 }
 
+/// Start node `index` as `name` over mTLS. Node 0 bootstraps the council;
+/// every other node expects it, as `relish join` would have saved (#2397):
+/// `first` is node 0's name.
 async fn start_mtls_node(
     cluster: &TestCluster,
     index: u16,
     name: &str,
+    first: &str,
     identity: NodeIdentity,
     shutdown: &CancellationToken,
 ) -> (
@@ -272,6 +276,19 @@ async fn start_mtls_node(
     let data_dir = cluster.data_dir(name);
     let identity_dir = data_dir.join("identity");
     reliaburger::sesame::identity_store::save(&identity_dir, &identity).unwrap();
+    if index > 0 {
+        reliaburger::council::admission::ExpectedCouncil::save(
+            &identity_dir,
+            &BTreeMap::from([(
+                raft_id_from_name(first),
+                reliaburger::council::types::CouncilNodeInfo {
+                    addr: local(cluster.gossip_port(0) + 1),
+                    name: first.into(),
+                },
+            )]),
+        )
+        .unwrap();
+    }
     let identity = reliaburger::sesame::credentials::LiveNodeIdentity::load(&identity_dir).unwrap();
 
     let (mut handle, runtime) = runtime::start(
@@ -594,9 +611,11 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
     let identity_3 = issued_node_identity(&hierarchy, "tls-3", 12);
 
     let cluster = TestCluster::lease(3);
-    let node_1 = start_mtls_node(&cluster, 0, "tls-1", identity_1.clone(), &shutdown).await;
-    let node_2 = start_mtls_node(&cluster, 1, "tls-2", identity_2.clone(), &shutdown).await;
-    let node_3 = start_mtls_node(&cluster, 2, "tls-3", identity_3, &shutdown).await;
+    let node_1 =
+        start_mtls_node(&cluster, 0, "tls-1", "tls-1", identity_1.clone(), &shutdown).await;
+    let node_2 =
+        start_mtls_node(&cluster, 1, "tls-2", "tls-1", identity_2.clone(), &shutdown).await;
+    let node_3 = start_mtls_node(&cluster, 2, "tls-3", "tls-1", identity_3, &shutdown).await;
     let nodes = [&node_1, &node_2, &node_3];
 
     let expected_voters: BTreeSet<u64> = ["tls-1", "tls-2", "tls-3"]
@@ -1025,6 +1044,7 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
                 &cluster,
                 index,
                 name,
+                names[0],
                 issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
@@ -1193,6 +1213,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
                 &cluster,
                 index,
                 name,
+                names[0],
                 issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
@@ -1415,6 +1436,7 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
                 &cluster,
                 index,
                 name,
+                names[0],
                 issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
@@ -1522,7 +1544,7 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
                     _ = ticker.tick() => {}
                 }
                 let _ = identity
-                    .adopt_council_trust(&council.security_state().await)
+                    .adopt_council_trust(&*council.security_state().await)
                     .await;
             }
         });

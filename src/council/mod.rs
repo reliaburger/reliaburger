@@ -84,6 +84,10 @@ pub enum CouncilError {
     InitError(String),
     #[error("raft write failed: {0}")]
     WriteFailed(String),
+    /// A write too large to replicate, refused before it reached the log
+    /// (#2370).
+    #[error("raft write refused: the request is {bytes} bytes, over the {limit}-byte entry limit")]
+    EntryTooLarge { bytes: usize, limit: usize },
     /// A write didn't commit within its deadline. It may still commit:
     /// the caller has to check, or repeat an idempotent write.
     #[error("raft write outcome unknown: not committed within {waited:?}")]

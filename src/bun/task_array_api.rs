@@ -101,7 +101,10 @@ pub struct TaskResults {
     pub next_after: Option<u32>,
     /// Detail is retained locally, for at most the configured terminal retention.
     pub retention_seconds: u64,
-    /// Nodes that couldn't be asked; their tasks are missing.
+    /// Nodes whose tasks are missing from the page: the call failed, or a
+    /// node the accepted record names as an owner holds nothing. When the
+    /// record no longer names owners, every node is asked, and one that
+    /// holds nothing isn't listed.
     pub unreachable: Vec<NodeId>,
 }
 
@@ -189,6 +192,7 @@ pub async fn submit_handler(
         }),
         replay_unknown: true,
         hook: false,
+        declared_image: None,
     };
     let policy_warnings = match super::job_api::admit_definition(
         &state,
@@ -317,6 +321,7 @@ pub async fn manifest_handler(
             cron: None,
             replay_unknown: true,
             hook: false,
+            declared_image: None,
         };
         match super::job_api::admit_definition(
             &state,
@@ -392,7 +397,7 @@ pub(crate) async fn admit_template_image(
     };
     let catalog = match (&state.council, &state.pickle_catalog) {
         (Some(council), _) => council.manifest_catalog().await,
-        (None, Some(catalog)) => catalog.read().await.clone(),
+        (None, Some(catalog)) => std::sync::Arc::new(catalog.read().await.clone()),
         _ => Default::default(),
     };
     if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_none() {
@@ -1010,6 +1015,34 @@ fn result_window(
     (start, end, Some(owners))
 }
 
+/// How one node's answer to a results call counts toward the page.
+#[derive(Debug, PartialEq)]
+enum NodeAnswer {
+    /// Rows to merge.
+    Rows(Vec<TaskResultRow>),
+    /// The node holds nothing for the array, and nothing was expected of it.
+    Nothing,
+    /// The node's tasks are missing from the page, with the error if the
+    /// call itself failed.
+    Unreachable(Option<String>),
+}
+
+/// Classify one node's answer. `owners_known` says whether the node was
+/// asked because the accepted record names it as an owner.
+fn node_answer(
+    result: Result<Option<Vec<TaskResultRow>>, String>,
+    owners_known: bool,
+) -> NodeAnswer {
+    match result {
+        Ok(Some(rows)) => NodeAnswer::Rows(rows),
+        // Once the accepted record is folded (#2473), every node is asked,
+        // and most never ran any of the array.
+        Ok(None) if !owners_known => NodeAnswer::Nothing,
+        Ok(None) => NodeAnswer::Unreachable(None),
+        Err(reason) => NodeAnswer::Unreachable(Some(reason)),
+    }
+}
+
 /// `GET /v1/batch/{id}/results`: every task's outcome, gathered from the
 /// nodes' ledgers.
 pub async fn results_handler(
@@ -1074,9 +1107,15 @@ pub async fn results_handler(
         if calls.len() >= 8
             && let Some(Ok((node, result))) = calls.join_next().await
         {
-            match result {
-                Ok(Some(rows)) => per_node.push((node, rows)),
-                Ok(None) | Err(_) => unreachable.push(node),
+            match node_answer(result, owners.is_some()) {
+                NodeAnswer::Rows(rows) => per_node.push((node, rows)),
+                NodeAnswer::Nothing => {}
+                NodeAnswer::Unreachable(reason) => {
+                    if let Some(reason) = reason {
+                        eprintln!("bun: task array {batch_id}: results from {node}: {reason}");
+                    }
+                    unreachable.push(node);
+                }
             }
         }
     }
@@ -1085,11 +1124,13 @@ pub async fn results_handler(
     }
     while let Some(done) = calls.join_next().await {
         let Ok((node, result)) = done else { continue };
-        match result {
-            Ok(Some(rows)) => per_node.push((node, rows)),
-            Ok(None) => unreachable.push(node),
-            Err(reason) => {
-                eprintln!("bun: task array {batch_id}: results from {node}: {reason}");
+        match node_answer(result, owners.is_some()) {
+            NodeAnswer::Rows(rows) => per_node.push((node, rows)),
+            NodeAnswer::Nothing => {}
+            NodeAnswer::Unreachable(reason) => {
+                if let Some(reason) = reason {
+                    eprintln!("bun: task array {batch_id}: results from {node}: {reason}");
+                }
                 unreachable.push(node);
             }
         }
@@ -1319,6 +1360,27 @@ pub async fn summaries_handler(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_holding_nothing_for_a_folded_array_is_not_reported_unreachable() {
+        use super::{NodeAnswer, node_answer};
+        // Folded record: every node is asked; one that never ran the array
+        // has nothing to add, and the page is still complete.
+        assert_eq!(node_answer(Ok(None), false), NodeAnswer::Nothing);
+        // A named owner that holds nothing has lost its detail.
+        assert_eq!(node_answer(Ok(None), true), NodeAnswer::Unreachable(None));
+        // A call that fails is unreachable either way.
+        for owners_known in [false, true] {
+            assert_eq!(
+                node_answer(Err("answered 503".into()), owners_known),
+                NodeAnswer::Unreachable(Some("answered 503".into()))
+            );
+        }
+        assert_eq!(
+            node_answer(Ok(Some(Vec::new())), false),
+            NodeAnswer::Rows(Vec::new())
+        );
+    }
+
     use super::*;
     use crate::config::types::EnvValue;
     use crate::meat::index_set::IndexRangeSet;

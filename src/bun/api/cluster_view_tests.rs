@@ -160,7 +160,7 @@ impl Setup {
             self.cmd_tx,
             None,
             None,
-            Some(Arc::new(RwLock::new(self.history))),
+            Some(Arc::new(RwLock::new(self.history.into_iter().collect()))),
             None,
             None,
             self.council,
@@ -236,6 +236,93 @@ async fn deploy_history_merges_every_members_record_with_its_node() {
         .collect();
     assert_eq!(rows, [("local", 1), ("peer", 2)]);
     assert!(view.warnings.is_empty(), "{:?}", view.warnings);
+}
+
+/// A deploy recorded with a plain secret in its env and an API key in an
+/// inline config file.
+fn history_entry_with_secrets() -> DeployHistoryEntry {
+    let spec: crate::config::app::AppSpec = toml::from_str(
+        "image = \"web:v1\"\n\
+         [env]\nDB_PASSWORD = \"hunter2\"\n\
+         [[config_file]]\npath = \"/etc/app.conf\"\ncontent = \"api_key=abc123\"\n",
+    )
+    .unwrap();
+    let mut entry = history_entry("web", "default", 1, 100);
+    entry.spec = Some(Box::new(spec));
+    entry
+}
+
+/// The history route answers with each recorded spec. Like the spec route
+/// (#1322), it must leave out env values and inline config content for
+/// any caller but a peer node (#2400).
+#[tokio::test]
+async fn deploy_history_leaves_out_env_values_and_config_content() {
+    let reader = crate::sesame::token::create_token(
+        "reader",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
+    setup.history = vec![history_entry_with_secrets()];
+    setup.tokens = vec![reader.token.clone()];
+    let app = setup.router().await;
+
+    let (status, body) = get(
+        app,
+        "/v1/deploys/history/web?namespace=default",
+        Some(&reader.plaintext),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("hunter2"), "{body}");
+    assert!(!body.contains("abc123"), "{body}");
+    // The rest of the spec is still there to read.
+    let view: ClusterDeployHistory = serde_json::from_str(&body).unwrap();
+    let spec = view.history[0].row.spec.as_ref().unwrap();
+    assert_eq!(spec.image.as_deref(), Some("web:v1"));
+    assert!(spec.env.contains_key("DB_PASSWORD"));
+}
+
+/// A rollback picks its target from every node's history, read over this
+/// same route with the node's service token, and applies it. A peer must
+/// still get the spec as it was deployed (#2400), and so must one on a
+/// cluster with no tokens yet, which has no token to send.
+#[tokio::test]
+async fn a_peer_reading_history_for_a_rollback_still_gets_the_full_spec() {
+    for service_token in [Some("rbrg_service"), None] {
+        a_peer_gets_the_full_spec(service_token).await;
+    }
+}
+
+async fn a_peer_gets_the_full_spec(service_token: Option<&str>) {
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
+    setup.history = vec![history_entry_with_secrets()];
+    setup.service_token = service_token.map(str::to_string);
+    let app = setup.router().await;
+
+    let (status, body) = get(
+        app,
+        "/v1/deploys/history/web?namespace=default&local=true",
+        service_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let view: ClusterDeployHistory = serde_json::from_slice(&body).unwrap();
+    let history: Vec<DeployHistoryEntry> = view.history.into_iter().map(|row| row.row).collect();
+    // The app now runs v2, so the recorded v1 is the one to go back to.
+    let current: crate::config::app::AppSpec = toml::from_str("image = \"web:v2\"").unwrap();
+    let target = crate::bun::cluster_view::rollback_target(&history, Some(&current)).unwrap();
+    assert_eq!(
+        target.env.get("DB_PASSWORD"),
+        Some(&crate::config::EnvValue::Plain("hunter2".into()))
+    );
+    assert_eq!(
+        target.config_file[0].content.as_deref(),
+        Some("api_key=abc123")
+    );
 }
 
 #[tokio::test]
@@ -493,6 +580,50 @@ async fn node_page_says_when_that_node_did_not_answer() {
 // ---------------------------------------------------------------------------
 // WebSocket log stream
 // ---------------------------------------------------------------------------
+
+/// A log WebSocket is authenticated before the upgrade. A token that
+/// expires while the socket is open must close it, with a policy-violation
+/// Close frame that says why (#2399).
+#[tokio::test]
+async fn an_open_log_websocket_closes_once_its_token_expires() {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let created = crate::sesame::token::create_token(
+        "brief",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope::default(),
+        Some(SystemTime::now() + Duration::from_secs(2)),
+    )
+    .unwrap();
+    let mut setup = Setup::new(spawn_agent(Vec::new(), vec!["hello".into()]));
+    setup.tokens = vec![created.token.clone()];
+    let address = serve_peer(setup.router().await).await;
+
+    let mut request = format!("ws://{address}/v1/ws/logs/web/default")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", created.plaintext).parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let close = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(message) = socket.next().await {
+            if let Ok(WsMessage::Close(frame)) = message {
+                return frame;
+            }
+        }
+        None
+    })
+    .await
+    .expect("the socket outlived its expired token")
+    .expect("the socket ended without a Close frame");
+    assert_eq!(close.code, CloseCode::Policy);
+    assert!(close.reason.contains("expired"), "{close:?}");
+}
 
 /// Each WebSocket frame is a [`crate::ketchup::follow::LogFrame`], so the
 /// TUI can tell a log line from a "node left" notice.

@@ -423,7 +423,12 @@ impl reliaburger::pickle::upstream::UpstreamRegistry for FixedRegistry {
         'a,
         reliaburger::pickle::upstream::UpstreamManifest,
     > {
-        unimplemented!("binding only asks for the digest")
+        // No manifest: apply's layer check (#2528) is skipped.
+        Box::pin(async {
+            Err(reliaburger::pickle::types::PickleError::ReplicationFailed(
+                "no manifest".into(),
+            ))
+        })
     }
 
     fn fetch_root<'a>(
@@ -1316,4 +1321,100 @@ async fn differing_local_gitops_config_is_reported_not_used() {
             fields: vec!["repo".into()]
         }
     );
+}
+
+/// One node's webhook endpoint on `council`: its own validator, keyed with
+/// `secret`, as every Bun has. Two of these on one council stand in for
+/// two nodes, each with replay windows of its own. The receiver keeps the
+/// sync channel open.
+fn webhook_router(council: &Arc<CouncilNode>, secret: &str) -> (axum::Router, mpsc::Receiver<()>) {
+    let (tx, _rx) = mpsc::channel(8);
+    let (webhook_tx, webhook_rx) = mpsc::channel::<()>(8);
+    let validator = Arc::new(tokio::sync::Mutex::new(
+        reliaburger::lettuce::webhook::WebhookValidator::new(secret, 10),
+    ));
+    let router = reliaburger::bun::api::router_with_upgrade(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(council)),
+        None,
+        None,
+        None,
+        None,
+        Some(webhook_tx),
+        Some(validator),
+        0,
+        None,
+        None,
+        None,
+        "default".to_string(),
+        None,
+        reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
+        reliaburger::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        reliaburger::bun::capabilities::StaticCapabilities::default(),
+        reliaburger::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    (router, webhook_rx)
+}
+
+/// POST a GitHub-signed webhook with the given delivery id.
+async fn post_signed_webhook(
+    router: &axum::Router,
+    secret: &str,
+    body: &[u8],
+    delivery: &str,
+) -> axum::http::StatusCode {
+    use tower::ServiceExt;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = format!(
+        "sha256={}",
+        hex::encode(ring::hmac::sign(&key, body).as_ref())
+    );
+    let request = axum::http::Request::post("/v1/gitops/webhook")
+        .header("x-hub-signature-256", signature)
+        .header("x-github-delivery", delivery)
+        .body(axum::body::Body::from(body.to_vec()))
+        .unwrap();
+    router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// #2408: the delivery id is a header the signature doesn't cover, so the
+/// cluster's replay receipt is the digest of the signed body. A captured
+/// delivery resent to another node under a fresh id is refused by the
+/// leader, though that node's own validator has never seen it.
+#[tokio::test]
+async fn a_signed_body_sent_to_another_node_under_a_new_delivery_id_is_refused() {
+    let council = single_node_leader().await;
+    let (first_node, _first_rx) = webhook_router(&council, "hooksecret");
+    let (second_node, _second_rx) = webhook_router(&council, "hooksecret");
+    let body = br#"{"after":"abc123","ref":"refs/heads/main"}"#;
+
+    assert_eq!(
+        post_signed_webhook(&first_node, "hooksecret", body, "delivery-1").await,
+        axum::http::StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_signed_webhook(&second_node, "hooksecret", body, "delivery-2").await,
+        axum::http::StatusCode::UNAUTHORIZED,
+        "the same signed body under a new delivery id is a replay"
+    );
+    let other = br#"{"after":"def456","ref":"refs/heads/main"}"#;
+    assert_eq!(
+        post_signed_webhook(&second_node, "hooksecret", other, "delivery-3").await,
+        axum::http::StatusCode::ACCEPTED,
+        "a new push is admitted"
+    );
+    council.shutdown().await.ok();
 }

@@ -702,7 +702,7 @@ Now we need something that actually runs containers. That something is Grill.
 
 The name follows the burger theme (Reliaburger, Bun, Relish, Meat, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
-1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
+1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies the security settings the spec asks for (a seccomp filter, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 
 2. **Grill** manages runc. It translates our `AppSpec` configuration into the OCI runtime specification that runc expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
 
@@ -955,6 +955,30 @@ runc init was OOM-killed before the workload started: it runs inside the contain
 We match runc's text, which is fragile in principle: a future runc could reword it. The cost of that is small, though. If the match misses, we're back to the old generic failure, not a wrong answer. The pure function is tested on its own with runc's real message, and it works on any platform, like the cgroup helpers above.
 
 Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
+
+### A ceiling on processes
+
+CPU and memory aren't the only things a container can exhaust. Run `:(){ :|:& };:` in a container with no process limit and within seconds the node hits `kernel.threads-max`. From then on every `fork` on the node fails with `EAGAIN`, Bun's included, and stopping the offender needs a `runc kill` child that Bun can no longer start. Until 0.3.4 that was every app: jobs had a `pids` field since #741, but an app, its init containers and its sidecars never got a `pids.max` (#2386).
+
+Now the resource builder takes a third argument, and an image app always passes one:
+
+```rust
+fn build_resources(spec: &AppSpec) -> Option<OciResources> {
+    let host = spec.exec.is_some() || spec.script.is_some();
+    let pids = (!host).then(|| container_pids(spec.pids));
+    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref(), pids)
+}
+
+fn container_pids(asked: Option<PidsLimit>) -> u32 {
+    asked.map_or(DEFAULT_CONTAINER_PIDS, |limit| limit.get())
+}
+```
+
+`map_or(default, f)` is `match asked { Some(limit) => f(limit), None => default }` in one call. The default, `DEFAULT_CONTAINER_PIDS`, is 4,096: enough for a JVM or a Postgres with hundreds of connections, and a tiny slice of a node's process table. An app that needs more sets `pids`, up to the same 32,768 a job may ask for, and `PidsLimit` (the type jobs already used) refuses 0 and anything above that when the TOML is parsed, so no later code has to check. A sidecar has its own cgroup and its own `pids`. An init container runs in the app's cgroup before the app does, so it takes the app's limit. A host app gets none: it's a process on the node, with no container cgroup to put the limit in, and `relish apply` refuses `pids` on one rather than accept a number it would ignore.
+
+Jobs keep their old rule, no limit unless they ask. Their commands already run under a 256 default when an executor reuses its container, and a fresh job container is the one place where "unset means unlimited" was a deliberate choice.
+
+The default changes behaviour for an app that already runs more than 4,096 threads, and that's a real cost: it fails with `EAGAIN` where it used to work. We took it because the alternative fails worse. An app over the limit breaks itself; an app with no limit can break the node and every other app on it.
 
 ### The last one out turns off the lights
 
@@ -1544,6 +1568,18 @@ This is a general pattern worth adopting for any code that depends on the clock:
 
 Why `deadline_after` and not plain `now + config.initial_delay`? Because `Instant + Duration` panics when the sum doesn't fit in the clock. In C that would be silent wraparound; Rust's standard library chooses a loud failure instead. Rust gives you the quiet version too, `checked_add`, which returns an `Option<Instant>`: `None` means overflow, and you decide what happens. A review found that `initial_delay = 9223372036854775807` sailed through validation and then took the whole agent loop down on the first `register`. Now validation refuses any `interval` or `initial_delay` over a day, and `deadline_after` cuts the delay to that day and uses `checked_add`, so even a config that skipped validation can't panic the loop.
 
+The same audit found three more `now + timeout` sums a few hops away: the deploy's health wait (`health_timeout`), the proxy's drain deadline (`drain_timeout`) and the stop grace that falls back to the drain timeout ([#2378](https://github.com/reliaburger/reliaburger/issues/2378)). Validation now caps the first at a day and the second at an hour, and the sums themselves became checked too ([#2527](https://github.com/reliaburger/reliaburger/issues/2527)):
+
+```rust
+let now = std::time::Instant::now();
+let deadline = now
+    .checked_add(wait)
+    .or_else(|| now.checked_add(HEALTH_WAIT_FALLBACK))
+    .unwrap_or(now);
+```
+
+`Option::or_else` runs its closure only when the option is `None`, so the fallback, the longest wait config accepts, is computed only on overflow. Each site has a test that passes `Duration::MAX` straight in, past validation, and expects no panic.
+
 ### evaluate_result: a pure function
 
 The function that decides state transitions is deliberately stateless:
@@ -1679,6 +1715,23 @@ pub fn compute_backoff(&self, restart_count: u32) -> Duration {
 `f64` handles large exponents gracefully. At extreme values, `powi` returns infinity, and `infinity.min(300.0)` is `300.0` (the max backoff). No overflow, no panic, no wrapping. The `.min()` method on floats is exactly the cap we need.
 
 `powi` is "power, integer exponent." It's faster than `powf` (which takes a float exponent) because integer exponentiation can use repeated squaring. The `i` suffix is Rust's naming convention for integer-argument variants.
+
+### Forgiving old restarts
+
+The first version passed the instance's `restart_count` straight in, and the count only ever went up. An instance that had restarted nine times over three months needed a five-minute gap before any later restart, however long it had run in between: the day its database failed over, it sat down for five minutes when a fresh instance would have waited two seconds (#2373). The count can't just be reset, because `relish apps` shows it as RESTARTS and the state sweep compares it to tell one run from the next, so it must never go backwards. The instance carries a second counter instead, `backoff_step`, which climbs with `restart_count` but drops to 0 when a run has lasted `RESTART_FORGIVEN_AFTER`, ten minutes, the window sidecars already used:
+
+```rust
+if instance.last_restart.is_some_and(|last| {
+    now.saturating_duration_since(last) >= crate::bun::restart::RESTART_FORGIVEN_AFTER
+}) {
+    instance.backoff_step = 0;
+}
+let required_backoff = instance
+    .restart_policy
+    .compute_backoff(instance.backoff_step);
+```
+
+`saturating_duration_since` returns zero rather than panicking if `last` is somehow later than `now`. A job's restart budget still counts `restart_count`: forgiving a job's failures would let it retry for ever.
 
 ### The struct update syntax
 
@@ -2339,6 +2392,8 @@ pub async fn probe_health(config: &HealthCheckConfig, host: &str) -> HealthStatu
 There's a double timeout here, and it's deliberate. `reqwest` has its own timeout (`config.timeout`), and we wrap the whole thing in `tokio::time::timeout` with an extra second. The outer timeout is a safety net: if reqwest's timeout mechanism fails (which can happen with certain connection states), we still give up. Belt and suspenders.
 
 `danger_accept_invalid_certs(true)` looks alarming, but it's correct for health probes. We're probing localhost containers that might use self-signed certs. We're checking "is the process alive and responding," not "is the TLS certificate valid." Certificate validation belongs in the security layer (Phase 4).
+
+That first line, `format!("{}://{}:{}{}", ...)`, is the version we started with, and the November 2026 audit found the hole in it (#2401). `config.path` comes from the app's file, and it's pasted straight after `host:port`. Write `path = "@169.254.169.254/latest/"` and the URL becomes `http://10.0.0.5:8080@169.254.169.254/latest/`: by the URL rules everything before the last `@` in the authority is a username and password, so the host is now `169.254.169.254`, and Bun, from the node's own network, probes whatever the app's author chose. The instance's health then tells them whether it answered. The fix works at both ends. Admission refuses a `health.path` that doesn't start with one `/`, or that holds whitespace or a control character (the rule `metrics.path` already had, now one shared `check_http_path`). And `probe_url` no longer builds the URL as text: it parses `scheme://host:port/` with `reqwest::Url`, then calls `set_path` and `set_query`, which can only ever change the path and query. It checks the path too, so a spec that reached desired state before the rule existed fails locally instead of probing elsewhere. The general rule holds in any language: never build a URL, a shell command or SQL by pasting user text next to the part that says where it goes.
 
 The return type maps directly to the `HealthStatus` enum the health checker already understands. No new types, no adapters. The pure logic processes results the same way whether they came from a real HTTP request or a test fixture.
 
@@ -3172,7 +3227,7 @@ The underscores are just digit separators, like `2_000_000_000` in Python. We pi
 
 With the namespace comes Docker's default capability set: `CAP_CHOWN`, `CAP_SETUID`, `CAP_NET_BIND_SERVICE` and a handful more. Inside a user namespace a capability only acts on what the namespace owns, so these let an entrypoint manage its own files and processes without any say over the host's.
 
-Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards. Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
+Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards (which is why Chapter 10 closes the unpacked tree to other local users). Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
 
 Second, `/sys`. The kernel only lets a user namespace mount a fresh `sysfs` if it also owns the network namespace, and ours was created by the node beforehand. Rootless mode already had the answer, a read-only bind of the host's `/sys`, so both paths share it now.
 
@@ -3187,6 +3242,54 @@ if let Some(run_as_user) = overrides.user {
 ```
 
 `by_id` is a closure that returns a `Result` of a three-element tuple. Assigning a tuple to existing `mut` variables in one go works the way it does in Python or Go (`uid, gid, home = ...`). Rust only allowed it on plain assignment, not just in `let`, from version 1.59.
+
+### Confining what root can ask for
+
+A user namespace stops container root being host root, but that's all it does. Until 0.3.4 it was the only barrier: the November 2026 audit found that a container could call any system call the kernel offers a user namespace (`keyctl`, `bpf`, `io_uring_setup`, `userfaultfd`, `unshare`), that a set-uid binary could still raise privileges inside it, and that the read-only bind of the host's `/sys` showed every container the node's whole cgroup tree: every namespace, app and instance, with its memory and CPU use (#2402). The design doc said a seccomp profile was applied. Nothing in the spec types could even hold one.
+
+Now `userns::apply` adds four things. The OCI spec has a field for each, so first the types grew:
+
+```rust
+pub struct OciLinux {
+    // ...namespaces, resources, mappings, sysctls, devices
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    #[serde(rename = "readonlyPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_paths: Vec<String>,
+}
+```
+
+`noNewPrivileges` on the process is a `bool` skipped when false, with `skip_serializing_if = "std::ops::Not::not"`: `Not::not` is the function behind the `!` operator, so serde calls `!value` and leaves the field out when that's true. Every new field has `#[serde(default)]`, so a runtime intent written before them still loads.
+
+The seccomp filter is the interesting one. We could have written our own list, and an earlier design-doc draft did: a dozen calls to block. A deny-list is the wrong shape. It misses every call the kernel adds after you wrote it, and `io_uring` alone has been the source of a steady run of privilege escalations since 2020. Docker and containerd use an allow-list of about 370 calls, maintained against real images for a decade, and that's what we ship, copied unchanged from Moby's `seccomp/v0.3.0` profile into `src/grill/seccomp_default.json`. Writing our own allow-list would only find, one bug report at a time, the images Docker runs and we don't.
+
+The file goes into the binary with `include_str!`, and it's parsed once:
+
+```rust
+const MOBY_DEFAULT_PROFILE: &str = include_str!("seccomp_default.json");
+
+fn moby_profile() -> Result<&'static MobyProfile, SeccompError> {
+    static PROFILE: OnceLock<Result<MobyProfile, String>> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            serde_json::from_str(MOBY_DEFAULT_PROFILE).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| SeccompError::Profile(error.clone()))
+}
+```
+
+`OnceLock` stores whatever the first caller's closure returns, here a `Result`, and hands every later caller a reference to it. `.as_ref()` turns `&Result<MobyProfile, String>` into `Result<&MobyProfile, &String>`, so we can borrow the profile out without moving it from the static. The `'static` in the return type is the lifetime of anything a `static` holds: the whole run of the program, so the caller can keep the reference as long as it likes.
+
+Moby's file isn't in the OCI format. Each rule may say it applies only on some architectures or only to a container holding some capabilities: `mount` and `unshare` are allowed only with `CAP_SYS_ADMIN`, `reboot` only with `CAP_SYS_BOOT`. `default_profile` does what Docker does at container start: keep the rules for this machine's architecture and the container's capability set, and drop the conditions. That's also how a runtime knob (#1122) that adds a capability works: `knobs::apply_to_spec` rebuilds the filter from the new capability set, so asking for `CAP_SYS_ADMIN` brings `mount` with it, as `docker run --cap-add` does. Without that the knob would grant a capability whose calls still failed.
+
+The other three are short. `noNewPrivileges` sets the kernel's `no_new_privs` bit, after which no set-uid binary or file capability raises the process's privileges. An image that starts as a non-root user and runs `sudo` breaks; an image that starts as root and drops with `gosu`, as Redis's does, doesn't notice. Masked paths hide `/proc/kcore`, `/proc/keys`, `/sys/firmware`, `/sys/kernel/security` and the rest of Docker's list (plus `/sys/fs/bpf`, where the node pins its eBPF maps), and read-only paths cover `/proc/sys` and `/proc/sysrq-trigger`. Finally a cgroup namespace: runc creates one, and a `cgroup` mount after the `/sys` bind covers `/sys/fs/cgroup` with the container's own cgroup as its root. Mount order matters here, since runc mounts in order and a mount under `/sys` that came first would vanish beneath the bind.
+
+The first `make test-linux` run broke every shared-runc job, with the helper reporting `ENOENT` for each task. Chapter 17's executor starts a task with `clone3(CLONE_INTO_CGROUP)` straight into a *sibling* of its own cgroup, and the kernel refuses a target outside the caller's cgroup namespace, with "no such file" rather than "permission denied". So the executor gets no cgroup namespace, and its `/sys/fs/cgroup` is masked instead: Bun already hands it the task cgroup as a file descriptor, so it never needed the path.
+
+`runc_container_runs_under_seccomp_without_new_privileges` (`make test-linux`) checks the result from inside: PID 1's `/proc/1/status` shows `Seccomp: 2` (filtering) and `NoNewPrivs: 1`, `/sys/fs/cgroup` lists the container's own `cgroup.procs` and no `reliaburger` tree, `/proc/kcore` reads as empty, and `unshare -U` fails. The Redis and nginx tests and the shared-runc executor suite run under the same filter.
 
 ### Testing image pulling
 
@@ -3264,6 +3367,36 @@ The methods that write to the journal take the claim by value and hand it back: 
 **Let something else own the process.** Every command Runc runs, from the long-lived `runc run` launcher to a two-second `ip link add`, starts under an independent *process owner*: a small Bun helper process that outlives Bun. The owner records the child's identity on disk before opening an execution gate that lets the command actually start. It holds its own lock file for its whole life, makes itself the subreaper so orphaned grandchildren come back to it, and is the only thing that ever reaps or signals the child. Bun talks to it over a private Unix socket. If Bun can take an owner's lock, the owner is gone, and an owner that vanished without recording a result is an error, never "probably finished". A timed-out wait means "still running", and the command stays on the books until its owner confirms it has retired.
 
 That socket conversation once panicked a Bun that had already shut down cleanly. Bun's owner bookkeeping takes file locks, so it runs in `tokio::task::spawn_blocking`, which hands a closure to a separate pool of threads where blocking is allowed. Inside it, `request` borrowed the runtime back with `Handle::current().block_on(...)` so it could put a Tokio `timeout` around the connect, write and read. Tokio's shutdown order is what broke it: when the runtime is dropped, async tasks are dropped first, then the timer stops, and only then does Tokio wait for blocking threads to finish. A status request still running at that moment registered a timer on a stopped driver, and Tokio panics with "A Tokio 1.x context was found, but it is being shutdown". It happened once in a jobs soak, during a graceful stop. The request now uses a plain `std` Unix socket instead. A nonblocking `connect` still fails at once on a full backlog, and socket read and write timeouts, plus one overall deadline, replace the Tokio timer. The code that runs on a blocking thread no longer needs the runtime at all, and a test calls it from a thread that has no runtime.
+
+`relish exec` and exec health checks use the same machinery. Each exec gets a helper owner of its own, in an `exec-*` directory inside its workload owner's, and the command's output used to go straight into two files there. The 1 MiB limit was checked only when the files were read back, after the command had finished. A command that printed a lot wrote gigabytes to the node's disk first, for up to five minutes, and then the caller got an error and none of the output ([#2392](https://github.com/reliaburger/reliaburger/issues/2392)). `exec_output_file_never_grows_past_its_limit` in `tests/process_recovery.rs` runs `yes` for two seconds and watches the file: on the old code it reached 4 GB.
+
+A workload's own output can't move off files: [Chapter 14](14-changing-the-tyres.md) explains how a pipe whose reader dies kills its writer with SIGPIPE. An exec is different. Its command is short-lived and its helper retires it anyway, so the helper hands the command pipes and drains them itself:
+
+```rust
+let (source, sink) = std::io::pipe()?;
+fcntl(&source, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+```
+
+`std::io::pipe` returns the two ends as owned values, `PipeReader` and `PipeWriter`, each closed when it's dropped and marked close-on-exec, so no other child inherits them. The writer becomes the command's stdout through `Stdio::from(sink)`. The reader is non-blocking, because the helper is a single-threaded loop that mustn't stall on a quiet command. Each turn, `OutputDrain::drain` copies what the pipe holds into the file, up to 1 MiB plus one byte, and throws away the rest. It keeps reading past the cap, or the command would block on a full pipe and never finish. The extra byte is the evidence that there was more. When Bun reads the files back, it returns the first mebibyte with `[output cut at 1 MiB]` as the last line, rather than an error. The in-process path that tests use reads its pipes with the same cap, and `runc exec`, which runs under the same helper, behaves the same way.
+
+There's one owner per workload, so whatever an owner costs, a busy node pays 500 times. Its loop used to look at everything (new clients, the child, adopted orphans, exec helpers) and then sleep for 10 ms, for as long as the workload ran. An idle owner woke 187 times in two seconds in `an_idle_owner_does_not_wake_on_a_timer`, which counts its voluntary context switches in `/proc/<pid>/status`. At 500 apps that's 50,000 wake-ups a second spent finding nothing to do, and it keeps a small CPU like a Wyse 3040's out of its deeper idle states ([#2447](https://github.com/reliaburger/reliaburger/issues/2447)).
+
+The owner can't just block on one thing, because the things it waits for arrive in different ways. A client arrives on the listening socket and output arrives on a pipe, and those are file descriptors that `poll(2)` can wait on together. A child's exit and a cancellation arrive as signals, SIGCHLD and SIGTERM, which no file descriptor reports. The classic answer is the *self-pipe trick*: the owner opens a socket pair, and the signal handler writes one byte to it. Now a signal is a readable descriptor too:
+
+```rust
+pub(super) extern "C" fn wake(_: nix::libc::c_int) {
+    let saved = nix::errno::Errno::last_raw();
+    let sender = WAKE_SENDER.load(std::sync::atomic::Ordering::Relaxed);
+    if sender >= 0 {
+        unsafe { nix::libc::write(sender, b"!".as_ptr().cast(), 1) };
+    }
+    nix::errno::Errno::set_raw(saved);
+}
+```
+
+A signal handler can interrupt the program anywhere, even halfway through a `malloc`, so it may only make *async-signal-safe* calls. Loading an atomic integer and calling `write(2)` are safe. Allocating, locking or printing aren't. `extern "C"` gives the function the C calling convention the kernel uses to call it, and the descriptor lives in a `static AtomicI32` because a handler can't capture anything: it's a plain function, not a closure. It saves and restores `errno` because the code it interrupted may be about to read its own. The sending end is non-blocking. If the channel is full a wake-up is already pending, so a failed write loses nothing.
+
+The loop drains the channel *before* it looks at anything, then looks, then calls `poll` on the listener, the channel and any output pipes. A signal that lands while it's looking leaves a byte behind, so the next `poll` returns at once. Drain after looking instead, and that byte would be swallowed with the work it announced still undone. While an exec is in flight or the workload is retiring, the loop keeps its 10 ms tick, since those paths are written as polling state machines. Otherwise it waits up to five seconds, as a safety net: a missed wake-up delays work, but can't lose it. Linux has a neater tool for the child alone, `pidfd_open`, a descriptor that turns readable when one process exits. But orphans the owner adopts as subreaper raise SIGCHLD too, and macOS has no pidfd, so one handler covers both. The same test now sees the idle owner wake no times at all in two seconds (three runs in the Lima VM, against 187 before), and `an_owner_sees_its_workload_exit_promptly` checks that a workload's exit still reaches Bun at once.
 
 With those three pieces, restart becomes a matter of reading and checking. For each instance, Bun finds its *adoption record* (its own note of what it was running: spec, PID, process start time, log location). `owned_adopt` claims the generation and cross-checks everything:
 

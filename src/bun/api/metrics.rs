@@ -49,7 +49,12 @@ pub(super) async fn metrics_query_handler(
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
 
-    let store = mayo.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let name = params.name.as_deref().unwrap_or("*");
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
@@ -75,11 +80,7 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         };
     }
 
@@ -94,11 +95,7 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         }
     } else {
         match store.query(name, start, end).await {
@@ -111,16 +108,13 @@ pub(super) async fn metrics_query_handler(
                     .collect();
                 Json(data).into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response(),
+            Err(e) => metrics_store_error(e),
         }
     }
 }
 
-/// `GET /v1/metrics/summary` — latest value for each metric.
+/// `GET /v1/metrics/summary` — the metric names reported in the last hour
+/// (`METRIC_NAMES_WINDOW_SECS`).
 pub(super) async fn metrics_summary_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -141,17 +135,25 @@ pub(super) async fn metrics_summary_handler(
         return Json(serde_json::json!([])).into_response();
     };
 
-    let store = mayo.read().await;
-    match store.metric_names().await {
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
+    match store
+        .metric_names_since(
+            crate::mayo::types::Sample::now(0.0)
+                .timestamp
+                .saturating_sub(crate::mayo::store::METRIC_NAMES_WINDOW_SECS),
+        )
+        .await
+    {
         Ok(names) => {
             // Return the list of known metrics (full summary requires more complex SQL)
             Json(serde_json::json!({"metrics": names})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -185,7 +187,8 @@ pub(super) async fn alerts_handler(
     Json(crate::mayo::alert::AlertsResponse { alerts: statuses }).into_response()
 }
 
-/// `GET /v1/metrics/keys` — list all distinct metric names.
+/// `GET /v1/metrics/keys` — the distinct metric names reported in the last
+/// hour (`METRIC_NAMES_WINDOW_SECS`).
 pub(super) async fn metrics_keys_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -206,14 +209,22 @@ pub(super) async fn metrics_keys_handler(
         return Json(serde_json::json!({"keys": []})).into_response();
     };
 
-    let store = mayo.read().await;
-    match store.metric_names().await {
-        Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match mayo.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
+    match store
+        .metric_names_since(
+            crate::mayo::types::Sample::now(0.0)
+                .timestamp
+                .saturating_sub(crate::mayo::store::METRIC_NAMES_WINDOW_SECS),
         )
-            .into_response(),
+        .await
+    {
+        Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -242,7 +253,12 @@ pub(super) async fn metrics_rollup_handler(
         return Json(Vec::<MetricsQueryRow>::new()).into_response();
     };
 
-    let store = rollup_store.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match rollup_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
@@ -267,11 +283,7 @@ pub(super) async fn metrics_rollup_handler(
                 .collect();
             Json(data).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -300,23 +312,86 @@ pub(super) async fn metrics_owned_rollup_handler(
         )
             .into_response();
     };
-    match store
-        .read()
-        .await
-        .query_owned_rows(
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let snapshot = match store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
+    // One page at a time; a longer answer names where the next page starts
+    // (#2451), and the entry node follows it.
+    match snapshot
+        .query_owned_page(
             params.name.as_deref(),
             params.start.unwrap_or(0),
             params.end.unwrap_or(i64::MAX as u64),
         )
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error":error.to_string()})),
-        )
-            .into_response(),
+        Ok(page) => {
+            let mut response = Json(page.rows).into_response();
+            if let Some(next) = page.next_start {
+                response.headers_mut().insert(
+                    crate::mayo::query_fanout::NEXT_START_HEADER,
+                    axum::http::HeaderValue::from(next),
+                );
+            }
+            response
+        }
+        Err(error) => metrics_store_error(error),
     }
+}
+
+/// `GET /v1/metrics/rollup/reporters`: the newest rollup window this
+/// aggregator holds from each node (#2536). The entry node of a cluster query
+/// asks every council member, to name a node that stopped reporting.
+pub(super) async fn metrics_rollup_reporters_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Metrics,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(store) = &state.rollup_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no rollup store configured",
+        )
+            .into_response();
+    };
+    Json(store.read().await.reporters()).into_response()
+}
+
+/// The nodes a cluster metric query expects rollups from: the members gossip
+/// calls live, with when each joined as far as this node knows (#2536).
+/// Empty without the member table, so nobody is called silent.
+async fn expected_reporters(
+    known: Option<&crate::bun::api::KnownMembers>,
+    now: u64,
+) -> Vec<crate::mayo::query_fanout::ExpectedReporter> {
+    let Some(known) = known else {
+        return Vec::new();
+    };
+    known
+        .live_since()
+        .await
+        .into_iter()
+        .map(
+            |(node_id, joined)| crate::mayo::query_fanout::ExpectedReporter {
+                node_id: node_id.0,
+                joined: now.saturating_sub(joined.elapsed().as_secs()),
+            },
+        )
+        .collect()
 }
 
 /// Resolve the base URLs of every council aggregator (Raft voter) from the
@@ -350,14 +425,26 @@ pub(super) async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>
     if urls.is_empty() { None } else { Some(urls) }
 }
 
+/// Window `/v1/metrics/cluster` reads when the caller gives no `start`: the
+/// last hour, not the whole rollup retention (#2451).
+pub(super) const CLUSTER_METRICS_DEFAULT_WINDOW_SECS: u64 = 60 * 60;
+
 /// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
+///
+/// Without `start` it reads the last [`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`].
+/// A member's answer comes in pages; a member that refuses the query (too
+/// many contributions in the range) is reported with its reason.
 ///
 /// Fans out to all council aggregators' `/v1/metrics/rollup/owned` endpoints,
 /// deduplicates worker contributions before summing, and returns the combined data
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
+///
+/// A live member whose rollups stopped reaching the council is named
+/// `QueryWarning::NodeSilent` (#2536).
 pub(super) async fn metrics_cluster_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    known: Option<axum::Extension<crate::bun::api::KnownMembers>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
@@ -373,7 +460,11 @@ pub(super) async fn metrics_cluster_handler(
     {
         return resp;
     }
-    let start = params.start.unwrap_or(0);
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    let start = params
+        .start
+        .unwrap_or_else(|| now.saturating_sub(CLUSTER_METRICS_DEFAULT_WINDOW_SECS));
+    let expected = expected_reporters(known.as_deref(), now).await;
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
     // full-domain unsigned range like `timestamp <= u64::MAX`.
@@ -396,6 +487,8 @@ pub(super) async fn metrics_cluster_handler(
             state.cluster_http.client(),
             timeout,
             state.service_token.as_deref(),
+            &expected,
+            now,
         )
         .await;
         return Json(result).into_response();
@@ -413,19 +506,27 @@ pub(super) async fn metrics_cluster_handler(
         .into_response();
     };
 
-    let store = rollup_store.read().await;
+    // One statement: the read guard is dropped before any query runs
+    // (#2449).
+    let store = match rollup_store.read().await.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return metrics_store_error(error),
+    };
     let result = store
         .query_owned_rows(params.name.as_deref(), start, end)
         .await;
     match result {
         Ok(rows) => {
-            Json(crate::mayo::query_fanout::merge_owned_rollups(vec![rows])).into_response()
+            let mut answer = crate::mayo::query_fanout::merge_owned_rollups(vec![rows]);
+            let heard = rollup_store.read().await.reporters();
+            answer
+                .warnings
+                .extend(crate::mayo::query_fanout::silent_reporters(
+                    &expected, &heard, start, end, now,
+                ));
+            Json(answer).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => metrics_store_error(e),
     }
 }
 
@@ -449,13 +550,16 @@ pub(super) async fn app_metric_rows(
     // reading just this node's store misses instances scheduled elsewhere.
     if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
         use crate::meat::types::AppId;
-        let desired = council.desired_state().await;
         let app_id = AppId::new(app, namespace);
-        let node_ids: Vec<crate::meat::NodeId> = desired
-            .scheduling
-            .get(&app_id)
-            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
-            .unwrap_or_default();
+        let node_ids: Vec<crate::meat::NodeId> = council
+            .read_desired(|desired| {
+                desired
+                    .scheduling
+                    .get(&app_id)
+                    .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
 
         if !node_ids.is_empty() {
             let members = membership.read().await;
@@ -500,12 +604,27 @@ pub(super) async fn app_metric_rows(
     // `query_app` escapes (OBS1): without that a crafted `?name=x' OR '1'='1`
     // or an app name carrying a quote would break out of the literal and drop
     // the tenant/time predicate, leaking other apps' metrics.
-    let rows = mayo
+    // One statement: the read guard is dropped before the query runs
+    // (#2449).
+    let snapshot = mayo
         .read()
         .await
+        .snapshot()
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = snapshot
         .query_app(&format!("{namespace}/{app}"), name, start, end, per_series)
         .await
         .map_err(|error| error.to_string())?;
+    // A full answer may have lost older rows; say so, as the fan-out does
+    // for each node (#2477).
+    let warnings = if rows.len() >= crate::mayo::store::APP_QUERY_ROW_LIMIT {
+        crate::mayo::query_fanout::truncation_warning(&super::local_node_name(state), rows.len())
+            .into_iter()
+            .collect()
+    } else {
+        vec![]
+    };
     Ok(MetricsQueryResult {
         data: rows
             .into_iter()
@@ -516,7 +635,7 @@ pub(super) async fn app_metric_rows(
                 value,
             })
             .collect(),
-        warnings: vec![],
+        warnings,
     })
 }
 
@@ -533,6 +652,21 @@ pub(super) fn app_query_window(start: Option<u64>, end: Option<u64>) -> (u64, u6
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
     (start, end)
+}
+
+/// A store error as an API answer: a refused query (past its deadline, or
+/// too many rows for its range) is the caller's to narrow, so a 400 with
+/// the reason; anything else is ours (#2382).
+pub(super) fn metrics_store_error(error: crate::mayo::types::MayoError) -> Response {
+    let status = match error {
+        crate::mayo::types::MayoError::QueryRejected(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 pub(super) fn metrics_error_response(error: String) -> Response {

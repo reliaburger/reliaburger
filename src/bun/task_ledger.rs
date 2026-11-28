@@ -301,6 +301,14 @@ pub fn scan(
         let count = u32::from_le_bytes([c0, c1, c2, c3]);
         let checksum = u32::from_le_bytes([k0, k1, k2, k3]);
         if count == 0 || count > MAX_BLOCK_RECORDS {
+            if header == [0; BLOCK_HEADER_BYTES] && rest_is_zero(&mut file)? {
+                // A filesystem that records a file's new size before its data
+                // leaves the unsynced last block as zeros after a power cut
+                // (#2377). Only a tail that is zeros to the end is torn:
+                // anything after it means real damage.
+                replayed.torn_tail = true;
+                break;
+            }
             return torn_or_corrupt(&mut replayed, at as usize, length as usize, at);
         }
         let end = at + BLOCK_HEADER_BYTES as u64 + u64::from(count) * RECORD_BYTES as u64;
@@ -328,6 +336,21 @@ pub fn scan(
         replayed.valid_bytes = at;
     }
     Ok(replayed)
+}
+
+/// Whether everything from the file's position to its end is zero bytes.
+/// Reads in fixed-size buffers, so memory stays bounded.
+fn rest_is_zero(file: &mut File) -> Result<bool, LedgerError> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        if buffer[..read].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+    }
 }
 
 fn torn_or_corrupt(
@@ -634,6 +657,43 @@ mod tests {
         let replayed = replay(&path_in(&dir)).unwrap();
         assert!(replayed.torn_tail);
         assert_eq!(replayed.records.len(), 1);
+    }
+
+    #[test]
+    fn a_zero_filled_tail_is_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(&path_in(&dir)).unwrap();
+        ledger.append(&[record(1, TaskFinal::Succeeded)]);
+        ledger.flush().unwrap();
+        drop(ledger);
+        let mut bytes = std::fs::read(path_in(&dir)).unwrap();
+        let durable = bytes.len() as u64;
+        // A filesystem that records the size before the data (#2377).
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        std::fs::write(path_in(&dir), &bytes).unwrap();
+
+        let replayed = replay(&path_in(&dir)).unwrap();
+        assert!(replayed.torn_tail);
+        assert_eq!(replayed.records, vec![record(1, TaskFinal::Succeeded)]);
+        Ledger::open(&path_in(&dir)).unwrap();
+        assert_eq!(std::fs::metadata(path_in(&dir)).unwrap().len(), durable);
+    }
+
+    #[test]
+    fn zeros_followed_by_data_are_still_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(&path_in(&dir)).unwrap();
+        ledger.append(&[record(1, TaskFinal::Succeeded)]);
+        ledger.flush().unwrap();
+        drop(ledger);
+        let mut bytes = std::fs::read(path_in(&dir)).unwrap();
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        bytes.push(1);
+        std::fs::write(path_in(&dir), &bytes).unwrap();
+        assert!(matches!(
+            replay(&path_in(&dir)),
+            Err(LedgerError::Corrupt { .. })
+        ));
     }
 
     #[test]

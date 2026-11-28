@@ -1,5 +1,9 @@
 # Wrapper: Built-In Ingress Proxy
 
+**Status:** Partly shipped (see the v1 contract note below).
+**Reconciled against:** not reconciled
+**Sketches:** ACME in §5.3 and §8.2, the keys marked planned in §6.1, §13
+
 > **Current v1 contract (2026-07-22):** Wrapper supports plain HTTP,
 > `tls = "cluster"` using the Sesame Ingress CA, and `tls = "explicit"`
 > using the certificate/key configured on the node. Omitting `tls` means
@@ -32,7 +36,7 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 |---|---|---|
 | **Bun agent** | Lifecycle host. Wrapper runs as async tasks within the Bun process. Bun starts Wrapper after the node has joined the cluster and the service map is initialised. | If Bun crashes, Wrapper stops. Bun's watchdog restarts the entire agent within seconds. |
 | **Sesame (PKI)** | Provides Ingress CA signing material to the resolver on a council-enabled ingress node for `tls = "cluster"` routes. | Without a usable resolver, Wrapper falls back to its development self-signed listener certificate. That isn't a production substitute for a cluster certificate. |
-| **Reporting tree** | Delivers runtime state (which app instances are running, on which nodes, at which host ports, and their health status) from Bun agents through council members to the leader, and back down to each node. Wrapper reads this state to build its routing table. | If the reporting tree stalls, Wrapper continues routing with the last known good routing table. Stale backends are detected by Wrapper's own active health probes. |
+| **Reporting tree** | Delivers runtime state (which app instances are running, on which nodes, at which host ports, and their health status) from Bun agents through council members to the leader, and back down to each node. Wrapper reads this state to build its routing table. | If the reporting tree stalls, Wrapper keeps routing with the last known good routing table for up to 60 s, the view lease, which only an answer from the council leader renews. Once the lease lapses, Wrapper routes only to backends on its own node and answers 503 for a route with none, until a leader answers again ([discovery-onion.md §7.6](discovery-onion.md#76-a-node-that-is-gone-view-leases)). Unreachable backends within the lease are found by Wrapper's own active probes. |
 | **Onion (service map)** | The in-kernel BPF hash map that maps app names to lists of healthy backend `(host_ip, host_port)` entries. Wrapper reads this map to resolve which backends are available for each ingress route. | The service map is maintained by Bun locally on each node. It is always available as long as Bun is running. |
 
 **Startup order within Bun:**
@@ -56,7 +60,7 @@ If no ingress routes are configured in any app spec, Wrapper still binds its por
 
 Wrapper binds two TCP listeners on the host network namespace:
 
-- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1.
+- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1. The redirect keeps the client's host. When the `Host` named a port, the redirect names the HTTPS listener's port instead (left out when it is 443); a `Host` with no port redirects with none, which is right behind a port mapping (#2471).
 - **Port 443 (HTTPS)**: The primary listener. Terminates TLS using `rustls`, performs SNI-based certificate selection, and routes the decrypted request to the appropriate backend.
 
 Both ports are configurable via `node.toml`:
@@ -67,9 +71,9 @@ http_port = 80
 https_port = 443
 ```
 
-Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its backend's count under the routing table's read lock, so a drain started under the write lock can't miss it.
+Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its primary backend's count under the routing table's read lock, so a drain started under the write lock can't miss it. A plain request captures only once its body has arrived, under a second read of the table: a slow upload holds no drain open (#2381). A failover candidate is captured only when the request moves on to it, which releases the one before, so a drain on a candidate the request never tried neither waits for it nor cancels it (#2469). That late capture happens outside the lock; a candidate withdrawn in between refuses the connection and the request moves on.
 
-Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A streaming response or a quiet WebSocket is never closed for being idle; only a stalled write ends it. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
+Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A quiet WebSocket is never closed for being idle; only a stalled write ends it. A proxied HTTP response is different: both upstream HTTP clients abort after 30 s without a byte from the backend, before the response head (the client gets 502) or between body chunks (the client's body ends with an error). A response that keeps sending, a server-sent event every few seconds say, has no total lifetime. The 30 s is fixed today; #1215 plans to make it configurable per route. The ingress handler adds three limits of its own on request bodies, which it buffers whole so it can replay one against a failover backend: a body over `max_request_body_bytes` (10 MiB) gets 413, a body that sends nothing for `request_body_idle` (30 s) gets 408, and every body being buffered shares `request_body_budget_bytes` (256 MiB, counted in KiB on a semaphore), so a request whose declared body won't fit gets 503 before any of it is read (#2381). The API and registry listeners set no body deadline: they stream long uploads. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -101,7 +105,7 @@ The routing table is an in-memory data structure mapping `(host, path_prefix)` p
 2. Look up the host in a `HashMap<String, Vec<PathRoute>>`. This is an exact match (no wildcard host matching in v1).
 3. Within the matched host, iterate `PathRoute` entries sorted by path length descending (longest prefix match). The first matching prefix wins.
 4. The matched `PathRoute` contains a `BackendPool` with a list of healthy backend addresses.
-5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4).
+5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4). A route keeps its round-robin position through table rebuilds and replacements, matched by host and path prefix, so a quiet route doesn't restart at its first backend each time the table changes (#2454).
 
 **Routing table updates:**
 
@@ -114,6 +118,10 @@ Wrapper's health information comes from two sources:
 1. **Passive health (from reporting tree):** The service map already excludes instances that have failed their application-level health checks. Wrapper inherits this by reading the service map.
 
 2. **Active health (Wrapper-local) — implemented.** A background probe loop (`run_health_probes`) runs its own lightweight L7 probes against each backend to catch instances that are "healthy" cluster-wide but unreachable from this specific node. A `ProbeTracker` applies hysteresis (three consecutive failures mark a backend locally unhealthy; two successes recover it), flipping `Backend.locally_healthy`, which `select_backend` then honours on top of the passive service-map signal.
+
+   A probe is a `GET /` that asks only whether this node can reach the backend. Any HTTP response, a 5xx included, passes; a refused or reset connection, a connection closed without an answer, or no answer within the 2 s timeout fails. Whether the app is well is the passive signal's job: its own health check, on its own path. Until #2464 a 5xx at `/` failed the probe, so an app with no handler there (a 501 from its framework, say) deployed green and then answered 502 on every path through every ingress node. The probe loop logs a backend's first flip to locally unhealthy, with the reason, and its recovery (`wrapper: web-1 at 10.0.0.5:30001 is unreachable from this node: ...`). Probing the app's declared health path instead would need that path, and its port and protocol, in the endpoint catalogue, a wire and durable-state change, to tell apart what the passive signal already reports.
+
+   A sweep probes up to 32 backends at once (`PROBE_CONCURRENCY`, with `buffer_unordered`), so backends that never answer cost one timeout per 32 of them, not one each (#2448). With thousands of backends a sweep can still take (B / 32) × timeout in the worst case. The loop applies a sweep's verdicts together: it checks under the read lock whether any verdict changes a backend (`RoutingTable::health_differs`), and takes the write lock once per sweep only when one does. A verdict applies only to the same `(instance_id, address)` pair it probed, so a late result can't judge a replaced endpoint.
 
 When all backends in a pool are unhealthy (per either signal), Wrapper returns `502 Bad Gateway`. Upstream **retry/failover of a single request** is now implemented for connect failures: `do_proxy` selects a primary plus up to two distinct candidates and retries on `reqwest::Error::is_connect()` (a connection that never established, so replay is side-effect-free). A 5xx is a completed send and is returned as-is, never replayed. A request sent on a pooled keep-alive connection that the backend had already closed (the send fails with an incomplete message or a reset, before any response head) is retried once on the same backend over a fresh, unpooled connection (`ProxyState::fresh_client`), but only when replay is safe: the method is idempotent (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`), or the request has a body that the HTTP client never began reading. The body is passed as a one-chunk stream that sets a flag on first poll, so a `POST` whose body was streamed is never replayed and answers 502. To make the race rare, the upstream pool drops idle connections after 50 s (`UPSTREAM_POOL_IDLE_TIMEOUT`), under nginx's 60 s and Go's 90 s keep-alive defaults (#322).
 
@@ -173,7 +181,12 @@ grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development
 certificate instead; a client that validates the hostname rejects it, so an
 unconfigured host can never obtain a trusted cluster certificate. The cache is
-additionally capped as defence in depth.
+additionally capped at 1,024 hosts (`MAX_SNI_CACHE`) as defence in depth. When
+it's full, a new host first evicts every entry whose host no longer has a
+`tls = "cluster"` route and every expired leaf, then, if all entries are still
+live, the least recently used one. Before #2430 a full cache refused new hosts,
+so a cluster that had served 1,024 preview hosts signed a fresh leaf on every
+handshake for the 1,025th, on a runtime worker thread.
 
 This currently requires the ingress node to have council state and the
 wrapping key material. If it doesn't, `cluster` hosts get the listener's
@@ -244,6 +257,8 @@ Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instanc
 ---
 
 ## 4. Data Structures
+
+This section is a design sketch, not the code. The types that exist in `src/wrapper/` are `RoutingTable`, `PathRoute`, `Backend`, `TlsMode`, `RateLimitConfig`, `RateLimiter`, `TokenBucket`, `HealthProbeConfig` and `WrapperConfig`, and their fields differ from the sketch. `BackendPool`, `LoadBalanceStrategy`, `DrainingBackend`, `ConnectionDrainState`, `DrainInfo`, `TrackedConnection`, `IngressRoute`, `HeaderRule` and `TlsVersion` don't exist: routes hold their backends directly, the drain tracker lives in `src/wrapper/draining.rs`, and headers and the TLS minimum aren't configurable.
 
 ```rust
 use std::collections::HashMap;
@@ -436,9 +451,10 @@ pub enum HeaderRule {
     Remove { name: String },
 }
 
-/// Active health probe configuration. The probe loop ships (§3.3) with fixed
-/// defaults: every 5s, 2s timeout, GET "/", 3 failures down, 2 successes up.
-/// Making it configurable, and `expected_status`, are planned.
+/// Active reachability probe configuration. The probe loop ships (§3.3)
+/// with fixed defaults: every 5s, 2s timeout, GET "/", 3 failures down,
+/// 2 successes up. Any HTTP response passes (#2464), so the shipped struct
+/// has no `expected_status`. Making it configurable is planned.
 pub struct HealthProbeConfig {
     /// Interval between probes.
     pub interval: Duration,
@@ -448,10 +464,8 @@ pub struct HealthProbeConfig {
     pub threshold_unhealthy: u32,
     /// Number of consecutive successes before marking healthy again.
     pub threshold_healthy: u32,
-    /// HTTP path to probe (default: "/").
+    /// HTTP path to probe (default: "/"). Its status doesn't matter.
     pub path: String,
-    /// Expected HTTP status codes (default: 200-399).
-    pub expected_status: std::ops::RangeInclusive<u16>,
 }
 
 /// Global Wrapper configuration (from node.toml [ingress] section).
@@ -525,7 +539,7 @@ Every inbound HTTPS request follows this path:
     b. If pool empty: respond 502 Bad Gateway
     c. Select backend by unweighted round-robin (the only strategy implemented; no strategy setting is exposed)
 8.  Proxy the request:
-    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369).
+    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, send the client's `Host`, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369; §8.4).
     b. Forward the request to backend_addr
     c. Stream the response back to the client
 9.  Connection accounting:
@@ -630,7 +644,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 1. Wrapper validates the `Sec-WebSocket-Key` header is present.
 2. Wrapper selects a backend from the pool (same algorithm as HTTP).
 3. Wrapper forwards the upgrade request to the backend.
-4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
+4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing). Any other final status (a `401`, `403`, `429`, a redirect) is relayed to the client with its end-to-end headers and up to 64 KiB of its body, read within what is left of the 30 s handshake deadline (#2470). A connect failure, a handshake timeout, an unparsable head or another `1xx` status gets `502`.
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
 6. WebSocket connections are long-lived. At a drain deadline the splice sends the client a Close 1001 (Going Away) frame, then closes both sockets (§5.5).
 
@@ -735,24 +749,41 @@ https_port = 443
 tls_cert = "/etc/reliaburger/ingress/fullchain.pem"
 tls_key = "/etc/reliaburger/ingress/private-key.pem"
 
-# Default drain timeout for rolling deploys.
-# Per-app drain_timeout in the app spec overrides this.
-# Default: "30s".
-drain_timeout = "30s"
+# Requests in flight at once, WebSockets included; past it, 503.
+# This counts requests, not connections. Default: 10000.
+max_connections = 10000
 
-# Global default rate limit (requests per second per client IP).
-# Applied to routes that do not specify their own rate limit.
-# Default: none (no rate limiting).
-# rate_limit_rps = 1000
-# rate_limit_burst = 2000
+# Connections both listeners hold open between them; one accepted past
+# it is closed at once (#2383). Default: 32768.
+max_open_connections = 32768
 
-# NOTE: the keys below are PLANNED, not parsed today.
+# TLS handshakes in progress from one client address; past it, that
+# client's next connection is dropped (#2383). Default: 16.
+max_tls_handshakes_per_source = 16
+
+# Largest request body forwarded (413 past it), and the bytes every body
+# being buffered may hold between them (503 past it) (#2381).
+# Defaults: 10 MiB and 256 MiB.
+max_request_body_bytes = 10485760
+request_body_budget_bytes = 268435456
+
+# NOTE: the keys below are PLANNED, not parsed today. The section refuses
+# unknown keys, so uncommenting one stops Bun at startup.
+#   - `drain_timeout` would set a node-wide default drain timeout. Today
+#     each app's `[app.<name>.deploy] drain_timeout` (default 30s) is the
+#     only one.
+#   - `rate_limit_rps` / `rate_limit_burst` would set a node-wide default
+#     rate limit per client IP. Today only routes that set their own are
+#     limited.
 #   - `min_tls_version` does not exist as a config key. The TLS minimum is
 #     not configurable; rustls 0.23's default (TLS 1.2+) applies, so 1.0/1.1
 #     are rejected, but there is no key to force 1.3-only.
 #   - the `health_probe_*` keys would tune the Wrapper-local active health
 #     probe (§3.3). The probe runs today, but only with its built-in
 #     defaults (5s interval, 2s timeout, GET "/").
+# drain_timeout = "30s"
+# rate_limit_rps = 1000
+# rate_limit_burst = 2000
 # min_tls_version = "1.2"
 # health_probe_interval = "5s"
 # health_probe_timeout = "2s"
@@ -781,7 +812,7 @@ websocket = false
 # rate_limit_burst = 200
 
 [app.web.deploy]
-# Drain timeout for this app during rolling deploys. Default: node-level setting.
+# Drain timeout for this app during rolling deploys. Default: 30s.
 drain_timeout = "30s"
 ```
 
@@ -853,23 +884,24 @@ Limitations:
 - IP-based only. Cannot rate limit by API key, user identity, or other application-level attributes.
 - Doesn't protect against volumetric attacks that saturate network bandwidth before reaching Wrapper.
 
+Below the rate limiter, the listeners bound what a flood can cost Bun itself (#2383). The two listeners share a cap on open connections (`max_open_connections`, 32,768); a connection accepted past it is closed before it costs a task. `max_connections` (10,000) is a separate cap on requests in flight. The TLS listener allows 512 handshakes in progress, and at most `max_tls_handshakes_per_source` (16) from one client address, so one host opening silent sockets can't keep every slot full. When `accept` fails because the process is out of file descriptors or kernel memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`), every accept loop in `sesame::connection` and the ingress pauses 100 ms instead of retrying at once: the pending connection stays queued, so an immediate retry fails the same way and spins a core. The API and registry listeners share the back-off but have no connection cap.
+
 For production deployments facing DDoS risk, operators should place a dedicated DDoS mitigation service (Cloudflare, AWS Shield, etc.) in front of the cluster. Wrapper's rate limiting protects against application-layer abuse, not network-layer floods.
 
 ### 8.4 Header Security
 
-Wrapper adds the following headers to proxied requests today (`forwarded_headers` in `src/wrapper/proxy.rs`):
+Wrapper sets these on every proxied request and WebSocket upgrade, from its own view of the connection (`forwarded_headers` and `UpstreamRequest::build` in `src/wrapper/proxy.rs`, `build_upgrade_request` in `src/wrapper/websocket.rs`):
 
-- `X-Forwarded-For`: Client IP appended to any existing chain.
-- `X-Forwarded-Proto`: `https`.
+- `Host` and `X-Forwarded-Host`: the host the client asked for, as it sent it (its `Host` header, or the HTTP/2 `:authority`), never the backend's address (#2404).
+- `X-Forwarded-For`: the TCP peer's address. It replaces anything the client sent; there is no chain.
+- `X-Forwarded-Proto`: `http` or `https`, the listener the request arrived on.
+- `X-Forwarded-Port`: the port of that listener.
+- `X-Real-IP`: the TCP peer's address.
+- `X-Request-ID`: the client's own if it sent a non-empty one, otherwise 32 random hex digits (a random `u128`, not a UUID).
 
-Planned, not yet added:
+Wrapper drops these from client requests (`is_forwarded_header`), so a backend can trust the values above: `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`, `Forwarded` and `X-Real-IP`. It also drops the hop-by-hop set, anything the client's `Connection` header names, and the node dashboard's session cookie.
 
-- `X-Real-IP`: Client's direct IP address.
-- `X-Request-ID`: Unique request identifier (UUID v4) if not already present.
-
-Wrapper strips the following headers from client requests before proxying:
-
-- `X-Forwarded-For` (replaced with accurate value to prevent spoofing, unless the peer IP is in a configured trusted proxy CIDR range).
+There is no trusted-proxy setting. Behind another proxy or a load balancer, the backend sees that proxy's address in `X-Forwarded-For` and `X-Real-IP`, and the rate limiter buckets every client behind it together (§5.1 step 6a).
 
 ---
 

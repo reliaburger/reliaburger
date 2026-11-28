@@ -13,7 +13,7 @@ ask any node and
 it gathers from every node that runs the app:
 
 ```sh
-relish logs web                  # everything captured
+relish logs web                  # the newest 10,000 lines
 relish logs web --tail 20 -f     # last 20 per replica, then follow
 relish logs web --grep error --since 1h
 relish logs web --grep 'GET /(healthz|ready)' --since 2h --until 1h
@@ -21,6 +21,12 @@ relish logs web --instance default__web-2      # one replica
 relish logs web --stream stderr                # only what it wrote to stderr
 relish logs web --json-field level=warn
 ```
+
+Without `--tail`, you get the newest 10,000 lines across the cluster, and a
+`warning: showing the newest 10000 lines` on stderr when there were more. Ask
+for an older stretch with `--since` and `--until`, or for more with `--tail`,
+up to 100,000. A query that runs longer than 8 seconds on a node is refused
+with a 400 asking you to narrow it, so give a busy app a time window.
 
 `--grep` is a regular expression, matched anywhere in the line, so quote it
 for your shell. A pattern that won't compile is refused before anything is
@@ -94,6 +100,7 @@ max_storage_mb = 2048             # default; 0 = no size cap
 
 [metrics]
 max_storage_mb = 1024             # default; 0 = no size cap
+export_path = "s3://bucket/metrics/" # optional, as for logs
 ```
 
 Both stores are capped by size as well as age. Past the cap, Bun prunes the
@@ -157,7 +164,8 @@ explains that a later export may repeat them.
 ## Metrics
 
 Every node collects its own system metrics and each workload's CPU and memory
-every 10 seconds, and keeps them for 7 days (`[metrics] retention_days`).
+every 10 seconds (`[metrics] collection_interval_secs`), and keeps them for 7
+days (`[metrics] retention_days`).
 The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
 `relish top` is a one-shot table of every workload on every node: node, app,
 namespace, state, PID, restarts, and the latest CPU and memory sample each
@@ -171,6 +179,31 @@ doesn't answer becomes a `warning:` line rather than an error:
 ```sh
 relish top                       # every node's workloads, with CPU and memory
 ```
+
+Each node also sends the council a one-minute summary of every series it
+has, which is what `/v1/metrics/cluster` sums. A node with many series sends
+its minute in several parts; if a single series is too large to send at all
+(a label holding a megabyte, say), the node counts it in its own
+`mayo_rollups_refused_total` metric and logs it.
+
+The metrics API answers within bounds. `GET /v1/metrics?name=X` and
+`/v1/metrics/rollup?name=X` return at most the newest 10,000 rows of the
+range you ask for, `/v1/metrics/summary` and `/v1/metrics/keys` list the
+metrics reported in the last hour, and a query that runs longer than 8
+seconds is refused with a 400 asking for a narrower range.
+`/v1/metrics/cluster` reads the last hour when you give no `start`. A council
+member that refuses a range (more than 200,000 node-minute contributions, or
+one minute holding more than 10,000) shows up in the answer's `warnings` as
+`QueryRefused` with its reason, not as an unresponsive node.
+A live node whose rollups haven't reached the council for five minutes is
+named as `NodeSilent`, with when its last rollup arrived (`last_seen`, or
+none): its share of the sums is missing. A node that joined in the last five
+minutes isn't expected to have reported yet.
+`/v1/metrics/app/{app}/{namespace}` (what `relish metrics` reads) asks each
+node running the app for its newest 10,000 rows in the range. A node whose
+answer reached that limit is named in `warnings` as `Truncated`, and `relish`
+prints the warning: that node's older rows are missing, so ask for a shorter
+range or one metric with `--name`.
 
 ### Remote metrics archives
 
@@ -205,7 +238,7 @@ prove node ownership, and no automatic migration assigns them to a node.
 ### Your app's own metrics
 
 An app that serves Prometheus text declares it, and each node scrapes its own
-instances every 10 seconds. You don't install Prometheus, and the metrics port
+instances every 10 seconds (`[metrics] app_scrape_interval_secs`). You don't install Prometheus, and the metrics port
 needn't be published:
 
 ```toml
@@ -242,17 +275,39 @@ app's page in the web dashboard charts the same data, one line per instance.
 Axes and legends pick a readable unit (`12 MiB`, `300 µs`, `1.5k req/s`),
 and the legend shows each line's newest value until you hover over a point.
 
+A scrape takes at most an 8 MiB response and 20,000 samples; one over either
+limit fails whole, so nothing from it is stored, `up` is 0 for that instance
+and Bun logs the reason. The limits are fixed, not settings.
+
+An app can't use the names the node writes for itself: anything starting
+`node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_` or
+`discovery_withdrawal_`, plus `up`, `process_cpu_percent`,
+`process_memory_bytes` and the `job_*` names the
+[batch jobs chapter](14_batch-jobs.md#job-history-metrics-and-events) lists.
+A scraped sample with one of those names is stored as `exported_<name>`
+(`exported_node_cpu_usage_percent`), the way a clashing `app`, `namespace`,
+`instance` or `node` label becomes `exported_<label>`, so an app can't raise
+the node's alerts or draw on its charts. Other `process_*` names, such as a
+client library's `process_cpu_seconds_total`, keep their names.
+
 There's no PromQL. You read metrics through `relish metrics`, the dashboards
 and the API. For something that isn't an app on the cluster, such as a node
 exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
-`url`; they're scraped every 30 seconds.
+`url`; they're scraped every 30 seconds (`[metrics] scrape_interval_secs`).
 
 ### Alerts
 
 Each node evaluates four built-in rules against its own metrics every 30
-seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
+seconds (`[alerts] evaluation_interval_secs`; `[metrics] alerts_enabled = false`
+turns them off): CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 (critical); memory above 70% for 10 minutes and disk above 80% for 5 minutes
-(warning). An idle node raises nothing: low CPU is spare capacity, not a fault. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
+(warning). An idle node raises nothing: low CPU is spare capacity, not a fault.
+The rules read only the node's own series, never one with an `app` label. A
+firing alert whose metric stops reporting resolves after 10 evaluations
+without a reading (5 minutes at the default interval), and at most 8
+deliveries run at once. A firing alert survives a Bun restart (an upgrade,
+say): it's kept in `alerts-firing.json` in the data directory, so a
+condition that cleared while Bun was down still sends its resolve. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml

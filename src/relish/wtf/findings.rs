@@ -149,6 +149,17 @@ pub const FINDINGS: &[FindingKind] = &[
         }],
     },
     FindingKind {
+        id: "council-retired-identities-nearly-full",
+        severities: WARNING,
+        meaning: "the council's list of permanently retired node identities is nearly at its limit, after which `relish decommission-node` is refused",
+        thresholds: &[Threshold {
+            constant: "RETIRED_IDENTITY_WARNING_PERCENT",
+            value: crate::cluster::retirement::RETIRED_IDENTITY_WARNING_PERCENT as u64,
+            unit: Unit::Percent,
+            meaning: "of the 65,536 retired identities a cluster can hold",
+        }],
+    },
+    FindingKind {
         id: "council-multiple-leaders",
         severities: CRITICAL,
         meaning: "more than one node reports itself, or is reported, as the council leader",
@@ -201,6 +212,12 @@ pub const FINDINGS: &[FindingKind] = &[
         id: "export-failing",
         severities: WARNING,
         meaning: "a node can't export its logs or metrics; it prunes only what it has exported, so the store's size cap and retention are on hold until an export works",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "image-collection-failing",
+        severities: WARNING,
+        meaning: "a node's image collection pass keeps failing or being refused (a container bundle whose spec it can't read), so no unpacked image is removed and each new image version takes more disk",
         thresholds: &[],
     },
     FindingKind {

@@ -45,6 +45,7 @@ pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
 pub mod runc_intent;
+pub mod seccomp;
 pub mod snapshot;
 pub mod state;
 pub mod stop;

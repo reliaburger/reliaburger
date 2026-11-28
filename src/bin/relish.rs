@@ -386,10 +386,17 @@ struct JoinOptions {
     /// `identity` in the current directory (matching `relish init`).
     #[arg(long)]
     identity_dir: Option<std::path::PathBuf>,
-    /// Pin the cluster's root CA fingerprint (`sha256:...`). When set,
-    /// a member offering a different root CA is refused.
-    #[arg(long)]
+    /// Pin the cluster's root CA fingerprint (`sha256:...`, printed by
+    /// `relish init`). A member offering a different root CA is refused
+    /// before the token is sent. Required unless
+    /// `--insecure-trust-first-ca` is given.
+    #[arg(long, required_unless_present = "insecure_trust_first_ca")]
     ca_fingerprint: Option<String>,
+    /// Trust whatever root CA the member offers, unverified, and send it the
+    /// join token. Someone on the path can then capture the token. Prefer
+    /// `--ca-fingerprint`.
+    #[arg(long, conflicts_with = "ca_fingerprint")]
+    insecure_trust_first_ca: bool,
 }
 
 // `relish metrics`, boxed to keep the generated `Command` parser
@@ -2126,12 +2133,21 @@ enum SecretAction {
         namespace: Option<String>,
     },
     /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
+    ///
+    /// The value comes from `--value-file`, or from standard input when
+    /// neither it nor VALUE is given (asked for without echo at a terminal).
+    /// One trailing newline is dropped, so `echo` and `printf` both work.
     Encrypt {
         /// The age public key (from `relish secret pubkey`).
         #[arg(long)]
         pubkey: String,
-        /// The plaintext value to encrypt.
-        value: String,
+        /// The plaintext value to encrypt. An argument shows in the process
+        /// list and shell history: prefer --value-file or standard input
+        /// for a real secret.
+        value: Option<String>,
+        /// Read the value from this file instead.
+        #[arg(long, conflicts_with = "value")]
+        value_file: Option<PathBuf>,
     },
     /// Rotate the secret encryption key (start or finalise).
     ///
@@ -2865,6 +2881,7 @@ async fn main() -> ExitCode {
                 ref node_id,
                 ref identity_dir,
                 ref ca_fingerprint,
+                insecure_trust_first_ca: _,
             } = *options;
             async {
                 let token = match (token, token_file) {
@@ -3334,9 +3351,16 @@ async fn main() -> ExitCode {
             SecretAction::Pubkey { dir, namespace } => {
                 commands::secret_pubkey(dir.as_deref(), namespace.as_deref(), cli.output).await
             }
-            SecretAction::Encrypt { pubkey, value } => {
-                commands::secret_encrypt(pubkey, value, cli.output)
+            SecretAction::Encrypt {
+                pubkey,
+                value,
+                value_file,
+            } => match (value, value_file) {
+                (Some(value), _) => Ok(value.clone()),
+                (None, Some(path)) => commands::read_secret_value_file(path),
+                (None, None) => commands::read_secret_value_stdin(),
             }
+            .and_then(|value| commands::secret_encrypt(pubkey, &value, cli.output)),
             SecretAction::Rotate {
                 finalize,
                 namespace,
@@ -6182,6 +6206,59 @@ mod tests {
         assert!(parse(&["relish", "setup", "--ssh", "u@a", "--nodes", "3"]).is_err());
     }
 
+    /// Every `relish ...` command quoted in backticks in `source`'s
+    /// non-test half, cut before its first argument placeholder or flag.
+    fn quoted_relish_commands(source: &str) -> Vec<Vec<String>> {
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        code.match_indices("`relish ")
+            .map(|(start, opening)| {
+                let rest = &code[start + opening.len()..];
+                let end = rest.find(['`', '\n']).unwrap_or(rest.len());
+                rest[..end]
+                    .split_whitespace()
+                    .take_while(|word| {
+                        !word.starts_with('-') && !word.contains(['<', '[', '{', '"', '\\'])
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_command_a_wtf_suggestion_names_exists() {
+        // `relish wtf` advised `relish pickle gc`, which has never existed,
+        // and agents run what `relish agent diagnose` suggests (#2468).
+        let sources = [
+            ("wtf/diagnose.rs", include_str!("../relish/wtf/diagnose.rs")),
+            ("wtf_cmd.rs", include_str!("../relish/wtf_cmd.rs")),
+            (
+                "agent/diagnose.rs",
+                include_str!("../relish/agent/diagnose.rs"),
+            ),
+        ];
+        let root = <Cli as clap::CommandFactory>::command();
+        let mut checked = 0;
+        for (file, source) in sources {
+            for words in quoted_relish_commands(source) {
+                let mut command = &root;
+                for word in &words {
+                    if command.get_subcommands().next().is_none() {
+                        break; // the rest are arguments
+                    }
+                    command = command.find_subcommand(word).unwrap_or_else(|| {
+                        panic!(
+                            "{file} suggests `relish {}`: no subcommand {word:?}",
+                            words.join(" ")
+                        )
+                    });
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "found only {checked} quoted commands");
+    }
+
     #[test]
     fn parse_join_token_file_and_reject_conflicting_credentials() {
         assert!(
@@ -6192,6 +6269,8 @@ mod tests {
                 "/private/join.token",
                 "--node-id",
                 "node-02",
+                "--ca-fingerprint",
+                "sha256:ab",
                 "https://10.0.1.5:9117"
             ])
             .is_ok()
@@ -6222,6 +6301,56 @@ mod tests {
         );
     }
 
+    /// Without a pinned root CA fingerprint, `relish join` would trust
+    /// whatever CA the first member offered and send it the join token
+    /// (#2410). The pin is required, unless the operator opts out by name.
+    #[test]
+    fn join_requires_a_ca_fingerprint_or_an_explicit_opt_out() {
+        let base = [
+            "relish",
+            "join",
+            "--token",
+            "t",
+            "--node-id",
+            "node-02",
+            "https://10.0.1.5:9117",
+        ];
+        assert!(parse(&base).is_err(), "an unpinned join must not parse");
+        let pinned: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--ca-fingerprint", "sha256:ab"])
+            .collect();
+        assert!(parse(&pinned).is_ok());
+        let opted_out: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--insecure-trust-first-ca"])
+            .collect();
+        assert!(parse(&opted_out).is_ok());
+        let both: Vec<&str> = pinned
+            .iter()
+            .copied()
+            .chain(["--insecure-trust-first-ca"])
+            .collect();
+        assert!(parse(&both).is_err(), "a pin and the opt-out conflict");
+    }
+
+    #[test]
+    fn secret_encrypt_accepts_a_value_file_or_stdin_instead_of_an_argument() {
+        // An argument shows in `ps` and shell history (#2407).
+        let base = ["relish", "secret", "encrypt", "--pubkey", "age1x"];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            parse(&args)
+        };
+        assert!(with(&["--value-file", "/private/secret"]).is_ok());
+        assert!(with(&[]).is_ok(), "no value means standard input");
+        assert!(with(&["plain"]).is_ok(), "the argument still works");
+        assert!(with(&["plain", "--value-file", "/private/secret"]).is_err());
+    }
+
     #[test]
     fn parse_join_command() {
         let cli = parse(&[
@@ -6231,6 +6360,8 @@ mod tests {
             "abc123",
             "--node-id",
             "node-02",
+            "--ca-fingerprint",
+            "sha256:ab",
             "https://10.0.1.5:9117",
         ])
         .unwrap();
@@ -6243,13 +6374,15 @@ mod tests {
                     node_id,
                     identity_dir,
                     ca_fingerprint,
+                    insecure_trust_first_ca,
                 } = *options;
                 assert_eq!(token.as_deref(), Some("abc123"));
                 assert!(token_file.is_none());
                 assert_eq!(addr, "https://10.0.1.5:9117");
                 assert_eq!(node_id, "node-02");
                 assert!(identity_dir.is_none());
-                assert!(ca_fingerprint.is_none());
+                assert_eq!(ca_fingerprint.as_deref(), Some("sha256:ab"));
+                assert!(!insecure_trust_first_ca);
             }
             _ => panic!("expected Join command"),
         }

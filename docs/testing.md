@@ -19,13 +19,14 @@ run it.
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
 | Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
 | Lint and format | Clippy with warnings as errors, all features and none, over every target; the macOS job runs the all-features pass only, because that one holds the macOS-only code, over the library, `relish` and `bun` ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)) | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
-| Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` (then `make coverage-html` for the HTML report) |
+| Coverage floor | Line coverage of the portable suite never drops below 87.60%, raised at each minor release when coverage has risen ([#2487](https://github.com/reliaburger/reliaburger/issues/2487)) | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` (then `make coverage-html` for the HTML report) |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md), [6 Nov](qualification/2026-11-06-dependency-exceptions.md), [12 Nov](qualification/2026-11-12-dependency-exceptions.md) and [17 Nov](qualification/2026-11-17-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
+| Appliance image scripts | The image's launcher, boot check, disk and netboot helpers, installer modules, `/etc` sync and lab tools; the ones that need Linux or a missing tool skip, saying why ([#2484](https://github.com/reliaburger/reliaburger/issues/2484)) | [`image/tests/test_*.py`](../image/tests) | `make test-ci-scripts` |
 | Agent gym, without a cluster | Every scenario parses, each plant still applies to the checkout, the scorer's verdicts over recorded transcripts (right, partly right, wrong, steered, out of scope), the runner end to end with a fake cluster and a `relish` answering from calls recorded on a real one, and the Kubernetes ports against a rendered lab and fake `kubectl`, `claude`, `kubectl-ai` and `holmes` ([below](#an-agent-gym)) | [`scripts/gym/test_*.py`](../scripts/gym) | `make test-ci-scripts` |
-| Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
-| Feature status page | [`features.toml`](features.toml) has a valid schema, one of four statuses per row, an issue for every planned row and docs links that land on a real heading, and [`features.html`](website/features.html) is up to date with it; nightly, every issue it links is still open | [`features_page.py`](../scripts/ci/features_page.py) and its tests in `make test-ci-scripts`; the issue states in [`features.yml`](../.github/workflows/features.yml) nightly and on pull requests that edit the TOML | `make test-ci-scripts`, `python3 scripts/ci/features_page.py check-issues` |
+| Flakes register | Every row of [`flakes.md`](flakes.md) whose status doesn't start with "Fixed", "Not a defect", "Infrastructure" or "Superseded" links an issue, and every issue an "Open" row links is still open ([#2491](https://github.com/reliaburger/reliaburger/issues/2491)) | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
+| Feature status page | [`features.toml`](features.toml) has a valid schema, one of four statuses per row, an issue for every planned row and docs links that land on a real heading, and [`features.html`](website/features.html) is up to date with it; nightly, every issue it links is still open, and, on a pull request into main, that no row links an issue the pull request closes (`check-closing`) | [`features_page.py`](../scripts/ci/features_page.py) and its tests in `make test-ci-scripts`; the issue states in [`features.yml`](../.github/workflows/features.yml) nightly and on pull requests that edit the TOML | `make test-ci-scripts`, `python3 scripts/ci/features_page.py check-issues`, `check-closing N...` |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
 `make ci` runs the portable set locally, the same way CI does, quickest
@@ -213,12 +214,13 @@ ignored by default and run by their own targets and CI jobs
 | Layer | What it proves | Where | Run |
 |---|---|---|---|
 | Linux runtime | runc, user namespaces, eBPF service discovery, nftables, Btrfs, rootless runc | [`tests/owned_runc.rs`](../tests/owned_runc.rs), [`tests/ebpf.rs`](../tests/ebpf.rs), [`tests/owned_network.rs`](../tests/owned_network.rs), [`tests/owned_rootless.rs`](../tests/owned_rootless.rs) | `make test-linux` |
-| Crash recovery | Bun killed at every awkward moment: before adoption, mid-rollout, with owners alive | [`tests/oci_crash.rs`](../tests/oci_crash.rs), [`tests/job_recovery.rs`](../tests/job_recovery.rs), [`tests/registry_recovery.rs`](../tests/registry_recovery.rs), [`qualify-oci-interruptions.sh`](../scripts/release/qualify-oci-interruptions.sh) | `make test-linux` |
+| Crash recovery | Bun killed at every awkward moment: before adoption, mid-rollout, with owners alive | [`tests/job_recovery.rs`](../tests/job_recovery.rs), [`tests/registry_recovery.rs`](../tests/registry_recovery.rs), and the portable cases of [`tests/oci_crash.rs`](../tests/oci_crash.rs) | `make test` |
+| Crash recovery on real OCI | Bun killed around adoption with real runc, `ip`, nft, bpffs and tmpfs, as root on an isolated Linux host; `make test-linux` leaves `oci_crash` out ([#2494](https://github.com/reliaburger/reliaburger/issues/2494)) | The root-only cases of [`tests/oci_crash.rs`](../tests/oci_crash.rs), run by [`qualify-oci-interruptions.sh`](../scripts/release/qualify-oci-interruptions.sh); its two rootless cases run under `make test-rootless-runc`, and its host-reboot case through `qualify-discovery-reboot.sh` | `scripts/release/qualify-oci-interruptions.sh`, which CI's privileged Linux job runs |
 | Multi-node clusters | Leader failover, council self-healing and full-loss recovery, placement, gossip, an image surviving the loss of the node it was pushed to (Linux only), and the 0.2.4 exit test: policies through `relish apply`, GitOps and a leader kill, an admin removing a deny-everything policy, a controller failing a templated pair over, an agent lease surviving a leader kill and expiring on the new leader, and an agent proposal approved through a follower, surviving a leader kill as applied and undone on the new leader to its exact `before` revision | [`tests/cluster_failover.rs`](../tests/cluster_failover.rs), [`tests/council_self_healing.rs`](../tests/council_self_healing.rs), [`tests/council_disaster_recovery.rs`](../tests/council_disaster_recovery.rs), [`tests/placement.rs`](../tests/placement.rs), [`tests/cluster_task_arrays.rs`](../tests/cluster_task_arrays.rs), [`tests/registry_durability.rs`](../tests/registry_durability.rs) | `make test-cluster` |
 | Feature demos | [`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) (roll forward, roll back, a bad version rolled back and marked `RolloutFailed`) and [`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) (a `file://` repository synced, an app deleted from it, a hand-applied app left alone) run to completion on a one-node cluster each starts through [`lib.sh`](../scripts/demo/lib.sh); a step that doesn't do what it says fails the demo, and each must print the resource readout and summary [`resources.py`](../scripts/demo/resources.py) samples ([`test_demo_resources.py`](../scripts/ci/test_demo_resources.py) covers its parsing and arithmetic). [`test_demo_scripts.py`](../scripts/ci/test_demo_scripts.py) checks on every run that they stop on the first error and swallow nothing | [`tests/demos.rs`](../tests/demos.rs) | `make test-cluster`; by hand `make rollout-demo`, `make gitops-demo` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
-| S3 object storage | Logs export to an S3 bucket, and a council backup goes up, lists, prunes and restores, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
+| S3 object storage | Logs export to an S3 bucket, a council backup goes up, lists, prunes and restores, and an interrupted volume-snapshot upload restarts cleanly, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs), [`src/bun/snapshot_worker.rs`](../src/bun/snapshot_worker.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, policy evaluation per app for 10 to 1,000 policies, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
@@ -339,11 +341,12 @@ record goes in [`qualification/`](qualification):
 | `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
 | `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
-| `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after a promote, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
+| `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after the promote of every minor release, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). Before promotion, the candidate's `build.yml` starts each Linux release `bun` and runs one app ([`smoke-release-bun.sh`](../scripts/release/smoke-release-bun.sh), [#2486](https://github.com/reliaburger/reliaburger/issues/2486)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
 | `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host, the night before a planned freeze, armed with `nightly-qualify.sh --once` ([arming a nightly](releasing.md#arming-a-nightly), [#1721](https://github.com/reliaburger/reliaburger/issues/1721)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record, freeze rule, the one-night launchd job and the evening's build and staging, with fakes for `gh` and `launchctl` ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
+| `make test-hollow` (twenty hollow nodes, then a hundred running 1,000 apps, [below](#hollow-nodes)) | A multi-core host, macOS or Linux, without root; the two tests took 2 minutes 19 seconds on the Mac Studio on 27 November 2026 at a load average around 12, after a build of the test binaries | The maintainer, before any release that changes the cluster summary (`src/bun/api/summary.rs`), the reporting path (`src/reporting/`) or the hollow-node harness (`tests/hollow_nodes.rs`, `tests/support/hollow.rs`). No workflow runs it yet: the hundred-node check's 1 s budget has never been timed on a hosted runner, and running it in CI needs an evidence owner of its own ([#2489](https://github.com/reliaburger/reliaburger/issues/2489)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
-| `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
+| `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, after the tag, on every minor release and on a patch release that changes the job path or follows a throughput regression ([release step 9](releasing.md#staging-a-candidate), [#2488](https://github.com/reliaburger/reliaburger/issues/2488)); `the_newest_minor_release_has_a_profile_record` checks the newest minor series has a record. Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
 | `qualify-v02-loops-local.sh` (the loop lanes of `v02-loops.yml` on one Mac, [below](#loops-on-one-mac)) | A quiet Apple-silicon Mac with `cargo-nextest`, and a running arm64 Lima VM with Rust, `cargo-nextest`, `make`, `btrfs-progs` and passwordless `sudo` (`reliaburger-test` by default), with 40 GiB free on each | The maintainer, when the loop record is taken on the Mac Studio instead of GitHub ([#287](https://github.com/reliaburger/reliaburger/issues/287)). `make test-ci-scripts` checks its lanes, filters and archive against the workflow ([`test_loop_summary.py`](../scripts/release/test_loop_summary.py)) |
 
 ### Benchmarks in CI
@@ -352,17 +355,36 @@ The `benchmarks` job in [`ci.yml`](../.github/workflows/ci.yml) runs `make
 bench` (the gossip benchmarks, then [`benches/scheduler.rs`](../benches/scheduler.rs):
 a leader pass placing 150 replicas, and a converged pass, on 1,000 and 10,000
 nodes, then [`benches/policy.rs`](../benches/policy.rs): compiling 10, 100 and
-1,000 policies, and judging one app under them) and `make bench-large`, and the `task-array benchmarks` job runs `make
+1,000 policies, and judging one app under them, then
+[`benches/wrapper_drains.rs`](../benches/wrapper_drains.rs): the ingress
+drain tracker's capture and release on the request path,
+[#2455](https://github.com/reliaburger/reliaburger/issues/2455)) and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
-request runs the first when it touches the gossip protocol or its benchmarks,
-and the second when it touches what `benches/task_arrays.rs` measures: the
+request runs the first when it touches what `make bench` measures: the gossip
+protocol, the scheduler's planning pass (`src/cluster/orchestrate.rs` and the
+scheduler, filter, score, quota and cluster-state modules under `src/meat/`),
+the policy engine (`src/policy/`), the drain tracker (`src/wrapper/draining.rs`), or any of their benchmarks
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)); and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
 itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
 `criterion`'s version, in `Cargo.toml` or only in `Cargo.lock`, runs both,
 because both parse its output and use its filter syntax
 ([#1151](https://github.com/reliaburger/reliaburger/issues/1151)). A pull request into a
-merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip numbers
-gate nothing. The task-array job compares each benchmark's mean with the
+merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip, scheduler and policy numbers
+gate nothing: they're uploaded and no job compares them. Gossip's are a
+simulated network and vary with the runner; the scheduler and policy
+benchmarks are pure CPU work on in-memory data, the kind `bench_baseline.py`
+could compare, but whether to is a maintainer decision. Because nothing
+compares them, a pull request or a merge group builds `make bench` with 16
+codegen units for the workspace crate (`cargo --config
+profile.bench.package.reliaburger.codegen-units=16`, through the job's
+`BENCH_CARGO`). The release profile's single unit made that crate a 20-minute
+compile on one core, and the job was the merge queue's last in 18 of 29 groups
+from 25 to 27 November 2026
+([#1723](https://github.com/reliaburger/reliaburger/issues/1723)). The
+dependencies keep their settings, so the cache the task-array job shares still
+matches, and the nightly and pushes build the release profile, so the numbers
+kept from them compare with earlier ones. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
 differ by tens of per cent from run to run, and on 12 October 2026 one was
@@ -423,8 +445,10 @@ in the `Makefile` isn't run by any workflow.
 
 ### S3 in CI
 
-`make test-s3` exports logs to an S3 bucket and round-trips a council backup
-through it: put, list, prune and restore by key. Until 0.2.6 it needed AWS
+`make test-s3` exports logs to an S3 bucket, round-trips a council backup
+through it (put, list, prune and restore by key), and cuts a volume
+snapshot's multipart upload off by its deadline to check that the next sweep
+ships the archive whole. Until 0.2.6 it needed AWS
 credentials and a real bucket, which the qualification Mac didn't have, so
 0.2.5 shipped without it (#1534). Now
 [`scripts/test-s3.sh`](../scripts/test-s3.sh) finds a bucket one of three ways:
@@ -495,10 +519,11 @@ jobs. What else runs depends on where the change is going:
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Draft pull request, or one from a `0-4-0/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
+| Draft pull request, or one from a `0-4-0/` or `0-3-4/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
 | Merge-queue group | Everything but portable macOS; only CI policy and the gate when the group changes nothing but documentation | set by acceptance and the privileged Linux jobs instead of portable macOS, plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| [`appliance.yml`](../.github/workflows/appliance.yml), a ready pull request into `main` or a train that changes `image/`, `src/os/`, `src/appliance/`, `src/bun/`, `src/relish/netboot/`, `src/relish/os.rs`, `src/relish/image.rs`, `scripts/release/os_release.py` or the workflow ([#2484](https://github.com/reliaburger/reliaburger/issues/2484)) | Builds both appliance images with the PR's bun and relish, runs `image/tests`' unit tests (which `make test-ci-scripts` also runs), then the QEMU tests: boot, netboot install, `relish netboot` install, seeded and claimed pairs, OS update and fallback. Not in the merge queue, and no ruleset requires it | 60 to 90 minutes |
 | [`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), nightly and by hand | Portable macOS alone (`make lint-macos`, `make test-macos`, relish's doctests) on the newest `release-*` train with work `main` doesn't have, else `main` | about an hour, plus any wait for a macOS runner |
 
 **macOS only where it adds something**
@@ -538,12 +563,24 @@ the push to `main` runs it, and a candidate build only reuses a push or
 nightly run in which `portable macOS` passed; otherwise `validate-release`
 runs all of `ci.yml`, macOS included.
 
+A nightly like this runs only once it's on `main`. GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of a
+workflow, so `macos-nightly.yml` did nothing while it sat on the 0.3.3 train
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). A new or
+changed schedule-only workflow goes to `main` in its own PR, and
+`open_train.py` refuses to open a train while one is missing from `main`
+([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
+
 **Drafts and 0.4.0 work run the cheap set** (same decision). A draft pull
 request, and one whose head branch starts with `0-4-0/`, runs select jobs, CI
 policy and lint (when it changes code) and nothing else, whatever its labels;
 `appliance.yml` builds no image for it and `build.yml` builds nothing.
 `ready_for_review` starts a run with the full set for its base, and
 `converted_to_draft` starts a cheap run that cancels the one still going.
+`select-jobs.sh` treats a `0-3-4/` branch the same way: 0.3.4's batch
+branches reach the train through integration PRs, so a PR of their own is a
+mistake and pays for nothing heavy (`appliance.yml` and `build.yml` still
+build for one).
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
@@ -561,6 +598,14 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 `linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
+
+Both jobs run cargo as root (`scripts/ci/as-root`), so what that writes under
+`$CARGO_HOME` and `target/` is root's, while `Swatinem/rust-cache` saves as the
+runner after the last step. The 26.04 job's save failed with "Permission
+denied" on every nightly (run 45997532768), so it never found a cache and built
+every dependency cold, about four minutes of each run (#1723). Each job's last
+step, whatever happened, hands both directories back to the runner
+(`RootBuildCacheTests` in `test_ci_workflow.py`).
 
 Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
 `cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
@@ -705,6 +750,21 @@ to 110 to report (#1723). Three things wasted runners, and each now has a fix:
 A queue group that changes only documentation runs no code job either (two of
 the window's 32 groups): its code is its base's, which the run before it is
 testing. Scripts are code here, since the jobs run them.
+
+"Documentation" is narrower than everything under `docs/`
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)): it's
+`docs/plans/`, `docs/talks/`, `docs/research/`, `docs/_quarto/`, and Markdown
+outside `docs/`, `src/` and `tests/` other than the README, `CLAUDE.md`,
+`CONTRIBUTING.md`, `SECURITY.md` and `AGENTS.md` (so `CHANGELOG.md`, whose
+test runs in CI policy anyway). Everything else under `docs/` is read by a
+test or packed into relish: the manual, the book, the design docs, the
+release log, this file, the flakes register, the qualification records and
+`docs/testing/concept-budget.json`. A change to one ran no Rust test before,
+landed, and turned the train red on the push after it. `is_docs_only` in
+`scripts/ci/select-jobs.sh` holds the list, and
+`test_no_docs_path_named_by_a_test_is_docs_only` fails when a `"docs/..."`
+literal in `src/` or `tests/` names a file the list calls documentation. The
+price is portable Linux on every book or design-doc PR.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
@@ -979,7 +1039,10 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
-| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `task_manifest` | `TaskManifestRequest` from JSON and `validate_submission` (`bun::task_array_api`) | `POST /v1/batch/manifest` |
+| `task_manifest_file` | `TaskManifestRequest` from TOML, the JSON relish sends, and the trial registration `--dry-run` runs | a manifest file for `relish batch submit` |
+| `task_array_submit` | `TaskArraySubmitRequest` and `validate_submission` (`bun::task_array_api`) | `relish run --batch`, as `POST /v1/batch/array` |
+| `batch_submit` | `BatchSubmitRequest` and `resolve_job_namespaces` (`bun::batch`) | `relish batch`, as `POST /v1/batch` |
 | `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
 | `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 | `api_bearer` | `sesame::auth::extract_bearer`, `authenticate` and `sesame::oidc::verify_jwt_with_keys` | any client that can reach the API, before it has authenticated |
@@ -1002,7 +1065,9 @@ request matches its route on a segment boundary and that the HTTPS redirect
 names the routed host; the TFTP target that an honest client gets the whole
 file in order whatever options it asked for; the DHCP target that no reply
 hands out an address; and the netboot targets that a client's text reaches the
-operator's terminal escaped.
+operator's terminal escaped. The manifest-file target checks that the API reads
+the same manifest relish parsed from TOML, and that a manifest registered once
+registers again as the same batch when its retry is decoded afresh.
 
 Seeds must be the same bytes every time `make fuzz-corpus-seed` runs, so a
 seed never uses a random key or nonce: the JWT and join CSR seeds are signed
@@ -1029,7 +1094,7 @@ decoder gets the next target
 | 3 | A backend's WebSocket handshake response (`wrapper::websocket::parse_handshake`) | any workload behind an ingress route | none yet |
 | 4 | Join CSRs (`sesame::ca::sign_node_csr`) | a node holding a join token | `join_csr` |
 | 4 | Pushed manifests (`pickle::api`) | a client with a registry token | `oci_manifest_push` |
-| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest` (the rest are serde derives) |
+| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest`, `task_array_submit`, `batch_submit` (the rest are serde derives) |
 | 4 | GitOps webhook body (`lettuce::webhook`) | a sender holding the webhook secret; the HMAC is checked first | none yet |
 | 5 | Raft RPC frames (`council::network`) | a council peer, over mTLS | `raft_rpc_frame` |
 | 5 | Reporting frames (`reporting::transport`) | a node, over mTLS | none yet |
@@ -1037,7 +1102,7 @@ decoder gets the next target
 | 6 | Layer tarballs and whiteouts (`grill::image::unpack_layers`) | the registry an app names, pinned by the manifest's digests | none yet: it writes a filesystem |
 | 6 | Release and OS channel metadata (`upgrade::metadata`, `os::channel`) | the release server, signed | none yet |
 | 7 | Backup files and the state inside (`council::backup`) | an operator | `council_backup`, `council_backup_state` |
-| 7 | App, node, chaos scenario TOML (`config`, `smoker`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario` |
+| 7 | App, node, chaos scenario and task-manifest TOML (`config`, `smoker`, `bun::task_array_api`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario`, `task_manifest_file` |
 | 7 | Join tokens, Kubernetes YAML for `relish import`, the source bundle | an operator, on their own machine | none: nothing remote sends them |
 
 The next targets, in order: the Prometheus text parser, the WebSocket
@@ -1084,6 +1149,13 @@ and hit its timeout.
 also ran for 30 seconds a target on every pull request that touched a
 decoder's file, but the job takes 14 to 33 minutes and runners were short, so
 the maintainer took it off pull requests; the release gate never used it.
+The nightly fuzzes the newest `release-*` train that has work `main` doesn't,
+else `main`, picked the way [mutation testing](#mutation-testing) picks it, and
+says which in the job summary (`fuzzing origin/release-... at <commit>`); a
+run by hand takes a `ref`
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). GitHub runs
+the copy of `fuzz.yml` on `main`, so a change to it takes effect only once
+it's there ([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
 The stable half, every target over its checked-in corpus, still runs in the
 portable suite on every pull request. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
@@ -1160,7 +1232,10 @@ runner for up to 75 minutes per train PR while the train's own CI queued
 behind it, so it moved to a nightly run.
 
 The nightly run mutates the newest release train (`release-*`), where work
-lands before `main`, or `main` when no train has work `main` doesn't.
+lands before `main`, or `main` when no train has work `main` doesn't. That
+needs the train's copy of `mutants.yml` on `main`, since GitHub schedules
+from `main`'s; until it is, `main`'s older copy runs weekly and mutates
+`main` ([#2482](https://github.com/reliaburger/reliaburger/issues/2482)).
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
@@ -1326,7 +1401,7 @@ with `limactl stop --force`, waits 5–60 s and powers it back on with
 | I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate; the writer started again after the cut, and every start since then resumed at or past the last `ACK` read before the cut; a start between the cuts resumed at or past the previous cut's `ACK` |
 | I2 | Redis counter | Never goes backwards; the client started again after the cut, and every start since then found it at or past the last `INCR` read before the cut; a start between the cuts found it at or past the previous cut's `INCR` |
 | I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
-| I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
+| I6 | Recovery in time | Bun answered an API read within 120 s of the power-on that booted, and every workload ran within 300 s |
 | I7 | Desired = running | Each workload runs exactly once |
 
 I1 and I2 check where each workload *resumed*, not just what the file or
@@ -1338,7 +1413,11 @@ start since the previous check counts, not just the latest: a second start
 during the settle that resumed higher mustn't hide the cut's own start losing
 writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
 log is unreadable, holds none, or went below the last one read), it doesn't
-make the cut: I1 and I2 would hold whatever happened.
+make the cut: I1 and I2 would hold whatever happened. If it can't read the
+writer's file after a cut (Bun never answered), I1 is undecided
+(`"pass": null`), not a violation: the cut's line lists it under
+`undecided`, and `summary.json` lists such cuts and leaves them out of the
+bound (#2542).
 
 Two timings matter here. Just before each power-off the harness records how
 many starts each record holds, so a start between two cuts (in run 8
@@ -1359,7 +1438,8 @@ coming up with its vsock SSH forwarder spinning on `accept` (about 1 boot in
 up). The harness spots the second in the start log within about 10 s, or by
 the start timing out. That guest had booted, so its forced stop is a second
 power cut: the line records it as an extra power-off, the summary counts
-them, and the invariants after it cover both. A spinning forwarder writes
+them, and the invariants after it cover both. I6 is timed from the second
+start, the one that booted (#2542). A spinning forwarder writes
 gigabytes of log a minute, so the power-on log and Lima's `ha.stderr.log`
 keep only their first and last 25 MB.
 
@@ -1411,7 +1491,7 @@ at three, so no hollow node becomes a voter.
 
 | Command | What it does |
 |---|---|
-| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement. And a hundred hollow nodes running 1,000 one-replica apps: `GET /v1/cluster/summary` answers inside its 1 s budget, with the nodes, council, apps, instances, capacity and versions sections complete and the answer under 8 KiB |
+| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement. And a hundred hollow nodes running 1,000 one-replica apps: `GET /v1/cluster/summary` answers inside its 1 s budget, with the nodes, council, apps, instances, capacity and versions sections complete and the answer under 8 KiB. And 500 report workers whose ticks line up report to one leader over real TCP for 32 s with no report refused ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)) |
 | `scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` | One measured run per size, one at a time, each to `hollow-<N>.json`, then a table from [`hollow_summary.py`](../scripts/release/hollow_summary.py) |
 
 A run measures gossip convergence, the council's CPU and memory (it has its

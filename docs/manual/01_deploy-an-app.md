@@ -68,6 +68,24 @@ so `relish apply` refuses `memory = "8Mi"` instead of letting the start fail.
 The request can still be smaller (`memory = "4Mi-16Mi"`). Host apps (`exec` or
 `script`) have no floor.
 
+An image app's container can hold at most 4,096 processes and threads at once
+(its cgroup's `pids.max`), and so can each sidecar. One fork bomb or leaking
+thread pool then fills its own container, not the node's process table, and
+Bun can still start `runc` to stop it. Threads count, so an app that runs more
+(a big JVM, a database with thousands of connections) sets its own, up to
+32,768:
+
+```toml
+[app.search]
+image = "ghcr.io/example/search:8.1"
+memory = "2Gi-4Gi"
+pids = 16384
+```
+
+Before 0.3.4 a container had no limit, so an app that already runs more than
+4,096 threads needs `pids` before it moves to 0.3.4. `pids` doesn't apply to
+`exec` and `script` apps, which run on the node itself.
+
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
 `networking`, metrics scraping in `observability`. Every `[app.*]` field is
@@ -92,7 +110,9 @@ initial_delay = 0         # seconds before the first probe (default 0)
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
 interval, timeout or threshold, an `interval` or `initial_delay` over a day
-(86400 seconds), and a `timeout` longer than the `interval`. Leave `timeout` out and it's 5 seconds or the interval,
+(86400 seconds), a `timeout` longer than the `interval`, and a `path` that
+doesn't start with a single `/` or that holds whitespace or a control
+character. A query string is fine: `path = "/healthz?full=1"`. Leave `timeout` out and it's 5 seconds or the interval,
 whichever is shorter, so `interval = 2` on its own is fine.
 
 A new instance that crashes before its first passing probe is restarted at
@@ -103,6 +123,12 @@ minutes at the default interval). The node stops its process and marks it
 `failed` instead of restarting it, and records why under
 `restart.never_healthy`. Restarting wouldn't help: the same probe fails the
 same way. Fix the check and apply again.
+
+An app instance that crashes is restarted after a backoff that doubles with
+each restart: 1 s, 2 s, 4 s, up to five minutes. A run of ten minutes
+forgives the earlier restarts, so the next crash waits a second again, as a
+sidecar's does. The RESTARTS column in `relish apps` still counts every
+restart over the instance's life.
 
 ## Init containers
 
@@ -469,7 +495,11 @@ relish delete web                # remove the app from the cluster
 `relish exec` runs its command once, with no stdin and no terminal, so
 `relish exec web sh` exits straight away: name the command you want, as in
 `relish exec web ls /data`. Relish prints the output and exits with the
-command's exit code.
+command's exit code. It returns at most 1 MiB of output, stdout first and
+then stderr. Past that the output is cut, and its last line reads
+`[output cut at 1 MiB]`; the command still runs to the end and keeps its
+exit code. For more, have the command write to a file in a volume, or pipe
+it through `head`, `tail` or `grep` inside the instance.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
@@ -926,7 +956,8 @@ containers and `strategy = "blue-green"`, for a cluster with runc.
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
-(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
+(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`). `health_timeout` is
+at most a day (`"24h"`) and `drain_timeout` at most an hour (`"1h"`).
 
 ## Stopping gracefully
 

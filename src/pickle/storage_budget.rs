@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// A byte ceiling alone cannot bound empty uploads or tiny receipt files.
+/// The default `[images] max_files`: a byte ceiling alone cannot bound empty
+/// uploads or tiny receipt files.
 pub(super) const MAX_STORAGE_FILES: usize = 65_536;
 
 #[derive(Debug, Default)]
@@ -55,10 +56,13 @@ impl BudgetState {
             .checked_sub(old)
             .and_then(|n| n.checked_add(bytes))
             .ok_or(PickleError::StorageQuotaExceeded)?;
-        if self.limit.is_some_and(|limit| limit != 0 && total > limit)
-            || (!self.files.contains_key(path) && self.files.len() >= self.file_limit)
-        {
+        if self.limit.is_some_and(|limit| limit != 0 && total > limit) {
             return Err(PickleError::StorageQuotaExceeded);
+        }
+        if !self.files.contains_key(path) && self.files.len() >= self.file_limit {
+            return Err(PickleError::StorageFileLimitExceeded {
+                limit: self.file_limit,
+            });
         }
         self.used = total;
         self.files.insert(path.to_owned(), bytes);
@@ -238,7 +242,15 @@ impl StorageBudget {
         state.limit = Some(limit);
         Ok(())
     }
-    #[cfg(test)]
+    /// Bytes still free under the ceiling, or `None` when there is none.
+    pub(super) fn remaining(&self) -> Result<Option<u64>, PickleError> {
+        let state = self.lock()?;
+        Ok(state
+            .limit
+            .filter(|limit| *limit != 0)
+            .map(|limit| limit.saturating_sub(state.used)))
+    }
+    /// Set the payload-file cap (`[images] max_files`).
     pub(super) fn set_file_limit(&self, limit: usize) -> Result<(), PickleError> {
         self.lock()?.file_limit = limit;
         Ok(())

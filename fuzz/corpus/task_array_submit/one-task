@@ -1,0 +1,7 @@
+{
+  "name": "hello",
+  "template": {
+    "exec": "/bin/true",
+    "runtime": "process"
+  }
+}

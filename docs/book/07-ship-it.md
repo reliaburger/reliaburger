@@ -87,6 +87,18 @@ Read `if let Some(ref s) = spec.strategy && s == "blue-green"` as: "if the strat
 
 `parse_duration` is a small helper that turns `"30s"` or `"5m"` into a `Duration`. It returns `Option<Duration>` rather than erroring, so a malformed string simply leaves the default in place — the second half of the let-chain (`&& let Some(d) = parse_duration(s)`) only assigns when parsing succeeds.
 
+The minutes and hours branches multiply, and the November 2026 audit caught them multiplying carelessly (#2480):
+
+```rust
+} else if let Some(mins) = s.strip_suffix('m') {
+    mins.parse::<u64>()
+        .ok()
+        .and_then(|m| m.checked_mul(60))
+        .map(Duration::from_secs)
+```
+
+The first version said `m * 60`. Rust checks integer overflow in debug and test builds and panics; a release build (unless `overflow-checks` is on in the profile, and ours isn't) wraps around like C. So `"307445734561825861m"` panicked in a test and became 44 seconds in production, a value that then passed validation. `checked_mul` returns `Option<u64>`, `None` on overflow, and `and_then` threads that `None` through, so an unrepresentable duration is refused like any other bad string. When you want the arithmetic to fail rather than clamp, `checked_*` is the family to reach for; `saturating_*` (below) is for when the limit is a fine answer.
+
 ## The rolling sequence
 
 Each instance replacement follows five sub-steps:
@@ -181,31 +193,38 @@ The original plan was to commit deploy state to Raft at every phase transition, 
 
 The wired cluster path ended up keeping no deploy state in Raft at all. Each node rolls its own share, and the leader reads progress from the nodes' reports (more on that at the end of the chapter). What it does keep in Raft is small: the last ten specs of each app that rolled out everywhere, and the spec whose rollout failed.
 
-Finished deploys move into a per-app history on each node, so `relish history` and the API can show what shipped when. We don't keep it forever. An app that deploys fifty times a day, or a bad version the reconciler retries every five minutes, would grow it without bound. `record_deploy_history` in `src/bun/agent/deploy_ops.rs` caps it:
+Finished deploys move into a per-app history on each node, so `relish history` and the API can show what shipped when. We don't keep it forever. An app that deploys fifty times a day, or a bad version the reconciler retries every five minutes, would grow it without bound. `DeployHistory` in `src/bun/agent/deploy_ops.rs` caps it, by app and by number of apps:
 
 ```rust
-pub(crate) fn record_deploy_history(
-    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
-    entry: crate::meat::deploy_types::DeployHistoryEntry,
-) {
-    let app_id = entry.app_id.clone();
-    history.push(entry);
-    let kept = history
-        .iter()
-        .filter(|entry| entry.app_id == app_id)
-        .count();
-    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
-    history.retain(|entry| {
-        if excess > 0 && entry.app_id == app_id {
-            excess -= 1;
-            return false;
-        }
-        true
-    });
+pub struct DeployHistory {
+    apps: std::collections::HashMap<crate::meat::types::AppId, AppHistory>,
+    /// Writes so far, to tell which app was written longest ago.
+    writes: u64,
+}
+
+pub(crate) fn record(&mut self, entry: crate::meat::deploy_types::DeployHistoryEntry) {
+    self.writes += 1;
+    let app = self.apps.entry(entry.app_id.clone()).or_default();
+    app.last_write = self.writes;
+    app.entries.push_back(entry);
+    while app.entries.len() > DEPLOY_HISTORY_PER_APP {
+        app.entries.pop_front();
+    }
+    if self.apps.len() > DEPLOY_HISTORY_APPS
+        && let Some(oldest) = self
+            .apps
+            .iter()
+            .min_by_key(|(_, app)| app.last_write)
+            .map(|(id, _)| id.clone())
+    {
+        self.apps.remove(&oldest);
+    }
 }
 ```
 
-`retain` keeps the elements its closure says yes to, in order, like Python's `[e for e in history if keep(e)]` but in place. The closure is `FnMut`: it captures `excess` by mutable reference and counts it down, so it drops exactly the app's oldest surplus entries and keeps everyone else's. `DEPLOY_HISTORY_PER_APP` is fifty.
+Each app's entries sit in a `VecDeque`, a ring buffer: `push_back` adds at one end and `pop_front` drops the oldest from the other, both in constant time, where removing the first element of a `Vec` shifts every other one along. `entry(...).or_default()` is the `HashMap` entry API: it finds the app's slot, or inserts an empty `AppHistory` (built by its derived `Default`) and hands back a mutable reference to it either way, with one lookup. `DEPLOY_HISTORY_PER_APP` is fifty and `DEPLOY_HISTORY_APPS` a thousand.
+
+The history used to be one `Vec` for every app, trimmed with `retain` for the app just written (#2428). Every write walked the whole vector twice under the lock that readers share, and nothing ever dropped an app: a node serving a preview environment per pull request kept fifty specs for every name it had seen until Bun restarted. Now a write touches its own app's entries, and the app written longest ago goes when a new one takes the count past a thousand. Only a new app can do that, so the scan of the apps, never of their entries, runs at most once per new app. A retired app keeps its history until then: a node can't tell an app that was deleted from one that moved to another node, and `relish history` merges every node's records, so a moved app's history on its old node is still part of the story.
 
 For a long time there was no cap. The agent's history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed it. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now the history is capped on each node, and the rollback source moved to the council (see the end of the chapter).
 
@@ -307,6 +326,8 @@ The five sub-steps are spread over three functions. `start_replacement` starts t
 The CLI is a thin client over the agent's HTTP API. On a single node, `relish deploy` streams the agent's progress lines to your terminal as the rollout goes ("starting new instance", "healthy ✓", "stopping old instance") and ends with a one-line summary, `deploy started: N instance(s): …`. On a cluster it can't: the API returns as soon as the council has recorded the spec, and each node rolls its share later, so you get one line and watch the rest with `relish status`. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config, including the deploy section, before you ship it.
 
 That last claim used to be half true. `strategy` was a free string, and anything but `"blue-green"` meant rolling, so `"bluegreen"` rolled without a word. A `drain_timeout` of `"1m30s"` or `"500ms"` failed to parse and quietly became the 30-second default. Neither reached `relish lint`. Now `strategy` deserialises into the `DeployStrategy` enum, with `#[serde(rename_all = "kebab-case")]` mapping `BlueGreen` to `"blue-green"`, so an unknown value fails to parse at all; and `DeployConfig::parse` refuses a duration that doesn't parse, the same "refuse, don't clamp" rule `[autoscale]` follows. `unknown_deploy_strategy_is_rejected` and `unparseable_drain_timeout_is_rejected` pin both.
+
+A duration that parses can still be absurd. The deploy worker turns `health_timeout` into a deadline with `Instant::now() + wait`, and `impl Add<Duration> for Instant` panics when the sum doesn't fit, which a value like `"9223372036854775807s"` guarantees. The panic killed that app's deploy worker part-way through a rollout, with the replacement running beside the old instances and no rollback (#2378). `DeployConfig::parse` now caps both timeouts, at a day for `health_timeout` (the same bound as `[health] initial_delay`) and an hour for `drain_timeout` (the same as `stop_grace`), and names the cap when it refuses one. `an_over_long_deploy_timeout_is_refused` pins it. The general lesson for C and Go readers: `Instant + Duration` is checked arithmetic that panics; `Instant::checked_add` is the form that hands you an `Option` instead.
 
 `relish rollback <app>` deserves its own paragraph, because for a long time it was a lie. The command read the last successful entry from history and *printed* the image name, followed by "(use `relish apply` with the previous config to rollback)". It rolled nothing back; it told you to. Worse, it couldn't have worked even if it tried: the deploy history stored the image string but not the *spec*, so there was nothing to re-apply. And the fresh-deploy path — the very first deploy of an app — recorded no history at all, so a two-deploy app only had one entry.
 
@@ -873,7 +894,7 @@ let admission = guard.reserve(
 
 // The standalone handler consumes its reserved channel permit. On the
 // cluster leader, admission must be replicated before the HTTP 202:
-let receipt = Sha256::digest(delivery_id.unwrap().as_bytes());
+let receipt = signed_body_digest(&body); // the delivery id's hash, for GitLab
 let response = council.write(RaftRequest::GitOpsSyncRequested {
     delivery: receipt.into(),
 }).await?;
@@ -889,6 +910,10 @@ if let CouncilResponse::GitOpsSyncRequested { generation } = response {
 ```
 
 Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass can the handler admit the delivery. A standalone API consumes its reserved queue slot. A cluster follower forwards the original authenticated request to the leader; the leader commits a trigger generation through Raft before returning 202 and waking its runner.
+
+What happens *before* those checks matters as much, because anyone who can reach the port can send a request that fails them. On a council node the secret lives in Raft, so the handler has to read it first. It used to call `council.desired_state()`, which clones the whole desired state (every app, placement, job array and image manifest) to read one field, and it did that, and unsealed the secret, while holding the validator's lock (#2388). A few hundred junk requests a second turned into a few hundred deep clones, held the state machine's read lock against Raft's applies, and queued real deliveries behind them until they hit the five-second admission budget. Now the handler reads only that field, with `council.read_desired(|state| state.gitops_config.clone())`, before it takes the lock. `read_desired` takes a closure that borrows the state for the length of the call, so the caller copies out what it needs and nothing else. The validator also remembers the `StoredGitOpsConfig` it was last keyed from and unseals only when the stored value changes. A bad signature now costs one small clone and one HMAC. `a_webhook_with_a_bad_signature_never_clones_the_desired_state` and its good-signature twin count whole-state clones through the council's test-only counter and expect none.
+
+The replay check had a hole of its own (#2408). It compared delivery ids, and the id is a header: GitHub's HMAC covers the body and nothing else. Whoever got hold of one signed delivery (from a proxy log, say) could send the same body and signature with a fresh random id every few seconds, and every copy passed. Nothing rolled back, because a sync always fetches the branch's real head, but each copy wrote a Raft entry, and holding the rate window full turned real pushes away with 429. Now the validator also remembers the SHA-256 of each signed body it admitted, in a second bounded queue beside the ids, and the leader's replicated receipt is that digest rather than the id's, so the same body is refused on every node. The admission guard saves and restores the body queue exactly as it does the ids, or a delivery refused for the rate limit would come back as a "replay" when the provider retried it, which is the bug B10 fixed for ids. A real push always has a new body, so nothing genuine is lost; a provider's manual "Redeliver" of an old push is refused while its digest is remembered, and it has nothing new to sync anyway. GitLab is different: its `X-Gitlab-Token` header is the secret itself, so a captured request gives away the secret, and no deduplication can help. GitLab deliveries keep the id check alone. `a_signed_body_replayed_under_a_new_delivery_id_is_refused` failed before the change; `a_signed_body_sent_to_another_node_under_a_new_delivery_id_is_refused` in the suite puts two validators on one council, as two nodes would have, and expects the leader to refuse the second copy.
 
 Two design choices are worth pausing on. First, **fail closed**: if no `[gitops] webhook_secret` is configured, there's no validator, and the handler returns 503 rather than triggering an unauthenticated sync. A public route with no way to authenticate the caller is worse than no route at all. Second, the validator is `Arc<Mutex<WebhookValidator>>` — shared and *mutable*, because the replay set and the rate-limit window are state that changes on every request. `Mutex` here isn't guarding against data races in the C sense; it's making sure two hooks arriving at once can't both slip past the "have I seen this delivery id?" check. Rust's type system won't let you mutate shared state without saying how you're synchronising it, so the `Mutex` is the compiler asking you to be explicit, and the right answer.
 
@@ -1066,6 +1091,14 @@ The diff then only removes what's in the set. A resource that's in git *and* alr
 
 What about the person at the keyboard? `relish apply` of a GitOps-owned resource goes ahead and prints `warning: app 'web' in namespace 'default' is managed by GitOps; manual changes are reverted on the next sync`. `relish delete` and `relish rollback` of one are refused with a `409` unless you pass `--force`, because the next sync would undo them anyway. Refusing the pointless change is kinder than letting it quietly bounce back thirty seconds later.
 
+### An empty tree is a mistake until it says otherwise
+
+Ownership stopped GitOps deleting what it never wrote. It didn't stop it deleting everything it *did* write. The sync already failed closed on the neighbouring mistakes, each because it had once caused exactly this wipe: a missing `path` (a failed `git ls-tree`), a file that doesn't parse, a blob that can't be read. One shape was left (#2467). Rename the files to `.yaml`, move them to a sibling directory, or merge badly, and `apps/` holds only a `README.md`. `ls-tree` succeeds, lists no `.toml`, the empty map parses as an empty config, validation passes, and the diff removes every owned app. The runner then records the commit as applied.
+
+`execute_sync` now refuses a tree with no `.toml` files under `path` while GitOps owns anything, with an error that says how many resources it would have removed. Like the parse-error refusal, it doesn't advance the applied commit, so the next push that brings the files back syncs as normal. A fresh repository with nothing in it yet, on a cluster where GitOps owns nothing, still syncs. To remove everything on purpose you commit an empty `.toml` file (a comment is enough) under the path: a file that says "this tree declares nothing" is a statement, and an absent one is usually an accident.
+
+We decided against two other designs the audit offered. A general limit on how much one sync may delete (say, half of what GitOps owns) needs a new tuning knob, and it refuses legitimate large clean-ups as readily as mistakes. A commit trailer such as `Reliaburger-Allow-Prune-All: true` would work, but it means reading and trusting a commit message, and the empty file does the same job with no new mechanism. No stored field changed, so `CURRENT` stays. `a_tree_with_no_toml_files_is_refused_while_gitops_owns_apps` deletes the last app file from a watched `configs/` directory with the app owned, and failed before the change with a successful sync and one `Remove`; `a_tree_with_no_toml_files_is_accepted_when_gitops_owns_nothing` and `an_empty_toml_file_removes_every_owned_app_on_purpose` pin the other two paths.
+
 ### Every change gets its go
 
 The earlier section made "applied" mean "all of it applied", and the first version of that rule stopped at the first failure. That's correct for the commit pointer and wrong for everything else. One app whose image won't bind blocked every change behind it, removals included, forever, because the commit never advanced and the next tick stopped at the same app. `apply_changes` now tries every change and returns a report instead of a `Result`:
@@ -1198,6 +1231,26 @@ let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces)
 ```
 
 Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas at 800 millicores each, and the scheduler does the arithmetic — 2,400 > 2,000 — and refuses the placement with a clear reason in the log, instead of over-committing the budget you set. A namespace with headroom admits the same app without complaint. The enforcement was built and proven long ago; all this theme did was hand it the numbers.
+
+The arithmetic needs the right "already used", though, and for a long time it
+had the wrong one. The pass charged the ledger with every *converged* app's
+footprint and then admitted each unconverged app for all of its replicas. Say
+`prod` has 4,000 millicores, app `a` runs three 1,000m replicas, and you scale
+it to five. `a` isn't converged any more, so it wasn't charged; the quota
+refused its five (0 + 5,000 > 4,000), and its three running replicas vanished
+from the books. A new app `b` with two replicas then fitted into a ledger that
+said 0, and `prod` ran 5,000m against its 4,000m
+([#2462](https://github.com/reliaburger/reliaburger/issues/2462)). Losing a
+node did the same to `max_apps`: re-placed apps weren't counted as apps.
+
+Now the ledger is charged with every app's committed placements first, at the
+footprint each was committed with, converged or not, because that's what runs.
+Then an app is admitted only for what it adds: the resources it wants over
+what it was committed with, and the replicas over the ones it has. A scale-up
+of `a` from three to five asks for 2,000m on top of 3,000m, and a replacement
+for a replica lost with its node adds nothing, so it's never refused, even in
+a namespace whose quota was cut below what it already runs. The quota still
+never stops something that's running; it only stops growth.
 
 ## A deploy owns what it starts
 
@@ -1624,7 +1677,7 @@ close the receiver and fill the queue, then drain one slot and retry the same ID
 
 In a cluster, a local notification is too weak: a follower can consume it while it is idle, and a leader can lose it during handover. An authenticated request arriving at a follower is forwarded with its original raw body, signature or GitLab token and delivery ID. The leader returns 202 only after Raft commits a pending trigger generation and a bounded delivery receipt. An unavailable leader, rejected write or forwarding loop returns 503; a canceled or failed admission restores the local replay and rate reservation so the provider can retry.
 
-The runner watches committed trigger generations and leadership changes as well as the polling timer. A new leader sees accepted pending work immediately. A successful run acknowledges the generation it captured before starting; a newer webhook arriving during that run stays pending for another run. Failure keeps the trigger pending and uses the existing retry backoff. Stale status updates preserve newer generations and the bounded replay receipt inventory instead of overwriting them. That inventory retains the most recent 1,000 committed delivery IDs; an older delivery can be admitted again after eviction.
+The runner watches committed trigger generations and leadership changes as well as the polling timer. A new leader sees accepted pending work immediately. A successful run acknowledges the generation it captured before starting; a newer webhook arriving during that run stays pending for another run. Failure keeps the trigger pending and uses the existing retry backoff. Stale status updates preserve newer generations and the bounded replay receipt inventory instead of overwriting them. That inventory retains the most recent 1,000 committed receipts (the digest of a signed body, or of a GitLab delivery id); an older delivery can be admitted again after eviction.
 
 The handover tests cover the persisted trigger and replay receipt before a run starts. Resource and status writes continue to use the runner’s existing Raft writes and periodic drift reconciliation. An entire Git sync has no captured leadership-term guard or atomic transaction.
 

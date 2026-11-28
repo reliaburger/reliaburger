@@ -83,10 +83,12 @@ async fn wait_until(what: &str, timeout: Duration, mut check: impl AsyncFnMut() 
 #[tokio::test]
 #[ignore = "three real Bun processes over several heal ticks; run with make test-cluster"]
 async fn image_survives_loss_of_the_pushing_node() {
-    if std::env::var("RELIABURGER_CLUSTER_TESTS").is_err() {
-        eprintln!("skipping: set RELIABURGER_CLUSTER_TESTS=1");
-        return;
-    }
+    // Once selected, a gated test fails without its prerequisite: an early
+    // return would report a pass that tested nothing (#2490).
+    assert!(
+        std::env::var("RELIABURGER_CLUSTER_TESTS").is_ok(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(

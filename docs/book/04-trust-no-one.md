@@ -441,6 +441,8 @@ The token is a 256-bit random value, SHA-256 hashed for storage. The cluster nev
 
 One more check sits in front of that (#2050). Raft numbers its members with a `u64`, and we derive it from the node name with djb2 so every node can compute every peer's id. djb2 mixes short names badly: for any shared prefix, a name ending `c0` and one ending `ar` hash the same (33 × 99 + 48 = 33 × 97 + 114). Two nodes under one Raft id merge in the council directory, so if voter `worker-c0` died, a healthy `worker-ar` would fill its slot and the council would never replace the dead voter. A join is therefore refused when its Raft id matches a different node that has held a certificate or been retired, and the error names the node it clashes with. The pre-check in `check_join_token` gives the quick answer; the state machine repeats it when it consumes the token, so two joins racing each other can't both win, and again whenever it allocates a serial for a node leaf. Widening the hash would fix the cause, but every node derives every id, so that's a protocol change for another release.
 
+The name itself has a shape too. `[node] name` must be one DNS label (#2394), and the join path checks the same rule in three places: `create_join_token` won't mint a token for any other name, `check_join_token` refuses it on the leader, and `enrol` refuses it on the joining machine before it dials anyone, so a typo never spends a token. All three call `validate_node_id`, so the rule lives in one function.
+
 There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs to that member's `/v1/cluster/join` endpoint, which validates the token and signs the joiner a certificate, returning a bundle with the new cert plus the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
 
 Read that again, though, and one word should worry you: *returns*. An earlier version of this flow had the issuer generate the joiner's keypair and post the private key back in the bundle. That's a private key travelling over the wire and sitting in the issuer's memory — a key that's supposed to be the one thing only the joiner ever holds. So we changed it. The joiner now generates its own keypair locally and sends only a **CSR** (a certificate signing request: a public key plus the identity it's asking to be certified for, signed by the matching private key to prove possession). The issuer signs the CSR and returns just the leaf certificate. The private key never leaves the joining node. This is the same shape as the workload-identity flow from Chapter 10, and for the same reason: a key you never transmit is a key you can't leak in transit.
@@ -448,6 +450,8 @@ Read that again, though, and one word should worry you: *returns*. An earlier ve
 The issuer takes exactly one thing from the CSR — its public key. Every other field of the certificate, the node-id SAN in particular, it rebuilds from the id *it* validated. And validation is the load-bearing word: the token is minted for one id, and the request must ask for exactly that id. A token created for `node-05` cannot obtain a `node-01` certificate, no matter what the CSR or the request body claims — the mismatch is refused before the CA key is ever touched. So a joiner that stuffs a rival node's id into its CSR gets nothing; the request is a request, not an instruction, and it's a request the token has to have authorised in the first place.
 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
+
+For a long time the pin was optional, and that was the gap the November 2026 audit found (#2410). Without `--ca-fingerprint`, `relish join` pinned whatever CA came back and sent the token over a connection that CA vouched for, silently. An imposter didn't need to fool the operator, only to answer first, and then it could spend the token against the real cluster. Every documented command already passed the flag, so the fix makes the documented habit the rule: clap's `required_unless_present = "insecure_trust_first_ca"` refuses the command without a pin, and the opt-out has a name nobody types by accident. With the opt-out, `enrol` prints the fingerprint it was offered on stderr before the token leaves the machine, so even then the operator sees what they're trusting.
 
 So how do you add a node? Mint a credential for it, explicitly, naming the id
 it will enrol as:
@@ -573,6 +577,18 @@ There's a catch for clusters that already exist. A leaf picks up the extension a
 
 One thing the AKI doesn't change: a node certificate names the node, not its address. Python's default context also checks the hostname, so connect with `server_hostname` set to the node's id. Give it `127.0.0.1` and it now fails for an honest reason, `IP address mismatch`. `relish` doesn't hit this because it verifies the chain and never the name.
 
+Never the name, though, turned out to be too little. The operator gives `relish` the *root* CA, and the root signs the Workload and Ingress CAs too. Their leaves carry the server-auth usage, and a workload holds its own key in `/run/reliaburger/identity/`. So anything with a workload identity that could answer the operator's connection to port 9117 passed the handshake, and `relish` sent it the bearer token on the first request ([#2396](https://github.com/reliaburger/reliaburger/issues/2396)). The node side never had this problem, because it pins the Node CA. The CLI keeps the root as its anchor, so a saved context survives a `relish ca rotate --role node`, and adds one check after the chain walk in `src/relish/tls.rs`:
+
+```rust
+if crate::sesame::mtls::node_id_from_leaf(leaf).is_none() {
+    return Err(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::Other(rustls::OtherError(Arc::new(NotANodeCertificate))),
+    ));
+}
+```
+
+Only the Node CA puts a `spiffe://reliaburger/node/<id>` URI SAN on a leaf. A workload's SAN is rebuilt by the CA from its spec, an ingress leaf has DNS names only, and webpki refuses a path whose issuer isn't a CA, so a workload's key can't mint a node-looking leaf of its own. `rustls::OtherError` wraps any `std::error::Error` in an `Arc`, which is how a custom verifier hands rustls a reason of its own: `NotANodeCertificate` is a one-line `thiserror` struct whose message reaches the operator as "the server's certificate is not a cluster node's". `cluster_client_refuses_a_workload_certificate_under_the_same_root` and its ingress twin start a TLS server with each kind of leaf and check both that the call fails and that no `Authorization` header arrived.
+
 ### Binding a connection to a node
 
 Chapter 10 pins the client verifier to the Node CA: a peer must present a valid, unrevoked certificate that the Node CA issued. That stops outsiders cold. It does *not* stop one cluster node from impersonating another. Node B holds a perfectly valid Node-CA certificate. If B connects to A pretending to be C, the CA-pin check is happy — B's cert is genuine. We just never asked "genuine as *whom*?"
@@ -589,6 +605,8 @@ if let Some(expected) = &self.expected_node_id {
 ```
 
 Now a valid certificate for node C, presented when we dialled node A, is rejected: the SAN says C, we expected A. A certificate with no node-id SAN at all is rejected too — under binding, absence is mismatch. The property jumps from "some valid node" to "the specific node I meant to reach". (The reporting transport dials by address without a target id to hand the verifier, so it keeps the CA-pin-plus-CRL guarantee; binding lives where the id is known.)
+
+Binding answers "is this the node I dialled?". The Raft *listener* has the opposite question: is the node that dialled me one I should listen to? A valid certificate only proves the caller is some node of this cluster, and every worker has one. A council member answers from its own Raft membership. A node with no seat used to answer "anyone", and that let one compromised worker feed every seatless node a fake council, tokens and CA included (#2397). The fix takes the council's voters out of the one exchange that's authenticated before a node has any Raft state: the join. The join bundle carries them, `relish join` saves them as `council.json` next to the certificate, and the listener on a seatless node now serves a voter of that council under its own certificate and nobody else. Chapter 2's council membership section has the details.
 
 ### Naming the address, but only one we saw
 
@@ -895,6 +913,25 @@ pub async fn security_state(&self) -> SecurityState {
 
 `unwrap_or(local)` returns the empty local state when no view has arrived yet, so a reader never waits here. Bun's five-second security refresh fetches the view whenever its replica holds nothing, and keeps the last one if the leader can't be reached, the way a follower that can't reach quorum keeps its replica. A token revoked on the leader stops working on the node within one refresh.
 
+"Nothing had to change" turned out to be one thing too generous. A token's `[permission]` block (later in this chapter) doesn't live in the security state; it's desired state, applied with the manifest that declares it. So the view brought a seatless node every token and none of the blocks that narrow them, and that node treated a token limited to `ns-a` as one that could deploy and push anywhere (#2538). The registry batch found it while wiring the blocks into `docker push` (#2398). Now the view carries the blocks too, and the council handle answers for them the way it answers for tokens:
+
+```rust
+pub async fn permissions(&self) -> BTreeMap<String, PermissionSpec> {
+    if !self.holds_security_state().await
+        && let Some(view) = self.leader_security_view.read().await.as_ref()
+    {
+        return view.permissions.clone();
+    }
+    self.state_machine
+        .read_desired(|state| state.permissions.clone())
+        .await
+}
+```
+
+That's a let-chain (chapter 7) guarding a lock: the read guard lives only as long as the `if`, so the early `return` clones the map out before the lock is let go. It falls back to the replica when no view has arrived, not to an empty map, because a seated node that has never had a token still has its blocks there. The test, `a_node_without_a_seat_enforces_the_leaders_permission_blocks`, fetches a real view from the leader's endpoint, hands it to a node with no seat, and drives that node's own API and registry with a real bearer token: `apply` into `ns-b` and a push to `ns-b/app` both get 403, and a push to `ns-a/app` gets past the gate. Before the fix the apply got as far as looking for a leader, and the push as far as committing.
+
+The weak link was "the leader". A node with no seat has no Raft metrics, so it learns who leads from the gossip leader hint, and the first version sent its service token to whatever address that hint named, over TLS that accepted any node certificate. Every node holds the gossip key, so one compromised worker could name itself leader and hand every seatless node its own tokens and CA (#2406). Now `SecurityViewClient::fetch` takes the node id the hint names along with its address. It refuses before connecting unless that node is a voter of the council this node knows, its own membership or, with no seat, the expected council `relish join` saved (Chapter 2, "Council membership check"), and the TLS connection is bound to that node id, so a voter's name with an impostor's address fails the handshake. `leader_api_target` returns the pair, and `leader_api_address` is now a one-line wrapper around it for callers that only need the address.
+
 ### Evaluating a policy isn't enforcing it
 
 Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
@@ -943,6 +980,8 @@ DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cH...]"
 ```
 
 You don't need the cluster's key files on your laptop to encrypt a value. `GET /v1/secret/public-key` returns the active public recipient and its generation to any authenticated caller, including read-only ones. A public recipient can encrypt but can't decrypt, so the endpoint returns a two-field `SecretPublicKey` struct rather than serialising the stored keypair, which also holds wrapped private material. `relish secret pubkey` is a thin wrapper around that request. It used to read only the bootstrap file `relish init` leaves behind, which a quickstart user never sees and which goes stale after a rotation, so the CLI now asks the cluster by default and keeps the file as the offline option (`relish secret pubkey cluster/`).
+
+The encrypting half is `relish secret encrypt`, and it used to take the plaintext as a positional argument and nothing else. An argument is about the worst place for a secret: on Linux any local user can read `/proc/<pid>/cmdline` while the command runs, the shell writes it to history, and CI systems echo commands into their logs (#2407). It now reads the value from `--value-file`, or from standard input when no value is given, and at a terminal it asks with echo off, reusing the `prompt_secret` that `relish ca backup` already had. One trailing newline is dropped (`strip_suffix("\r\n").or_else(|| value.strip_suffix('\n'))`), so `echo value | relish secret encrypt ...` seals `value` and not `value\n`. clap's `conflicts_with = "value"` refuses a file and an argument together before our code runs. The argument form stays for values that aren't secret, and its `--help` says what it exposes.
 
 At container startup, Bun decrypts `ENC[AGE:...]` values and injects the plaintext as environment variables. The decrypted value never touches disk — it goes straight from memory into the container's process environment.
 
@@ -1296,6 +1335,8 @@ for (app_name, spec) in &config.app {
 `enforce_image_signature` reaches the root CA the same way secret decryption already did (through the council), looks the image up in the replicated manifest catalogue, and — for a Pickle-hosted image — verifies the signature against that CA. External-registry images (nginx from Docker Hub) aren't ours to vouch for, so they pass. A local image with no signature, or a tampered one, is refused. This is deliberately *local* enforcement: each node vouches for what it runs, which is exactly the right guarantee until a central scheduler exists to vouch cluster-wide.
 
 One more thing had to travel with the root CA to make this honest: the CRL. Chaining a signature to the cluster CA proves the signer *was* trusted when the certificate was issued, not that it still is. If a signing key leaks and you revoke its certificate, images it signed before the revocation must stop deploying. So `enforce_image_signature` passes the council's CRL alongside the root CA, and the keyless verifier checks the leaf and every intermediate against it before it even looks at the signature bytes. A revoked certificate anywhere in the chain fails the deploy closed. Revocation that doesn't reach every trust decision isn't revocation; it's a suggestion.
+
+Checking every link turned out to need one more question per link: is the issuer allowed to issue at all? `validate_chain_at` checked that each certificate was signed by the next one and named it as issuer, and that all were in date. It never asked whether that next one was a CA ([#2409](https://github.com/reliaburger/reliaburger/issues/2409)). A workload holds its own identity leaf's private key, so it can sign a certificate of its own, with the code-signing usage and any signer identity it likes, naming its leaf as issuer. The chain `[forged, workload leaf, Workload CA]` then validated up to the root. Only a node can attach a keyless signature today, so nothing outside could use this yet, but it's exactly the kind of gap that opens the day a less privileged path to submit a signature arrives. The walk now calls `check_is_issuing_ca` on every certificate that acts as an issuer: it must say `CA:TRUE`, allow `keyCertSign` if it states a key usage at all, and have a path length that allows the CA certificates below it. Our intermediates carry path length 0, so they may sign only leaves. The leaf itself must not be a CA. The TLS verifiers never had this gap, because webpki enforces all of RFC 5280's path rules; we kept the hand-written walk here because swapping in webpki would mean re-proving the build signer's longer validity rules against it. `verify_keyless_rejects_a_leaf_issued_by_another_leaf` builds the forged chain with rcgen and `validate_chain_at_rejects_a_non_ca_issuer` checks the walk directly, with the honest tail of the same chain still passing.
 
 Two different domains — gossip integrity and registry trust — one theme. The primitive was always there; the enforcement point was the missing piece.
 

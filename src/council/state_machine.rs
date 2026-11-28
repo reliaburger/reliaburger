@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use super::types::{
-    CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, ReplacesPaused, TypeConfig,
+    CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, ReplacesPaused, Shared, TypeConfig,
 };
 use crate::sesame::types::AgeKeyScope;
 
@@ -97,7 +97,10 @@ pub struct ApplyEntryPosition {
 struct StateMachineInner {
     state: DesiredState,
     snapshot_index: u64,
-    snapshot_data: Option<Vec<u8>>,
+    /// The latest snapshot's bytes, kept once: the copy here, the one
+    /// persisted to redb and the one the snapshot builder returns share it
+    /// (#2452).
+    snapshot_data: Option<Arc<Vec<u8>>>,
     /// The log id and membership `snapshot_data` covers. The live `state`
     /// moves on as entries apply; a snapshot handed to a learner must
     /// describe its own contents, or the learner records a log position its
@@ -172,7 +175,7 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 #[allow(clippy::result_large_err)]
 async fn persist_snapshot_blocking(
     db: Arc<Database>,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     index: u64,
 ) -> Result<(), StorageError<u64>> {
     match tokio::task::spawn_blocking(move || persist_snapshot(&db, &data, index)).await {
@@ -338,9 +341,15 @@ impl StateMachineInner {
             })
     }
 
-    fn apply_scheduling_decision(
-        &mut self,
+    /// Check one decision of a placement pass without writing anything.
+    /// A decision for a test-lease namespace records its placements in
+    /// `leases`, a copy of the test leases taken on first use, so the
+    /// pass's later decisions see them and the caller commits the copy only
+    /// once the whole pass passes.
+    fn check_scheduling_decision(
+        &self,
         decision: &crate::meat::SchedulingDecision,
+        leases: &mut Option<std::collections::BTreeMap<String, crate::testkit::lease::TestLease>>,
     ) -> Option<CouncilResponse> {
         if decision.placements.iter().any(|placement| {
             self.state
@@ -370,9 +379,8 @@ impl StateMachineInner {
             let resource = crate::testkit::lease::LeasedResource::App {
                 app_id: decision.app_id.clone(),
             };
-            let Some(lease) = self
-                .state
-                .test_leases
+            let Some(lease) = leases
+                .get_or_insert_with(|| self.state.test_leases.clone())
                 .values_mut()
                 .find(|lease| lease.resources.contains(&resource))
             else {
@@ -406,6 +414,11 @@ impl StateMachineInner {
             }
             lease.placements = owners;
         }
+        None
+    }
+
+    /// Write one checked decision of a placement pass.
+    fn write_scheduling_decision(&mut self, decision: &crate::meat::SchedulingDecision) {
         // A stop commits an empty decision; where the app ran must
         // outlive it, because that's where its managed volumes are.
         // Recorded in ordinal order, so a returning app gets each
@@ -424,7 +437,6 @@ impl StateMachineInner {
         self.state
             .scheduling
             .insert(decision.app_id.clone(), decision.placements.clone());
-        None
     }
 
     /// Apply a request. Returns a request-specific response for entries
@@ -707,36 +719,47 @@ impl StateMachineInner {
             } => {
                 if *expected_log_id != position.previous_log_id {
                     return Some(CouncilResponse::Refused {
-                        reason: "admission revision changed".into(),
+                        reason: crate::meat::types::PASS_REVISION_CHANGED.into(),
                     });
                 }
-                if decisions.len() > 4096
-                    || decisions
-                        .iter()
-                        .map(|d| d.placements.len())
-                        .try_fold(0usize, |n, size| n.checked_add(size))
-                        .is_none_or(|n| n > 131072)
+                // The leader's planner reads the same limits, so it never
+                // proposes a pass this refuses (#2366). One decision may be
+                // any size: an app is never too big to place on its own.
+                if decisions.len() > crate::meat::types::MAX_PASS_DECISIONS
+                    || (decisions.len() > 1
+                        && decisions
+                            .iter()
+                            .map(|d| d.placements.len())
+                            .try_fold(0usize, |n, size| n.checked_add(size))
+                            .is_none_or(|n| n > crate::meat::types::MAX_PASS_PLACEMENTS))
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "placement pass exceeds admission limits".into(),
                     });
                 }
+                // All or nothing without a staged copy (#2435): every
+                // decision is checked before any is written. A decision's
+                // checks don't read what an earlier one writes, apart from
+                // test-lease placements, which are checked on a copy of the
+                // leases committed with the pass.
                 let mut identities = std::collections::HashSet::new();
-                let mut staged = StateMachineInner {
-                    state: self.state.clone(),
-                    ..Default::default()
-                };
+                let mut leases = None;
                 for decision in decisions {
                     if !identities.insert(&decision.app_id) {
                         return Some(CouncilResponse::Refused {
                             reason: "placement pass repeats an application".into(),
                         });
                     }
-                    if let Some(response) = staged.apply_scheduling_decision(decision) {
+                    if let Some(response) = self.check_scheduling_decision(decision, &mut leases) {
                         return Some(response);
                     }
                 }
-                self.state = staged.state;
+                if let Some(leases) = leases {
+                    self.state.test_leases = leases;
+                }
+                for decision in decisions {
+                    self.write_scheduling_decision(decision);
+                }
             }
             RaftRequest::ConfigSet { key, value } => {
                 self.state.config.insert(key.clone(), value.clone());
@@ -844,30 +867,68 @@ impl StateMachineInner {
                         reason: "registry writer identity is retired".into(),
                     });
                 }
+                // An active upgrade's binaries are bare blobs no manifest
+                // tracks, so the catalogue would approve them as orphans.
+                // Nodes fetch them only when their turn comes, paused runs
+                // included, so they stay until the upgrade has gone (#2419).
+                let kept = self
+                    .state
+                    .active_upgrade
+                    .as_ref()
+                    .map(crate::upgrade::types::ClusterUpgradeState::binary_digests)
+                    .unwrap_or_default();
+                let without_binaries;
+                let report = if report
+                    .deleted_layers
+                    .iter()
+                    .any(|digest| kept.contains(digest.as_str()))
+                {
+                    without_binaries = crate::pickle::types::GcReport {
+                        node_id: report.node_id,
+                        deleted_layers: report
+                            .deleted_layers
+                            .iter()
+                            .filter(|digest| !kept.contains(digest.as_str()))
+                            .cloned()
+                            .collect(),
+                    };
+                    &without_binaries
+                } else {
+                    report
+                };
                 // The state machine is the deletion arbiter (M2): apply
                 // runs serialised through the Raft log, so two nodes
                 // racing to delete the last two copies of a layer get
                 // their reports arbitrated in order — the second one is
                 // refused the digest that would lose its final holder.
-                let mut next = self.state.manifest_catalog.clone();
-                let approved = next.apply_gc_report(report);
+                // The report changes the catalogue only where it approves a
+                // deletion, and an approval needs a next generation. So it
+                // applies in place unless the generation is exhausted, and
+                // only then on a copy, to find out whether it would approve
+                // anything (#2435).
+                let generation = self
+                    .state
+                    .registry_gc_generations
+                    .get(&report.node_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1);
+                let Some(generation) = generation else {
+                    let mut next =
+                        crate::pickle::types::ManifestCatalog::clone(&self.state.manifest_catalog);
+                    let approved = next.apply_gc_report(report);
+                    if approved.is_empty() {
+                        return Some(CouncilResponse::GcApproved { approved });
+                    }
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry GC generation exhausted".into(),
+                    });
+                };
+                let approved = self.state.manifest_catalog.apply_gc_report(report);
                 if !approved.is_empty() {
-                    let Some(generation) = self
-                        .state
-                        .registry_gc_generations
-                        .get(&report.node_id)
-                        .copied()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                    else {
-                        return Some(CouncilResponse::Refused {
-                            reason: "registry GC generation exhausted".into(),
-                        });
-                    };
                     self.state
                         .registry_gc_generations
                         .insert(report.node_id, generation);
-                    self.state.manifest_catalog = next;
                 }
                 return Some(CouncilResponse::GcApproved { approved });
             }
@@ -981,7 +1042,7 @@ impl StateMachineInner {
                         reason: "the cluster's security state is already initialised".to_string(),
                     });
                 }
-                self.state.security_state = *ss.clone();
+                self.state.security_state = Shared::new(*ss.clone());
             }
             RaftRequest::CreateJoinToken(jt) => {
                 if self
@@ -1044,7 +1105,7 @@ impl StateMachineInner {
                     .state
                     .security_state
                     .join_tokens
-                    .iter_mut()
+                    .iter()
                     .find(|jt| jt.token_hash == *token_hash);
                 let Some(token) = token else {
                     return Some(CouncilResponse::Refused {
@@ -2062,14 +2123,14 @@ impl StateMachineInner {
                     }
                 };
                 let released = retirements.release_confirmed(node_id, execution, &withdrawals);
-                self.state.producer_retirements = retirements;
-                self.state.endpoint_catalog = catalog;
+                self.state.producer_retirements = retirements.into();
+                self.state.endpoint_catalog = catalog.into();
                 self.state.endpoint_withdrawals = withdrawals;
                 return Some(CouncilResponse::EndpointExecutionRetired { released });
             }
             RaftRequest::PublishEndpoints {
                 expected_generation,
-                catalog,
+                changes,
             } => {
                 if *expected_generation != self.state.endpoint_withdrawals.generation {
                     return Some(CouncilResponse::Refused {
@@ -2079,6 +2140,17 @@ impl StateMachineInner {
                         ),
                     });
                 }
+                // The checks below look at the whole next catalogue, as they
+                // did when the entry carried it whole: a backend committed
+                // earlier on a node retired since still refuses it.
+                let catalog = match self.state.endpoint_catalog.with_changes(changes) {
+                    Ok(catalog) => catalog,
+                    Err(reason) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: reason.into(),
+                        });
+                    }
+                };
                 if catalog.services.values().any(|service| {
                     service.backends.iter().any(|backend| {
                         self.state
@@ -2103,7 +2175,7 @@ impl StateMachineInner {
                 }
                 let withdrawals = match self.state.endpoint_withdrawals.plan_publication(
                     &self.state.endpoint_catalog,
-                    catalog,
+                    &catalog,
                     &self.state.endpoint_consumers,
                 ) {
                     Ok(withdrawals) => withdrawals,
@@ -2114,7 +2186,7 @@ impl StateMachineInner {
                     }
                 };
                 self.state.endpoint_withdrawals = withdrawals;
-                self.state.endpoint_catalog = *catalog.clone();
+                self.state.endpoint_catalog = Shared::new(catalog);
             }
             RaftRequest::TestLeaseCreate(lease) => {
                 if !lease.repositories.is_empty() || lease.workloads_retired {
@@ -3635,6 +3707,10 @@ pub struct CouncilStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
     gitops_triggers: Arc<tokio::sync::watch::Sender<(u64, u64)>>,
     api_tokens: Arc<tokio::sync::watch::Sender<Vec<crate::sesame::types::ApiToken>>>,
+    /// Test hook: how many times [`Self::desired_state`] copied the whole
+    /// state (#2436).
+    #[cfg(test)]
+    full_clones: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for CouncilStateMachine {
@@ -3652,7 +3728,16 @@ impl CouncilStateMachine {
                 tokio::sync::watch::channel(inner.state.security_state.api_tokens.clone()).0,
             ),
             inner: Arc::new(RwLock::new(inner)),
+            #[cfg(test)]
+            full_clones: Arc::default(),
         }
+    }
+
+    /// Test hook: how many times [`Self::desired_state`] has copied the
+    /// whole state.
+    #[cfg(test)]
+    pub(crate) fn full_clones(&self) -> usize {
+        self.full_clones.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Observe the applied API tokens. A receiver sees a change as soon as an
@@ -3783,7 +3868,7 @@ impl CouncilStateMachine {
                 // security state (app specs, CA material, tokens). Refuse to
                 // start so an operator can restore from backup instead.
                 inner.state = serde_json::from_slice::<DesiredState>(&bytes)?;
-                inner.snapshot_data = Some(bytes);
+                inner.snapshot_data = Some(Arc::new(bytes));
                 inner.snapshot_last_log_id = inner.state.last_applied_log;
                 inner.snapshot_membership = inner.state.last_membership.clone();
             }
@@ -3887,6 +3972,9 @@ impl CouncilStateMachine {
 
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
+        #[cfg(test)]
+        self.full_clones
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.read().await.state.clone()
     }
 
@@ -3997,6 +4085,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
         .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
+        let data = Arc::new(data);
         let (db, index) = {
             let mut guard = self.inner.write().await;
             guard.state = new_state;
@@ -4005,7 +4094,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             self.publish_gitops_triggers(&guard.state);
             self.publish_api_tokens(&guard.state);
             guard.snapshot_index += 1;
-            guard.snapshot_data = Some(data.clone());
+            guard.snapshot_data = Some(Arc::clone(&data));
             guard.snapshot_last_log_id = meta.last_log_id;
             guard.snapshot_membership = meta.last_membership.clone();
             guard.snapshot_id = snapshot_id_for(meta.last_log_id, guard.snapshot_index);
@@ -4033,7 +4122,9 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                 };
                 Ok(Some(Snapshot {
                     meta,
-                    snapshot: Box::new(Cursor::new(data.clone())),
+                    // openraft's snapshot type owns its bytes, so each
+                    // send to a follower takes one copy of the kept ones.
+                    snapshot: Box::new(Cursor::new(Vec::clone(data))),
                 }))
             }
             None => Ok(None),
@@ -4058,7 +4149,7 @@ pub struct MemSnapshotBuilder {
 /// What [`MemSnapshotBuilder::build_snapshot`] stored, and the store to
 /// persist it to (`None` when there is nothing new to persist).
 struct BuiltSnapshot {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     snapshot_id: String,
     index: u64,
     db: Option<Arc<Database>>,
@@ -4085,7 +4176,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                     std::sync::atomic::Ordering::SeqCst,
                 );
             }
-            let data = serde_json::to_vec(&state)?;
+            let data = Arc::new(serde_json::to_vec(&state)?);
             let mut guard = inner.blocking_write();
             // A snapshot installed from the leader while this one encoded
             // is newer: keep it, and hand it back instead of this one.
@@ -4093,7 +4184,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                 && let Some(newer) = &guard.snapshot_data
             {
                 return Ok::<_, serde_json::Error>(BuiltSnapshot {
-                    data: newer.clone(),
+                    data: Arc::clone(newer),
                     snapshot_id: guard.snapshot_id.clone(),
                     index: guard.snapshot_index,
                     db: None,
@@ -4102,7 +4193,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                 });
             }
             guard.snapshot_index += 1;
-            guard.snapshot_data = Some(data.clone());
+            guard.snapshot_data = Some(Arc::clone(&data));
             guard.snapshot_last_log_id = state.last_applied_log;
             guard.snapshot_membership = state.last_membership.clone();
             guard.snapshot_id = snapshot_id_for(state.last_applied_log, guard.snapshot_index);
@@ -4131,7 +4222,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
         // (M7): the lock is released before the fsync. A newer installed
         // snapshot was persisted by its install.
         if let Some(db) = db {
-            persist_snapshot_blocking(db, data.clone(), index).await?;
+            persist_snapshot_blocking(db, Arc::clone(&data), index).await?;
         }
 
         let meta = SnapshotMeta {
@@ -4140,9 +4231,11 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
             snapshot_id,
         };
 
+        // The state machine keeps `data`, so openraft's owned snapshot is
+        // the one copy a build makes.
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(Arc::unwrap_or_clone(data))),
         })
     }
 }
@@ -5631,6 +5724,77 @@ mod tests {
         assert_eq!(placements.len(), 2);
     }
 
+    /// The entry that publishes `next` over the catalogue `state` holds.
+    fn publication(
+        state: &DesiredState,
+        expected_generation: u64,
+        next: crate::onion::catalog::EndpointCatalog,
+    ) -> RaftRequest {
+        publication_from(&state.endpoint_catalog, expected_generation, next)
+    }
+
+    /// The entry that publishes `next` over `previous`.
+    fn publication_from(
+        previous: &crate::onion::catalog::EndpointCatalog,
+        expected_generation: u64,
+        next: crate::onion::catalog::EndpointCatalog,
+    ) -> RaftRequest {
+        RaftRequest::PublishEndpoints {
+            expected_generation,
+            changes: Box::new(previous.changes_to(&next)),
+        }
+    }
+
+    /// #2438: a publication carries only the services that changed, and
+    /// applying it to the committed catalogue gives exactly the next one,
+    /// with the withdrawal ledger planned as for the whole catalogue.
+    #[test]
+    fn a_small_publication_yields_the_next_catalogue_and_its_withdrawals() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        let mut first_with_web = first.clone();
+        let web = crate::onion::catalog::EndpointCatalog::rebuild([(
+            crate::onion::service_id::ServiceId::new("default", "web"),
+            80,
+            vec![],
+        )])
+        .unwrap();
+        first_with_web.services.extend(web.services);
+        assert!(
+            inner
+                .apply_request(&publication(&inner.state, 0, first_with_web.clone()))
+                .is_none()
+        );
+        let mut next = first_with_web.clone();
+        next.services.get_mut("default__api").unwrap().backends[0].healthy = false;
+        let expected = inner
+            .state
+            .endpoint_withdrawals
+            .plan_publication(
+                &inner.state.endpoint_catalog,
+                &next,
+                &inner.state.endpoint_consumers,
+            )
+            .unwrap();
+        let request = publication(
+            &inner.state,
+            inner.state.endpoint_withdrawals.generation,
+            next.clone(),
+        );
+        let RaftRequest::PublishEndpoints { changes, .. } = &request else {
+            unreachable!()
+        };
+        assert_eq!(
+            changes.changed.keys().collect::<Vec<_>>(),
+            vec!["default__api"]
+        );
+        assert!(changes.removed.is_empty());
+        assert!(inner.apply_request(&request).is_none());
+        assert_eq!(*inner.state.endpoint_catalog, next);
+        assert_eq!(inner.state.endpoint_withdrawals, expected);
+    }
+
     fn withdrawal_fixture_catalogue() -> crate::onion::catalog::EndpointCatalog {
         use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
         use crate::onion::service_id::ServiceId;
@@ -5679,10 +5843,7 @@ mod tests {
             .unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let request = retire_endpoint("producer", &execution);
@@ -5702,10 +5863,7 @@ mod tests {
                 stale.services.get_mut("default__api").unwrap().backends[0].execution = None;
             }
             assert!(matches!(
-                inner.apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(stale)
-                }),
+                inner.apply_request(&publication(&inner.state, 2, stale)),
                 Some(CouncilResponse::Refused { .. })
             ));
             assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -5735,19 +5893,13 @@ mod tests {
             .generation = "b".repeat(64).try_into().unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(successor.clone())
-                })
+                .apply_request(&publication(&inner.state, 2, successor.clone()))
                 .is_none()
         );
         released(inner.apply_request(&request), true);
-        assert_eq!(inner.state.endpoint_catalog, successor);
+        assert_eq!(*inner.state.endpoint_catalog, successor);
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 3,
-                catalog: Box::new(first)
-            }),
+            inner.apply_request(&publication(&inner.state, 3, first)),
             Some(CouncilResponse::Refused { .. })
         ));
     }
@@ -5767,10 +5919,7 @@ mod tests {
             .unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(catalog),
-                })
+                .apply_request(&publication(&inner.state, 0, catalog))
                 .is_none()
         );
         let read = |inner: &StateMachineInner| {
@@ -5830,10 +5979,7 @@ mod tests {
             catalog.services.get_mut("default__api").unwrap().backends[0].host_port += 1;
             assert!(
                 inner
-                    .apply_request(&RaftRequest::PublishEndpoints {
-                        expected_generation: generation,
-                        catalog: Box::new(catalog.clone())
-                    })
+                    .apply_request(&publication(&inner.state, generation, catalog.clone()))
                     .is_none()
             );
         }
@@ -5864,7 +6010,7 @@ mod tests {
     #[test]
     fn producer_retirement_withdrawal_failure_preserves_catalogue_fence_and_history() {
         let mut inner = StateMachineInner::default();
-        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue().into();
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let execution = inner.state.endpoint_catalog.services["default__api"].backends[0]
             .execution
@@ -5905,10 +6051,11 @@ mod tests {
                 normal_entry(
                     1,
                     2,
-                    RaftRequest::PublishEndpoints {
-                        expected_generation: 0,
-                        catalog: Box::new(catalog),
-                    },
+                    publication_from(
+                        &crate::onion::catalog::EndpointCatalog::default(),
+                        0,
+                        catalog,
+                    ),
                 ),
                 normal_entry(1, 3, retirement),
             ])
@@ -5933,10 +6080,11 @@ mod tests {
         for (expected_generation, catalog) in [first, Default::default()].into_iter().enumerate() {
             assert!(
                 inner
-                    .apply_request(&RaftRequest::PublishEndpoints {
-                        expected_generation: expected_generation as u64,
-                        catalog: Box::new(catalog),
-                    })
+                    .apply_request(&publication(
+                        &inner.state,
+                        expected_generation as u64,
+                        catalog
+                    ))
                     .is_none()
             );
         }
@@ -5980,14 +6128,16 @@ mod tests {
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "offline".into(),
             },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(withdrawal_fixture_catalogue()),
-            },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default(),
-            },
+            publication_from(
+                &crate::onion::catalog::EndpointCatalog::default(),
+                0,
+                withdrawal_fixture_catalogue(),
+            ),
+            publication_from(
+                &withdrawal_fixture_catalogue(),
+                1,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             endpoint_receipt("reader", 1),
         ];
         for (index, request) in requests.into_iter().enumerate() {
@@ -6036,20 +6186,14 @@ mod tests {
         let first = withdrawal_fixture_catalogue();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let mut second = first.clone();
         second.services.get_mut("default__api").unwrap().backends[0].host_port = 30002;
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 1,
-                    catalog: Box::new(second.clone())
-                })
+                .apply_request(&publication(&inner.state, 1, second.clone()))
                 .is_none()
         );
         assert_eq!(inner.state.endpoint_withdrawals.pending.len(), 1);
@@ -6058,10 +6202,11 @@ mod tests {
         candidate.services.get_mut("default__api").unwrap().backends[0].host_port = 30003;
         for expected_generation in [1, 3] {
             assert!(matches!(
-                inner.apply_request(&RaftRequest::PublishEndpoints {
+                inner.apply_request(&publication(
+                    &inner.state,
                     expected_generation,
-                    catalog: Box::new(candidate.clone())
-                }),
+                    candidate.clone()
+                )),
                 Some(CouncilResponse::Refused { .. })
             ));
             assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6072,17 +6217,19 @@ mod tests {
     fn endpoint_publication_generation_requires_current_evidence_even_for_noops() {
         let mut inner = StateMachineInner::default();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default()
-            }),
+            inner.apply_request(&publication(
+                &inner.state,
+                1,
+                crate::onion::catalog::EndpointCatalog::default()
+            )),
             Some(CouncilResponse::Refused { .. })
         ));
         let first = withdrawal_fixture_catalogue();
-        let request = RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(first.clone()),
-        };
+        let request = publication_from(
+            &crate::onion::catalog::EndpointCatalog::default(),
+            0,
+            first.clone(),
+        );
         assert!(inner.apply_request(&request).is_none());
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
@@ -6092,10 +6239,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 1,
-                    catalog: Box::new(first)
-                })
+                .apply_request(&publication(&inner.state, 1, first))
                 .is_none()
         );
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6104,10 +6248,11 @@ mod tests {
     #[tokio::test]
     async fn endpoint_publication_generation_survives_snapshot_for_stale_noop_refusal() {
         let mut sm = CouncilStateMachine::new();
-        let request = RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(withdrawal_fixture_catalogue()),
-        };
+        let request = publication_from(
+            &crate::onion::catalog::EndpointCatalog::default(),
+            0,
+            withdrawal_fixture_catalogue(),
+        );
         let applied = sm
             .apply_fixture(vec![normal_entry(1, 1, request.clone())])
             .await
@@ -6138,10 +6283,7 @@ mod tests {
         let first = withdrawal_fixture_catalogue();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let request = RaftRequest::DecommissionNode {
@@ -6162,19 +6304,13 @@ mod tests {
         backend.node_ip = "10.0.0.2".parse().unwrap();
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::new(candidate.clone())
-            }),
+            inner.apply_request(&publication(&inner.state, 1, candidate.clone())),
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(candidate)
-                })
+                .apply_request(&publication(&inner.state, 2, candidate))
                 .is_none()
         );
         assert_eq!(inner.state.endpoint_withdrawals.generation, 3);
@@ -6198,14 +6334,16 @@ mod tests {
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "survivor".into(),
             },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(catalogue.clone()),
-            },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default(),
-            },
+            publication_from(
+                &crate::onion::catalog::EndpointCatalog::default(),
+                0,
+                catalogue.clone(),
+            ),
+            publication_from(
+                &catalogue,
+                1,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "late-reader".into(),
             },
@@ -6278,10 +6416,7 @@ mod tests {
             });
         }
         let catalogue = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(catalogue.clone()),
-        });
+        inner.apply_request(&publication(&inner.state, 0, catalogue.clone()));
         let request = RaftRequest::DecommissionNode {
             node_id: "producer".into(),
             retired_by: "operator".into(),
@@ -6315,20 +6450,15 @@ mod tests {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());
         let original = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(original.clone()),
-        });
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 1,
-            catalog: Box::default(),
-        });
+        inner.apply_request(&publication(&inner.state, 0, original.clone()));
+        inner.apply_request(&publication(
+            &inner.state,
+            1,
+            crate::onion::catalog::EndpointCatalog::default(),
+        ));
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 2,
-                catalog: Box::new(original)
-            }),
+            inner.apply_request(&publication(&inner.state, 2, original)),
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6338,14 +6468,15 @@ mod tests {
     fn endpoint_withdrawal_refusal_leaves_publication_and_decommission_atomic() {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());
-        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue().into();
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let before = serde_json::to_value(&inner.state).unwrap();
         for request in [
-            RaftRequest::PublishEndpoints {
-                expected_generation: u64::MAX,
-                catalog: Box::default(),
-            },
+            publication(
+                &inner.state,
+                u64::MAX,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             RaftRequest::DecommissionNode {
                 node_id: "producer".into(),
                 retired_by: "operator".into(),
@@ -6374,14 +6505,12 @@ mod tests {
             });
         }
         let original = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(original),
-        });
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 1,
-            catalog: Box::default(),
-        });
+        inner.apply_request(&publication(&inner.state, 0, original));
+        inner.apply_request(&publication(
+            &inner.state,
+            1,
+            crate::onion::catalog::EndpointCatalog::default(),
+        ));
         assert_eq!(
             inner.state.endpoint_withdrawals.pending[&1].consumers,
             std::collections::BTreeSet::from(["stopped".into(), "survivor".into()])
@@ -6582,10 +6711,7 @@ mod tests {
         let entry = normal_entry(
             1,
             1,
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(catalog),
-            },
+            publication_from(&EndpointCatalog::default(), 0, catalog),
         );
         sm.apply_fixture(vec![entry]).await.unwrap();
 
@@ -6605,17 +6731,11 @@ mod tests {
         assert_eq!(d.backends[0].node_id, "node-a");
         assert_eq!(p.backends[0].node_id, "node-b");
 
-        // A later publish wholly replaces the catalogue (leader is authoritative).
+        // A later publish replaces the catalogue (leader is authoritative):
+        // the services it doesn't name any more are removed.
         let replacement =
             EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]).unwrap();
-        let entry2 = normal_entry(
-            2,
-            1,
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::new(replacement),
-            },
-        );
+        let entry2 = normal_entry(2, 1, publication(&state, 1, replacement));
         sm.apply_fixture(vec![entry2]).await.unwrap();
         let state = sm.desired_state().await;
         assert!(
@@ -7086,6 +7206,47 @@ mod tests {
         );
     }
 
+    /// #2419: `relish upgrade` uploads the new binary once, as a bare blob no
+    /// manifest tracks, and nodes fetch it only when their turn comes. While
+    /// the upgrade is active (paused included) the arbiter refuses to let
+    /// GC delete it; once the upgrade has gone it's an ordinary orphan.
+    #[test]
+    fn gc_arbitration_refuses_the_binary_of_an_active_upgrade() {
+        let mut inner = StateMachineInner::default();
+        let binary = test_digest("b1");
+        let other = test_digest("o1");
+        let mut upgrade = upgrade_state("up-1");
+        upgrade.binaries = vec![crate::upgrade::types::PlatformBinary {
+            platform: "linux-x86_64".into(),
+            sha256: binary.as_str().trim_start_matches("sha256:").into(),
+            embedded_signature: String::new(),
+            external_signature: None,
+        }];
+        upgrade.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
+            reason: "node 5 failed its health check".into(),
+        };
+        inner.state.active_upgrade = Some(upgrade);
+        let report = || {
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: 1,
+                deleted_layers: vec![binary.clone(), other.clone()],
+            })
+        };
+        assert_eq!(
+            inner.apply_request(&report()),
+            Some(CouncilResponse::GcApproved {
+                approved: vec![other.clone()]
+            })
+        );
+        inner.state.active_upgrade = None;
+        assert_eq!(
+            inner.apply_request(&report()),
+            Some(CouncilResponse::GcApproved {
+                approved: vec![binary.clone(), other.clone()]
+            })
+        );
+    }
+
     #[tokio::test]
     async fn apply_gc_report_removes_holder() {
         let mut sm = CouncilStateMachine::new();
@@ -7402,7 +7563,7 @@ mod tests {
     fn security_state_init_never_replaces_an_initialised_security_state() {
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("restored", &[3; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![hierarchy.root.ca.clone()],
             api_tokens: vec![crate::sesame::types::ApiToken {
                 name: "admin".to_string(),
@@ -7416,7 +7577,7 @@ mod tests {
             }],
             next_serial: 900,
             ..Default::default()
-        };
+        });
         let bootstrap = crate::sesame::types::SecurityState {
             certificate_authorities: vec![hierarchy.root.ca],
             next_serial: 2,
@@ -7491,7 +7652,7 @@ mod tests {
         use crate::sesame::types::{CaRole, CertificateAuthority, SerialNumber};
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![
                 CertificateAuthority {
                     private_key_wrapped: None,
@@ -7501,7 +7662,7 @@ mod tests {
             ],
             next_serial: 10,
             ..Default::default()
-        };
+        });
         // node-a joins under generation 0.
         inner
             .state
@@ -7650,7 +7811,7 @@ mod tests {
         use crate::sesame::types::{CaRole, CertificateAuthority};
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![
                 CertificateAuthority {
                     private_key_wrapped: None,
@@ -7660,7 +7821,7 @@ mod tests {
             ],
             next_serial: 10,
             ..Default::default()
-        };
+        });
         let (csr_der, private_key_wrapped) =
             crate::sesame::ca::create_intermediate_csr(CaRole::Node, &[4; 32]).unwrap();
         let prepare = RaftRequest::CaRotationPrepare {
@@ -9664,6 +9825,56 @@ mod tests {
         assert_eq!(sm.desired_state().await.scheduling, before);
     }
 
+    /// A pass is held to the limits the leader's planner reads (#2366),
+    /// except a pass of one decision: one app is never too big to place.
+    #[tokio::test]
+    async fn a_pass_over_the_placement_limit_is_admitted_only_alone() {
+        use crate::meat::types::{MAX_PASS_DECISIONS, MAX_PASS_PLACEMENTS};
+        let decision = |name: &str, replicas: usize| SchedulingDecision {
+            app_id: AppId::new(name, "default"),
+            placements: (0..replicas)
+                .map(|ordinal| Placement {
+                    node_id: NodeId::new("home"),
+                    resources: Resources::new(1, 0, 0),
+                    ordinal: ordinal as u32,
+                })
+                .collect(),
+        };
+        let pass = |index: u64, decisions: Vec<SchedulingDecision>| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::SchedulingDecisions {
+                    expected_log_id: (index > 1).then(|| log_id(1, index - 1)),
+                    decisions,
+                },
+            )
+        };
+        let mut sm = CouncilStateMachine::new();
+
+        let half = MAX_PASS_PLACEMENTS / 2 + 1;
+        let response = sm
+            .apply([pass(1, vec![decision("a", half), decision("b", half)])])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
+
+        let response = sm
+            .apply([pass(2, vec![decision("big", MAX_PASS_PLACEMENTS + 1)])])
+            .await
+            .unwrap();
+        assert!(
+            matches!(response[0], CouncilResponse::Applied { .. }),
+            "{response:?}"
+        );
+
+        let many = (0..=MAX_PASS_DECISIONS)
+            .map(|index| decision(&format!("app-{index}"), 1))
+            .collect();
+        let response = sm.apply([pass(3, many)]).await.unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
+    }
+
     #[tokio::test]
     async fn unguarded_app_placement_cannot_race_shared_capacity_admission() {
         let mut sm = CouncilStateMachine::new();
@@ -9897,6 +10108,7 @@ mod tests {
             RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
                 operation_id: op.clone(),
                 config: Box::new(config.clone()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             })),
         )])
@@ -10003,6 +10215,7 @@ mod tests {
                 cron: None,
                 replay_unknown: false,
                 hook: false,
+                declared_image: None,
             }),
             trigger: Some(RunTrigger::Manual {
                 request_id: request_id.into(),
@@ -10210,6 +10423,7 @@ mod tests {
             RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
                 operation_id: "c".repeat(32),
                 config: Box::new(config),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             })),
         ];
@@ -13426,5 +13640,143 @@ mod tests {
             }),
             Some(CouncilResponse::Refused { .. })
         ));
+    }
+
+    /// A fixed state serialises to the same snapshot bytes, whatever the
+    /// in-memory layout of `DesiredState` (#2435): sharing its collections
+    /// behind `Arc` must not change the snapshot format.
+    #[test]
+    fn a_fixed_state_serialises_to_the_same_snapshot_bytes() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        assert!(
+            inner
+                .apply_request(&RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: web_spec("web:v1"),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::SchedulingDecisions {
+                    expected_log_id: None,
+                    decisions: vec![SchedulingDecision {
+                        app_id,
+                        placements: vec![Placement {
+                            node_id: NodeId::new("home"),
+                            resources: Resources::new(1000, 0, 0),
+                            ordinal: 0,
+                        }],
+                    }],
+                })
+                .is_none()
+        );
+        inner.apply_request(&RaftRequest::ConfigSet {
+            key: "colour".into(),
+            value: "blue".into(),
+        });
+        inner.apply_request(&RaftRequest::ManifestCommit(test_manifest_commit()));
+        assert!(
+            inner
+                .apply_request(&publication(
+                    &inner.state,
+                    0,
+                    withdrawal_fixture_catalogue()
+                ))
+                .is_none()
+        );
+        insta::assert_snapshot!(
+            String::from_utf8(serde_json::to_vec(&inner.state).unwrap()).unwrap()
+        );
+    }
+
+    /// A state holding one committed image manifest, so a test can tell
+    /// whether an entry that never writes the catalogue copied it.
+    fn state_with_a_manifest() -> StateMachineInner {
+        let mut inner = StateMachineInner::default();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ManifestCommit(test_manifest_commit()))
+                .is_none()
+        );
+        assert!(!inner.state.manifest_catalog.manifests.is_empty());
+        inner
+    }
+
+    /// #2435: a placement pass is all or nothing, but it must not get
+    /// there by copying the whole desired state. The image catalogue, which
+    /// a pass never writes, is the same allocation afterwards.
+    #[test]
+    fn a_placement_pass_does_not_copy_state_it_does_not_touch() {
+        let mut inner = state_with_a_manifest();
+        let before = inner.state.manifest_catalog.manifests.as_ptr();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::SchedulingDecisions {
+                    expected_log_id: None,
+                    decisions: vec![SchedulingDecision {
+                        app_id: AppId::new("web", "default"),
+                        placements: vec![Placement {
+                            node_id: NodeId::new("home"),
+                            resources: Resources::new(1000, 0, 0),
+                            ordinal: 0,
+                        }],
+                    }],
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.scheduling.len(), 1);
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+    }
+
+    /// #2435: the other three staged entries, a deployment's begin and
+    /// commit and an approved proposal, also leave what they don't write
+    /// where it was.
+    #[test]
+    fn deployments_and_proposals_do_not_copy_state_they_do_not_touch() {
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let mut inner = state_with_a_manifest();
+        let before = inner.state.manifest_catalog.manifests.as_ptr();
+        let op = "0123456789abcdef0123456789abcdef".to_string();
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.once]\nruntime='process'\nexec='/bin/true'",
+        )
+        .unwrap();
+        let begin = inner.apply_request(&RaftRequest::TaskArray(Box::new(
+            TaskArrayWrite::DeployBegin {
+                declared_images: Default::default(),
+                operation_id: op.clone(),
+                config: Box::new(config),
+                now_epoch_secs: 10,
+            },
+        )));
+        assert!(
+            !matches!(begin, Some(CouncilResponse::Refused { .. })),
+            "{begin:?}"
+        );
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+        let commit = inner.apply_request(&RaftRequest::JobApplyCommit {
+            operation_id: op,
+            now_epoch_secs: 11,
+        });
+        assert!(
+            !matches!(commit, Some(CouncilResponse::Refused { .. })),
+            "{commit:?}"
+        );
+        assert!(inner.state.apps.contains_key(&AppId::new("web", "default")));
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let create = scale_proposal(&inner.state, 5, 1_000);
+        proposal_outcome(inner.apply_request(&create));
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            crate::proposal::ProposalOutcome::Applied { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
     }
 }

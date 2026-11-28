@@ -120,6 +120,9 @@ pub struct MockGrill {
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// Instances whose `adopt` fails, as an uncertain runtime's does.
     adopt_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// How long `adopt` of an instance takes, as a loaded host makes runc
+    /// take (#2541).
+    adopt_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
     /// Whether `forget_retired` really forgets, as runc's deletes the
     /// intent journal: a later kill or state read is `NotFound`.
     forget_for_real: Arc<AtomicBool>,
@@ -206,6 +209,7 @@ impl Default for MockGrill {
             unanswered: Arc::default(),
             inspection_failures: Arc::default(),
             adopt_failures: Arc::default(),
+            adopt_delays: Arc::default(),
             forget_for_real: Arc::default(),
             forgotten: Arc::default(),
             exit_code_failures: Arc::default(),
@@ -326,6 +330,14 @@ impl MockGrill {
     /// Make `adopt` of `instance` fail, as a runtime that can't tell does.
     pub fn set_adopt_failure(&self, instance: &InstanceId) {
         self.adopt_failures.lock().unwrap().insert(instance.clone());
+    }
+
+    /// Make `adopt` of `instance` take `delay` before it answers.
+    pub fn set_adopt_delay(&self, instance: &InstanceId, delay: std::time::Duration) {
+        self.adopt_delays
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), delay);
     }
 
     /// Make `forget_retired` forget, as runc's does: until it's created
@@ -1180,6 +1192,10 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("adopt".to_string(), instance.clone()));
+        let delay = self.adopt_delays.lock().unwrap().get(instance).copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if self.adopt_failures.lock().unwrap().contains(instance) {
             return Err(GrillError::StateUnavailable {
                 instance: instance.clone(),

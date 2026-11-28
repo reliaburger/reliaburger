@@ -44,7 +44,7 @@ use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{
     DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
-    MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
+    MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
@@ -68,9 +68,36 @@ const MAX_SEQUENCE_FLOORS: usize = 1024;
 /// set goes out as a rotating window, like the membership table.
 const MAX_SYNC_FLOORS: usize = MAX_PIGGYBACK_UPDATES * 2;
 
+/// Most datagrams in one page of a join sync (#2442). A peer whose table is
+/// under half ours is joining, and one 64-entry window per exchange made
+/// its join time grow with the cluster. A page is 512 entries, about
+/// 90 KB: small enough for a default UDP receive buffer to take as one
+/// burst, so a joiner learns a 10,000-member cluster in 20 exchanges, one
+/// per protocol period, instead of hundreds at the 10 s anti-entropy
+/// interval.
+const MAX_JOIN_SYNC_DATAGRAMS: usize = 64;
+
+/// Most entries in one page of a join sync.
+const MAX_JOIN_SYNC_ENTRIES: usize = MAX_PIGGYBACK_UPDATES * MAX_JOIN_SYNC_DATAGRAMS;
+
+/// Most joining peers whose page cursor a node keeps. Past this the one
+/// served longest ago is forgotten, and restarts from the first page.
+const MAX_JOIN_CURSORS: usize = 64;
+
 /// Shortest gap between two [`GossipPayload::Stale`] answers to one sender,
 /// so a stream of old datagrams draws one answer a second, not one each.
 const STALE_ANSWER_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The highest incarnation a node accepts from the wire (#2395).
+///
+/// Incarnations start at 1 and rise by one per refutation or restart, so
+/// no real node gets near half of `u64`'s range. A datagram, update, `Stale`
+/// answer or floor above this is dropped: without the bound one claim at
+/// `u64::MAX` left its subject with no higher incarnation to refute it with.
+pub const MAX_INCARNATION: u64 = u64::MAX / 2;
+
+/// Shortest gap between two log lines about dropped implausible incarnations.
+const IMPLAUSIBLE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How fresh a sender's datagram is: its incarnation, then its sequence.
 /// The derived ordering compares the fields in declaration order, so a
@@ -83,6 +110,13 @@ struct Freshness {
 }
 
 impl Freshness {
+    /// Below every real datagram: the floor of a member we never heard
+    /// from directly, which holds only a tombstone.
+    const UNHEARD: Freshness = Freshness {
+        incarnation: 0,
+        sequence: 0,
+    };
+
     fn of(message: &GossipMessage) -> Self {
         Self {
             incarnation: message.incarnation,
@@ -94,8 +128,15 @@ impl Freshness {
 /// A reaped member's sequence floor, as this node keeps it.
 #[derive(Debug, Clone)]
 struct RetainedFloor {
-    /// The freshest datagram accepted from the member.
+    /// The freshest datagram accepted from the member. Zero for a member
+    /// this node reaped without ever hearing from it directly: then the
+    /// floor holds only its tombstone.
     freshness: Freshness,
+    /// The incarnation the member had when this node reaped it: a
+    /// tombstone (#2474). A rumour that the member is `Alive` at or below
+    /// it is from before its death, and doesn't bring it back. `None` for
+    /// a floor learned from a peer.
+    reaped_incarnation: Option<u64>,
     /// When the floor stops applying.
     expires: Instant,
     /// Whether we've already logged a datagram dropped below this floor,
@@ -145,6 +186,40 @@ impl SendFailureLog {
         self.unreported = 0;
         self.last_logged = Some(now);
         Some(line)
+    }
+}
+
+/// Rate-limited reporting of incarnations dropped as above
+/// [`MAX_INCARNATION`]: every refusal is counted, and one line goes to
+/// stderr at most every [`IMPLAUSIBLE_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct ImplausibleLog {
+    /// Refusals since the node started.
+    total: u64,
+    /// Refusals since the last line we printed.
+    unreported: u64,
+    last_logged: Option<Instant>,
+}
+
+impl ImplausibleLog {
+    /// Count a refusal of `what` from `sender`, and log it unless the last
+    /// line is too recent.
+    fn record(&mut self, now: Instant, sender: &NodeId, what: &str) {
+        self.total += 1;
+        self.unreported += 1;
+        if self
+            .last_logged
+            .is_some_and(|last| now.duration_since(last) < IMPLAUSIBLE_LOG_INTERVAL)
+        {
+            return;
+        }
+        eprintln!(
+            "mustard: dropped {what} from {sender} with an incarnation above {MAX_INCARNATION} \
+             ({} refusal(s) since the last report)",
+            self.unreported
+        );
+        self.unreported = 0;
+        self.last_logged = Some(now);
     }
 }
 
@@ -213,6 +288,12 @@ pub struct MustardNode<T: MustardTransport> {
     roster_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
     /// Digest of the last-published roster.
     last_published_roster_digest: Vec<MembershipDigest>,
+    /// The membership table's version at the last publish, or `None` before
+    /// the first (#2439).
+    last_published_version: Option<u64>,
+    /// How many membership snapshots `publish_membership` has built.
+    #[cfg(test)]
+    snapshots_taken: usize,
     /// Process-local proof that a peer has acknowledged our gossip.
     rejoin_watch: Option<watch::Sender<bool>>,
     /// Flips to `true` the first time a peer's membership table arrives in
@@ -278,6 +359,14 @@ pub struct MustardNode<T: MustardTransport> {
     /// When the next anti-entropy push-pull is due. Starts at creation, so
     /// the first cycle with a live peer syncs: that is the join sync.
     next_push_pull: Instant,
+    /// The peer of the last push-pull this node started, and how many
+    /// members it knew then. While each exchange teaches it at least a
+    /// window's worth of new members it is still joining: it syncs again
+    /// on the next cycle, with the same peer, for that peer's next page.
+    last_push_pull: Option<(SocketAddr, usize)>,
+    /// Per joining peer: where its next page of our table starts, and when
+    /// we last served it one.
+    join_cursors: HashMap<NodeId, (usize, Instant)>,
     /// Where the next outgoing window of the membership table starts, for
     /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
     sync_cursor: usize,
@@ -300,6 +389,8 @@ pub struct MustardNode<T: MustardTransport> {
     pending_relays: VecDeque<PendingRelay>,
     /// Failed sends, reported at a bounded rate.
     send_failures: SendFailureLog,
+    /// Incarnations dropped as implausible (#2395).
+    implausible: ImplausibleLog,
     /// Whether we've already said that our directory extension is too big
     /// to send, so the line appears once rather than on every datagram.
     oversize_extension_logged: bool,
@@ -342,6 +433,9 @@ impl<T: MustardTransport> MustardNode<T> {
             membership_watch: None,
             roster_watch: None,
             last_published_roster_digest: Vec::new(),
+            last_published_version: None,
+            #[cfg(test)]
+            snapshots_taken: 0,
             rejoin_watch: None,
             synced_watch: None,
             last_published_digest: Vec::new(),
@@ -360,6 +454,8 @@ impl<T: MustardTransport> MustardNode<T> {
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             rng: rand::make_rng(),
             next_push_pull: Instant::now(),
+            last_push_pull: None,
+            join_cursors: HashMap::new(),
             sync_cursor: 0,
             sequences: HashMap::new(),
             sequence_floors: HashMap::new(),
@@ -368,6 +464,7 @@ impl<T: MustardTransport> MustardNode<T> {
             highest_sent: 0,
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
+            implausible: ImplausibleLog::default(),
             oversize_extension_logged: false,
             stats: super::stats::GossipStats::default(),
         }
@@ -414,9 +511,7 @@ impl<T: MustardTransport> MustardNode<T> {
         // Keep our own membership record's labels in sync so a snapshot of
         // the local table already carries them (the scheduler reads labels
         // from the membership snapshot).
-        if let Some(member) = self.membership.get_mut(&self.node_id) {
-            member.labels = labels;
-        }
+        self.membership.set_labels(&self.node_id, &labels);
         self.publish_directory();
     }
 
@@ -508,16 +603,21 @@ impl<T: MustardTransport> MustardNode<T> {
             .as_ref()
             .and_then(|rx| rx.borrow().clone());
         let relayed = self.directory.leader.clone();
-        let leader = match (own, relayed) {
-            (Some(a), Some(b)) => Some(
+        let relayed_age = self.directory.leader_age(Instant::now());
+        // Our own hint is fresh by definition; a relayed one goes on with
+        // the age we hold for it (#2406).
+        let (leader, leader_age) = match (own, relayed) {
+            (Some(a), Some(b)) => {
                 if (a.recovery_epoch, a.term) >= (b.recovery_epoch, b.term) {
-                    a
+                    (Some(a), Duration::ZERO)
                 } else {
-                    b
-                },
-            ),
-            (a, b) => a.or(b),
+                    (Some(b), relayed_age)
+                }
+            }
+            (Some(a), None) => (Some(a), Duration::ZERO),
+            (None, b) => (b, relayed_age),
         };
+        let leader_age_ms = u32::try_from(leader_age.as_millis()).unwrap_or(u32::MAX);
         let recovery_claim = self
             .recovery_fence_rx
             .as_ref()
@@ -532,6 +632,7 @@ impl<T: MustardTransport> MustardNode<T> {
             api_address,
             reporting_address,
             leader,
+            leader_age_ms,
             labels: super::message::bounded_labels(&self.advertised_labels),
             disk_pressured,
             recovery_epoch: recovery_claim.map(|claim| claim.epoch),
@@ -653,15 +754,24 @@ impl<T: MustardTransport> MustardNode<T> {
             && floor.expires > now
         {
             if fresh <= floor.freshness {
+                // Tell a restarted member to refute past its tombstone too,
+                // so its next rumoured Alive isn't dropped as a stale one.
+                let held = Freshness {
+                    incarnation: floor
+                        .freshness
+                        .incarnation
+                        .max(floor.reaped_incarnation.unwrap_or(0)),
+                    sequence: floor.freshness.sequence,
+                };
                 if !floor.logged {
                     floor.logged = true;
                     eprintln!(
                         "mustard: dropping an old datagram from departed node {} (at or below \
                          what we heard before reaping it); answering with incarnation {}",
-                        message.sender, floor.freshness.incarnation
+                        message.sender, held.incarnation
                     );
                 }
-                return Err(floor.freshness);
+                return Err(held);
             }
             // Fresher: the member really is back. Track it as a live sender
             // from here on.
@@ -721,11 +831,8 @@ impl<T: MustardTransport> MustardNode<T> {
         // raise the floor first, so a stale hint here is refused.
         let mut changed = self.refresh_recovery_floor();
         changed |= self.directory.observe(extension);
-        if let Some(member) = self.membership.get_mut(&extension.node_id)
-            && member.labels != extension.labels
-        {
-            member.labels = extension.labels.clone();
-        }
+        self.membership
+            .set_labels(&extension.node_id, &extension.labels);
         if changed {
             self.publish_directory();
         }
@@ -800,13 +907,37 @@ impl<T: MustardTransport> MustardNode<T> {
     /// changed. Comparing a digest (not just the member count) means state
     /// transitions like Alive→Suspect — which keep the count constant until the
     /// reap — are published promptly to the council reconciler and `relish nodes`.
-    fn publish_membership(&mut self) {
+    ///
+    /// `run` calls this after every probe tick and every received datagram,
+    /// so it returns straight away when neither the table's
+    /// [`version`](MembershipTable::version) nor the council roles changed
+    /// since the last call (#2439): before, each datagram cost two full
+    /// snapshots, two digests and two sorts, mostly to learn that nothing
+    /// had changed. Public so a benchmark can drive the same step.
+    pub fn publish_membership(&mut self) {
+        let roles_changed = self
+            .council_roles_rx
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false));
+        if !roles_changed && self.last_published_version == Some(self.membership.version()) {
+            return;
+        }
         // Refresh council/leader flags from the latest Raft-derived roles before
-        // snapshotting. Clone the value out first so the watch borrow is released
+        // snapshotting: a member added since the roles last changed needs its
+        // flags too. Clone the value out first so the watch borrow is released
         // before taking `&mut self.membership` (different fields, but the borrow
         // checker can't see that through method calls).
-        if let Some(roles) = self.council_roles_rx.as_ref().map(|rx| rx.borrow().clone()) {
+        if let Some(roles) = self
+            .council_roles_rx
+            .as_mut()
+            .map(|rx| rx.borrow_and_update().clone())
+        {
             self.membership.set_roles(&roles);
+        }
+        self.last_published_version = Some(self.membership.version());
+        #[cfg(test)]
+        {
+            self.snapshots_taken += 1;
         }
         let snapshot = self.membership.snapshot();
         let digest = membership_digest(&snapshot);
@@ -818,6 +949,10 @@ impl<T: MustardTransport> MustardNode<T> {
             self.last_published_digest = digest;
         }
         if let Some(tx) = &self.roster_watch {
+            #[cfg(test)]
+            {
+                self.snapshots_taken += 1;
+            }
             let roster = self.membership.roster();
             let digest = membership_digest(&roster);
             if digest != self.last_published_roster_digest {
@@ -929,8 +1064,12 @@ impl<T: MustardTransport> MustardNode<T> {
         self.ping_rejoin_contact().await;
 
         // An isolated node stays due, so it syncs with the first peer it
-        // finds rather than a whole interval later.
-        if now >= self.next_push_pull && self.push_pull().await {
+        // finds rather than a whole interval later. A joiner still learning
+        // a page per exchange syncs again straight away (#2442).
+        let joining = self.last_push_pull.is_some_and(|(_, known)| {
+            self.membership.len() >= known.saturating_add(MAX_SYNC_ENTRIES)
+        });
+        if (joining || now >= self.next_push_pull) && self.push_pull(joining).await {
             self.next_push_pull = now + self.config.push_pull_interval;
         }
 
@@ -942,7 +1081,9 @@ impl<T: MustardTransport> MustardNode<T> {
             return;
         };
 
-        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        // Carry our claim about the target, if it isn't Alive to us, so a
+        // suspected target hears it from its suspecter and refutes (#2441).
+        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, Some(&target_id));
         self.send(target_addr, &ping).await;
 
         // Wait for ACK
@@ -1008,6 +1149,11 @@ impl<T: MustardTransport> MustardNode<T> {
     /// counter carries on from where it was, or restarts from the wall
     /// clock, above the floor either way.
     fn reap_departed(&mut self, now: Instant) {
+        // A leader hint nobody has re-advertised for a minute goes, even
+        // with no datagram to trigger it (#2406).
+        if self.directory.expire_leader(now) {
+            self.publish_directory();
+        }
         self.sequence_floors.retain(|_, floor| floor.expires > now);
         let reaped = self
             .membership
@@ -1015,24 +1161,40 @@ impl<T: MustardTransport> MustardNode<T> {
         if reaped.is_empty() {
             return;
         }
-        for node in &reaped {
-            if let Some(freshness) = self.sequences.remove(node) {
-                self.retain_floor(node.clone(), freshness, now + SEQUENCE_FLOOR_RETENTION);
-            }
-        }
-        for node in &reaped {
-            self.stale_answers.remove(node);
-        }
+        let reaped: Vec<NodeId> = reaped
+            .into_iter()
+            .map(|(node, incarnation)| {
+                // A member we never heard from directly has no sequence to
+                // keep, only its tombstone.
+                let freshness = self.sequences.remove(&node).unwrap_or(Freshness::UNHEARD);
+                self.retain_floor(
+                    node.clone(),
+                    freshness,
+                    Some(incarnation),
+                    now + SEQUENCE_FLOOR_RETENTION,
+                );
+                self.stale_answers.remove(&node);
+                node
+            })
+            .collect();
         if self.directory.prune(&reaped) {
             self.publish_directory();
         }
     }
 
-    /// Keep a sequence floor for `node`, raising an existing one. When the
-    /// table is full, the floor closest to expiring makes room.
-    fn retain_floor(&mut self, node: NodeId, freshness: Freshness, expires: Instant) {
+    /// Keep a sequence floor for `node`, raising an existing one (and its
+    /// tombstone, if `reaped_incarnation` gives one). When the table is
+    /// full, the floor closest to expiring makes room.
+    fn retain_floor(
+        &mut self,
+        node: NodeId,
+        freshness: Freshness,
+        reaped_incarnation: Option<u64>,
+        expires: Instant,
+    ) {
         if let Some(floor) = self.sequence_floors.get_mut(&node) {
             floor.freshness = floor.freshness.max(freshness);
+            floor.reaped_incarnation = floor.reaped_incarnation.max(reaped_incarnation);
             floor.expires = floor.expires.max(expires);
             return;
         }
@@ -1050,6 +1212,7 @@ impl<T: MustardTransport> MustardNode<T> {
             node,
             RetainedFloor {
                 freshness,
+                reaped_incarnation,
                 expires,
                 logged: false,
             },
@@ -1064,9 +1227,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// else is no newer than our floor. A floor for a sender we hear
     /// directly and consider up is ignored (our own record is what counts),
     /// and so is a floor about this node.
-    fn merge_floors(&mut self, floors: &[SequenceFloor], now: Instant) {
+    fn merge_floors(&mut self, sender: &NodeId, floors: &[SequenceFloor], now: Instant) {
         for floor in floors {
             if floor.node_id == self.node_id {
+                continue;
+            }
+            if floor.incarnation > MAX_INCARNATION {
+                self.implausible.record(now, sender, "a sequence floor");
                 continue;
             }
             let freshness = Freshness {
@@ -1088,7 +1255,7 @@ impl<T: MustardTransport> MustardNode<T> {
             if remaining.is_zero() {
                 continue;
             }
-            self.retain_floor(floor.node_id.clone(), freshness, now + remaining);
+            self.retain_floor(floor.node_id.clone(), freshness, None, now + remaining);
         }
     }
 
@@ -1119,7 +1286,7 @@ impl<T: MustardTransport> MustardNode<T> {
         let mut floors: Vec<SequenceFloor> = self
             .sequence_floors
             .iter()
-            .filter(|(_, floor)| floor.expires > now)
+            .filter(|(_, floor)| floor.expires > now && floor.freshness != Freshness::UNHEARD)
             .map(|(node, floor)| SequenceFloor {
                 node_id: node.clone(),
                 incarnation: floor.freshness.incarnation,
@@ -1163,6 +1330,10 @@ impl<T: MustardTransport> MustardNode<T> {
             return false;
         }
         let now = Instant::now();
+        if message.incarnation > MAX_INCARNATION {
+            self.implausible.record(now, &message.sender, "a datagram");
+            return false;
+        }
         // Replay protection comes before anything is applied. The HMAC proves
         // the sender wrote these bytes once, not that it wrote them just now:
         // a captured datagram replayed from another socket would otherwise
@@ -1197,6 +1368,15 @@ impl<T: MustardTransport> MustardNode<T> {
                 self.rejoin_contacts.pop_front();
             }
         }
+        // Whether the sender was down or suspect to us at a lower
+        // incarnation: then this datagram is its refutation or its return,
+        // which `add_node` applies directly, so nothing below would re-queue
+        // it (#2441).
+        let overturned = self.membership.get(&message.sender).is_some_and(|member| {
+            member.state != NodeState::Alive
+                && member.state != NodeState::Left
+                && message.incarnation > member.incarnation
+        });
         let is_new = self.membership.add_node(
             message.sender.clone(),
             from,
@@ -1209,34 +1389,55 @@ impl<T: MustardTransport> MustardNode<T> {
         // membership record. `ingest_extension` above ran before `add_node`,
         // so a first-contact sender wouldn't yet have a record to label;
         // do it here now the record exists.
-        if let Some(extension) = extension
-            && let Some(member) = self.membership.get_mut(&extension.node_id)
-            && member.labels != extension.labels
-        {
-            member.labels = extension.labels.clone();
+        if let Some(extension) = extension {
+            self.membership
+                .set_labels(&extension.node_id, &extension.labels);
         }
 
-        // Disseminate newly discovered nodes so the whole cluster learns
-        if is_new {
-            self.dissemination.enqueue(
-                MembershipUpdate {
-                    node_id: message.sender.clone(),
-                    address: from,
-                    state: NodeState::Alive,
-                    incarnation: message.incarnation,
-                },
-                self.membership.len(),
-            );
+        // Disseminate newly discovered nodes so the whole cluster learns,
+        // and a peer's refutation or return ahead of everything else.
+        if is_new || overturned {
+            let update = MembershipUpdate {
+                node_id: message.sender.clone(),
+                address: from,
+                state: NodeState::Alive,
+                incarnation: message.incarnation,
+            };
+            let size = self.membership.len();
+            if overturned {
+                self.dissemination.enqueue_urgent(update, size);
+            } else {
+                self.dissemination.enqueue(update, size);
+            }
         }
 
         // Process piggybacked updates
         self.stats.record_updates(message.payload.updates().len());
         for update in message.payload.updates() {
+            if update.incarnation > MAX_INCARNATION {
+                self.implausible
+                    .record(now, &message.sender, "a membership update");
+                continue;
+            }
+            if self.tombstoned(update, now) {
+                continue;
+            }
+            let was_down_or_suspect = self
+                .membership
+                .get(&update.node_id)
+                .is_some_and(|member| member.state != NodeState::Alive);
             let changed = self.membership.apply_update(update, now);
             if changed {
-                // Re-disseminate to other nodes
-                self.dissemination
-                    .enqueue(update.clone(), self.membership.len());
+                // Re-disseminate to other nodes. An Alive that overturns a
+                // failure claim goes first at every hop (#2441), or the
+                // suspicion timers win the race while it waits behind a
+                // correlated failure's rumours.
+                let size = self.membership.len();
+                if was_down_or_suspect && update.state == NodeState::Alive {
+                    self.dissemination.enqueue_urgent(update.clone(), size);
+                } else {
+                    self.dissemination.enqueue(update.clone(), size);
+                }
             }
 
             // If we're being suspected, declared dead, or reported as having
@@ -1296,17 +1497,19 @@ impl<T: MustardTransport> MustardNode<T> {
             GossipPayload::Sync {
                 floors,
                 wants_reply,
+                known_members,
                 ..
             } => {
                 if let Some(sender) = &self.synced_watch {
                     sender.send_if_modified(|synced| !std::mem::replace(synced, true));
                 }
-                self.merge_floors(floors, now);
+                self.merge_floors(&message.sender, floors, now);
                 // The entries were merged above like any piggybacked update.
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
                 if *wants_reply {
-                    self.send_membership(from, false).await;
+                    self.answer_sync(from, &message.sender, *known_members, now)
+                        .await;
                 }
             }
             GossipPayload::Stale {
@@ -1324,7 +1527,10 @@ impl<T: MustardTransport> MustardNode<T> {
                     incarnation: *held_incarnation,
                     sequence: *held_sequence,
                 };
-                if !self.left && self.behind(held) {
+                if *held_incarnation > MAX_INCARNATION {
+                    self.implausible
+                        .record(now, &message.sender, "a stale answer");
+                } else if !self.left && self.behind(held) {
                     self.refute(*held_incarnation);
                 }
             }
@@ -1337,19 +1543,30 @@ impl<T: MustardTransport> MustardNode<T> {
                 // Mark the acknowledged node alive: the sender itself, or the
                 // probed node a relay vouches for.
                 let acknowledged = relayed_for.as_ref().unwrap_or(&message.sender);
-                if let Some(member) = self.membership.get_mut(acknowledged) {
-                    if member.state == NodeState::Suspect {
-                        member.state = NodeState::Alive;
-                        member.state_changed = now;
-                    }
-                    member.last_ack = now;
-                }
+                self.membership.acknowledge(acknowledged, now);
                 if relayed_for.is_none() {
                     self.forward_relay_acks(&message.sender).await;
                 }
             }
         }
         true
+    }
+
+    /// Whether `update` is a stale `Alive` about a member this node reaped:
+    /// one at or below the incarnation it was reaped at, about a member not
+    /// in the table (#2474). A peer that missed the death (it was cut off,
+    /// or the rotating sync window never showed it) still says `Alive`, and
+    /// without the tombstone one such rumour re-added the member on every
+    /// node. A higher incarnation is a real return, and passes.
+    fn tombstoned(&self, update: &MembershipUpdate, now: Instant) -> bool {
+        update.state == NodeState::Alive
+            && self.membership.get(&update.node_id).is_none()
+            && self
+                .sequence_floors
+                .get(&update.node_id)
+                .filter(|floor| floor.expires > now)
+                .and_then(|floor| floor.reaped_incarnation)
+                .is_some_and(|tombstone| update.incarnation <= tombstone)
     }
 
     /// Remember that we pinged `target` for `requester`, so its ACK can be
@@ -1407,8 +1624,15 @@ impl<T: MustardTransport> MustardNode<T> {
     /// peers held it Dead@50, and restarted at 1 would otherwise need ~49
     /// refutes (often longer than the 60s reap) before its Alive out-ranks the
     /// stale Dead. Seeding from the seen value means a single refute wins.
+    ///
+    /// The step saturates at [`MAX_INCARNATION`]: a claim at the ceiling
+    /// burns this node's headroom (it can't out-rank it), but nothing wraps.
     fn refute(&mut self, offending_incarnation: u64) {
-        self.incarnation = self.incarnation.max(offending_incarnation) + 1;
+        self.incarnation = self
+            .incarnation
+            .max(offending_incarnation)
+            .saturating_add(1)
+            .min(MAX_INCARNATION);
         let update = MembershipUpdate {
             node_id: self.node_id.clone(),
             address: self.address,
@@ -1424,7 +1648,7 @@ impl<T: MustardTransport> MustardNode<T> {
         // Ahead of every queued Suspect and Dead: a falsely suspected node
         // that waits behind a rack failure's backlog flaps.
         self.dissemination
-            .enqueue_refutation(update, self.membership.len());
+            .enqueue_urgent(update, self.membership.len());
     }
 
     /// Start an anti-entropy exchange with one random live peer.
@@ -1434,7 +1658,10 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Both sides merge under the ordinary SWIM precedence, so a stale entry
     /// can't resurrect a dead node or undo a refutation. Returns `false` when
     /// there is no live peer to sync with.
-    pub async fn push_pull(&mut self) -> bool {
+    ///
+    /// `same_peer` asks for the peer of the last exchange, while it's still
+    /// alive: a joiner pages through one peer's table (#2442).
+    pub async fn push_pull(&mut self, same_peer: bool) -> bool {
         let mut candidates: Vec<_> = self
             .membership
             .alive_members()
@@ -1443,11 +1670,86 @@ impl<T: MustardTransport> MustardNode<T> {
             .map(|m| (m.node_id.clone(), m.address))
             .collect();
         candidates.sort_unstable();
-        let Some((_, address)) = candidates.choose(&mut self.rng).cloned() else {
+        let last = self
+            .last_push_pull
+            .map(|(address, _)| address)
+            .filter(|address| same_peer && candidates.iter().any(|(_, a)| a == address));
+        let Some(address) = last.or_else(|| {
+            candidates
+                .choose(&mut self.rng)
+                .map(|(_, address)| *address)
+        }) else {
             return false;
         };
-        self.send_membership(address, true).await;
+        self.last_push_pull = Some((address, self.membership.len()));
+        let window = self.membership_window();
+        self.send_membership(address, true, window, MAX_SYNC_DATAGRAMS)
+            .await;
         true
+    }
+
+    /// Answer a push-pull request from `requester`, which knows
+    /// `known_members` members: a page of our whole table if it's joining
+    /// (it knows more than a window fewer members than we do), otherwise one
+    /// anti-entropy window. A joiner gets at most one
+    /// page per half protocol period, so a peer repeating requests can't
+    /// turn one datagram into a page every time (#2442).
+    async fn answer_sync(
+        &mut self,
+        to: SocketAddr,
+        requester: &NodeId,
+        known_members: u32,
+        now: Instant,
+    ) {
+        let ours = self.membership.len();
+        let known = usize::try_from(known_members).unwrap_or(usize::MAX);
+        let joining = ours > MAX_SYNC_ENTRIES && known.saturating_add(MAX_SYNC_ENTRIES) < ours;
+        let paced = self.join_cursors.get(requester).is_some_and(|(_, served)| {
+            now.saturating_duration_since(*served) < self.config.protocol_interval / 2
+        });
+        if !joining || paced {
+            let window = self.membership_window();
+            self.send_membership(to, false, window, MAX_SYNC_DATAGRAMS)
+                .await;
+            return;
+        }
+        let mut entries: Vec<MembershipUpdate> = self
+            .membership
+            .iter()
+            .map(|m| MembershipUpdate {
+                node_id: m.node_id.clone(),
+                address: m.address,
+                state: m.state,
+                incarnation: m.incarnation,
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        let start = self
+            .join_cursors
+            .get(requester)
+            .map_or(0, |(cursor, _)| *cursor);
+        let start = if start >= entries.len() { 0 } else { start };
+        let page: Vec<MembershipUpdate> = entries
+            .into_iter()
+            .skip(start)
+            .take(MAX_JOIN_SYNC_ENTRIES)
+            .collect();
+        let sent = self
+            .send_membership(to, false, page, MAX_JOIN_SYNC_DATAGRAMS)
+            .await;
+        if self.join_cursors.len() >= MAX_JOIN_CURSORS && !self.join_cursors.contains_key(requester)
+        {
+            let oldest = self
+                .join_cursors
+                .iter()
+                .min_by_key(|(_, (_, served))| *served)
+                .map(|(node, _)| node.clone());
+            if let Some(oldest) = oldest {
+                self.join_cursors.remove(&oldest);
+            }
+        }
+        self.join_cursors
+            .insert(requester.clone(), (start + sent, now));
     }
 
     /// Send our membership table to `target` as a burst of `Sync` datagrams,
@@ -1457,33 +1759,85 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Sync datagrams go out unstamped: the directory extension can take
     /// ~1,100 bytes with a full label set, and every probe already carries it,
     /// so the whole UDP budget goes to membership entries instead.
-    async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
-        let window = self.membership_window();
-        for (index, entries) in window.chunks(MAX_PIGGYBACK_UPDATES).enumerate() {
-            let sync = GossipMessage::new(
-                self.node_id.clone(),
-                self.incarnation,
-                GossipPayload::Sync {
-                    entries: entries.to_vec(),
-                    floors: vec![],
-                    wants_reply: wants_reply && index == 0,
-                },
-            );
-            self.send(target, &sync).await;
-        }
+    ///
+    /// Sends `entries` in at most `max_datagrams` datagrams, and returns how
+    /// many of them went.
+    async fn send_membership(
+        &mut self,
+        target: SocketAddr,
+        wants_reply: bool,
+        entries: Vec<MembershipUpdate>,
+        max_datagrams: usize,
+    ) -> usize {
+        let known_members = u32::try_from(self.membership.len()).unwrap_or(u32::MAX);
+        let mut syncs = self.sync_datagrams(entries, |entries, first| GossipPayload::Sync {
+            entries,
+            floors: vec![],
+            wants_reply: wants_reply && first,
+            known_members,
+        });
+        syncs.truncate(max_datagrams);
+        let sent = syncs.iter().map(|sync| sync.payload.updates().len()).sum();
         let floors = self.floor_window(Instant::now());
-        for floors in floors.chunks(MAX_PIGGYBACK_UPDATES) {
-            let sync = GossipMessage::new(
+        syncs.extend(
+            self.sync_datagrams(floors, |floors, _| GossipPayload::Sync {
+                entries: vec![],
+                floors,
+                wants_reply: false,
+                known_members,
+            }),
+        );
+        for sync in &syncs {
+            self.send(target, sync).await;
+        }
+        sent
+    }
+
+    /// Pack `items` in order into `Sync` datagrams of at most
+    /// [`MAX_PIGGYBACK_UPDATES`] items that each fit
+    /// [`MAX_DATAGRAM_BYTES`](super::message::MAX_DATAGRAM_BYTES) (#2394).
+    /// Cutting by count alone assumed short node names; a long one made
+    /// every datagram too large to send. An item too large for a datagram
+    /// of its own is left out, since no datagram could carry it.
+    /// `payload` builds a datagram's payload, told whether it's the first.
+    fn sync_datagrams<Item: Clone>(
+        &self,
+        items: Vec<Item>,
+        payload: impl Fn(Vec<Item>, bool) -> GossipPayload,
+    ) -> Vec<GossipMessage> {
+        let message = |batch: &[Item], first: bool| {
+            GossipMessage::new(
                 self.node_id.clone(),
                 self.incarnation,
-                GossipPayload::Sync {
-                    entries: vec![],
-                    floors: floors.to_vec(),
-                    wants_reply: false,
-                },
-            );
-            self.send(target, &sync).await;
+                payload(batch.to_vec(), first),
+            )
+        };
+        let fits = |batch: &[Item], first: bool| {
+            batch.len() <= MAX_PIGGYBACK_UPDATES
+                && message(batch, first).encoded_len() <= super::message::MAX_DATAGRAM_BYTES
+        };
+        let mut datagrams = Vec::new();
+        let mut batch: Vec<Item> = Vec::new();
+        for item in items {
+            batch.push(item);
+            if fits(&batch, datagrams.is_empty()) {
+                continue;
+            }
+            // The newest item overflowed: send the rest, start again with it.
+            let Some(item) = batch.pop() else { continue };
+            if !batch.is_empty() {
+                datagrams.push(message(&batch, datagrams.is_empty()));
+                batch.clear();
+            }
+            batch.push(item);
+            if !fits(&batch, datagrams.is_empty()) {
+                batch.clear();
+            }
         }
+        if !batch.is_empty() {
+            datagrams.push(message(&batch, datagrams.is_empty()));
+        }
+        datagrams
     }
 
     /// The membership entries for one exchange: the whole table when it fits
@@ -1971,6 +2325,99 @@ mod tests {
                 .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Suspect),
             "state transition not published without a count change"
         );
+    }
+
+    /// #2439: `run` publishes after every datagram, and each publish built
+    /// and sorted two full snapshots even when nothing had changed.
+    #[tokio::test]
+    async fn a_datagram_that_changes_nothing_takes_no_snapshot() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        for i in 0..100u16 {
+            node.membership.add_node(
+                NodeId::new(format!("m{i}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let (tx, _rx) = tokio::sync::watch::channel(Vec::new());
+        node.set_membership_watch(tx);
+        let (tx, _roster) = tokio::sync::watch::channel(Vec::new());
+        node.set_roster_watch(tx);
+        let (_roles_tx, roles_rx) =
+            watch::channel(super::super::membership::CouncilRoles::default());
+        node.set_council_roles_watch(roles_rx);
+        node.handle_message(addr(1000), ping_from("m0")).await;
+        node.publish_membership();
+        let before = node.snapshots_taken;
+        for _ in 0..50 {
+            node.handle_message(addr(1000), ping_from("m0")).await;
+            node.publish_membership();
+        }
+        assert_eq!(node.snapshots_taken - before, 0);
+    }
+
+    /// The other side of skipping: whatever a snapshot shows still
+    /// publishes, including an ACK that clears a suspicion, a label change
+    /// with no state change, and new council roles.
+    #[tokio::test]
+    async fn every_visible_change_still_publishes() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+        node.set_membership_watch(tx);
+        let (roles_tx, roles_rx) =
+            watch::channel(super::super::membership::CouncilRoles::default());
+        node.set_council_roles_watch(roles_rx);
+        node.publish_membership();
+        let n2 = |rx: &watch::Receiver<Vec<MembershipSnapshot>>| {
+            rx.borrow()
+                .iter()
+                .find(|member| member.node_id == NodeId::new("n2"))
+                .cloned()
+                .unwrap()
+        };
+
+        node.membership.suspect(&NodeId::new("n2"));
+        node.publish_membership();
+        assert_eq!(n2(&rx).state, NodeState::Suspect);
+
+        let ack = GossipMessage::new(
+            NodeId::new("n2"),
+            1,
+            GossipPayload::Ack {
+                updates: vec![],
+                relayed_for: None,
+            },
+        );
+        node.handle_message(addr(2), ack).await;
+        node.publish_membership();
+        assert_eq!(n2(&rx).state, NodeState::Alive);
+
+        node.membership.set_labels(
+            &NodeId::new("n2"),
+            &BTreeMap::from([("zone".to_string(), "b".to_string())]),
+        );
+        node.publish_membership();
+        assert_eq!(n2(&rx).labels.get("zone").map(String::as_str), Some("b"));
+
+        roles_tx.send_replace(super::super::membership::CouncilRoles {
+            council: [NodeId::new("n2")].into(),
+            leader: Some(NodeId::new("n2")),
+        });
+        node.publish_membership();
+        assert!(n2(&rx).is_council && n2(&rx).is_leader);
     }
 
     /// The active watch drops a member the moment it goes down; the roster
@@ -2560,7 +3007,7 @@ mod tests {
                     let _ = node.transport.send(target_addr, &ping).await;
                 }
                 if push_pull_due {
-                    node.push_pull().await;
+                    node.push_pull(false).await;
                 }
             }
 
@@ -2601,6 +3048,7 @@ mod tests {
                 entries,
                 floors: vec![],
                 wants_reply,
+                known_members: 1,
             },
         )
     }
@@ -2763,6 +3211,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_datagrams_fit_the_udp_budget_with_long_names() {
+        // Sync datagrams were cut by count alone, so long node names made
+        // every one too large to send and anti-entropy stopped (#2394).
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let peer = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        for i in 0..16u16 {
+            node.membership.add_node(
+                NodeId::new(format!("{}{}", "m".repeat(197), 100 + i)),
+                addr(10 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+
+        let window = node.membership_window();
+
+        node.send_membership(addr(2), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
+
+        let mut seen = std::collections::HashSet::new();
+        while let Some((_, message)) = peer.try_recv() {
+            assert!(
+                message.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES,
+                "a {}-byte sync datagram",
+                message.encoded_len()
+            );
+            if let GossipPayload::Sync { entries, .. } = message.payload {
+                seen.extend(entries.into_iter().map(|entry| entry.node_id));
+            }
+        }
+        // Sixteen long names plus the observer itself.
+        assert_eq!(seen.len(), 17);
+    }
+
+    #[tokio::test]
     async fn joining_node_learns_the_whole_cluster_on_its_first_cycle() {
         let net = InMemoryNetwork::new();
         let joiner_transport = net.register(addr(1)).await;
@@ -2820,6 +3306,137 @@ mod tests {
         assert_eq!(requests, 0, "push-pull ran again before its interval");
     }
 
+    /// #2442: a joiner learnt at most one 64-entry window per exchange, one
+    /// exchange per 10 s, so its join time grew with the cluster.
+    #[tokio::test]
+    async fn a_joiner_learns_a_cluster_larger_than_one_sync_window_promptly() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        for i in 0..500u16 {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:04}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        assert!(seed.dissemination.is_empty());
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 1);
+        serve(&mut joiner, Duration::from_millis(50)).await;
+        assert!(
+            joiner.membership.len() >= 500,
+            "the joiner knows {} members after one exchange",
+            joiner.membership.len()
+        );
+    }
+
+    /// A table bigger than one join page is swept page by page, one per
+    /// cycle, with the same peer, and the joiner then falls back to the
+    /// anti-entropy interval.
+    #[tokio::test]
+    async fn a_joiner_pages_through_a_table_larger_than_a_join_page() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        let size = MAX_JOIN_SYNC_ENTRIES * 2 + 100;
+        for i in 0..size {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:05}")),
+                addr(1000 + i as u16),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+        let mut exchanges = 0;
+        for _ in 0..5 {
+            let ((), requests) = tokio::join!(
+                joiner.run_one_cycle(),
+                serve(&mut seed, Duration::from_millis(100))
+            );
+            exchanges += requests;
+            serve(&mut joiner, Duration::from_millis(50)).await;
+        }
+        assert!(
+            joiner.membership.len() >= size,
+            "the joiner knows {} of {size} members after {exchanges} exchanges",
+            joiner.membership.len()
+        );
+        assert!(
+            exchanges <= 4,
+            "{exchanges} exchanges: it kept syncing after it caught up"
+        );
+    }
+
+    /// A peer that already knows most of the table gets the ordinary
+    /// window, and a joiner asking again inside half a protocol period gets
+    /// the window too, so one request can't keep drawing whole pages.
+    #[tokio::test]
+    async fn a_join_page_goes_only_to_a_joiner_and_is_paced() {
+        let net = InMemoryNetwork::new();
+        let requester = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut config = fast_config();
+        config.protocol_interval = Duration::from_secs(60);
+        let mut seed = MustardNode::new(NodeId::new("seed"), addr(2), config, seed_transport);
+        for i in 0..500u16 {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:04}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let request = |known_members| {
+            GossipMessage::new(
+                NodeId::new("asker"),
+                1,
+                GossipPayload::Sync {
+                    entries: vec![],
+                    floors: vec![],
+                    wants_reply: true,
+                    known_members,
+                },
+            )
+        };
+        let entries_for = async |seed: &mut MustardNode<InMemoryTransport>, known| {
+            seed.handle_message(addr(1), request(known)).await;
+            let mut entries = 0;
+            while let Some((_, reply)) = requester.try_recv() {
+                entries += reply.payload.updates().len();
+            }
+            entries
+        };
+        assert_eq!(entries_for(&mut seed, 480).await, MAX_SYNC_ENTRIES);
+        assert!(entries_for(&mut seed, 1).await > MAX_SYNC_ENTRIES);
+        assert_eq!(entries_for(&mut seed, 1).await, MAX_SYNC_ENTRIES);
+    }
+
     // -- directory extension propagation (12b.2) ------------------------------
 
     #[tokio::test(start_paused = true)]
@@ -2843,6 +3460,52 @@ mod tests {
             .expect("n1 should learn n2's endpoints from the ACK");
         assert_eq!(endpoints.api_address, addr(9117));
         assert_eq!(endpoints.reporting_address, addr(9445));
+    }
+
+    /// #2406: a relay passes a hint on with the age it holds, and a hint
+    /// older than the expiry isn't adopted, so a forged one nobody
+    /// re-advertises ages out everywhere.
+    #[tokio::test]
+    async fn a_relayed_hint_carries_its_age_and_an_expired_one_is_refused() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let hint = |name: &str, term| LeaderHint {
+            node_id: NodeId::new(name),
+            term,
+            recovery_epoch: 0,
+            api_address: addr(9200),
+            reporting_address: addr(9201),
+        };
+        let from = |sender: &str, leader: LeaderHint, age_ms| {
+            let mut message = ping_from(sender);
+            message.extension = Some(DirectoryExtension {
+                node_id: NodeId::new(sender),
+                api_address: addr(9300),
+                reporting_address: addr(9301),
+                leader: Some(leader),
+                leader_age_ms: age_ms,
+                labels: BTreeMap::new(),
+                disk_pressured: false,
+                recovery_epoch: None,
+                recovery_id: None,
+                jobs: None,
+                hmac: [0u8; 32],
+            });
+            message
+        };
+        let expiry =
+            u32::try_from(super::super::directory::LEADER_HINT_EXPIRY.as_millis()).unwrap();
+        node.handle_message(addr(2), from("p1", hint("stale", 99), expiry))
+            .await;
+        assert_eq!(node.directory().leader, None);
+
+        node.handle_message(addr(3), from("p2", hint("leader", 4), 59_000))
+            .await;
+        let relayed = node.local_extension().unwrap();
+        assert_eq!(relayed.leader.unwrap().node_id, NodeId::new("leader"));
+        assert!(relayed.leader_age_ms >= 59_000, "{}", relayed.leader_age_ms);
     }
 
     #[tokio::test]
@@ -2918,6 +3581,7 @@ mod tests {
             api_address: addr(1),
             reporting_address: addr(2),
             leader: Some(hint.clone()),
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
@@ -2986,6 +3650,7 @@ mod tests {
                     api_address: addr(9217),
                     reporting_address: addr(9545),
                 }),
+                leader_age_ms: 0,
                 labels: BTreeMap::new(),
                 disk_pressured: false,
                 recovery_epoch: None,
@@ -3032,6 +3697,7 @@ mod tests {
             api_address: addr(9127),
             reporting_address: addr(9455),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
@@ -3372,6 +4038,218 @@ mod tests {
         );
     }
 
+    /// #2395: a claim at `u64::MAX` used to make `refute` overflow: a panic
+    /// in a test build, and in a release build a wrap to incarnation 0 that
+    /// lost to the claim everywhere. Now the claim is dropped at the door.
+    #[tokio::test]
+    async fn a_claim_at_the_highest_incarnation_does_not_wrap_ours() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let claim = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Dead,
+                    incarnation: u64::MAX,
+                }],
+            },
+        );
+        node.handle_message(addr(9), claim).await;
+
+        assert!(node.incarnation >= 1);
+        assert_eq!(
+            node.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive
+        );
+        assert_eq!(node.implausible.total, 1, "the refusal went uncounted");
+    }
+
+    /// A claim at the ceiling itself is plausible, and refuting it can't go
+    /// past the ceiling: the node stays at the highest incarnation a peer
+    /// accepts instead of wrapping or stepping out of range.
+    #[tokio::test]
+    async fn a_claim_at_the_ceiling_saturates_instead_of_wrapping() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let claim = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Suspect,
+                    incarnation: MAX_INCARNATION,
+                }],
+            },
+        );
+        node.handle_message(addr(9), claim).await;
+        assert_eq!(node.incarnation, MAX_INCARNATION);
+    }
+
+    /// Every other way an incarnation arrives from the wire is bounded too:
+    /// a datagram's own incarnation, a `Stale` answer and a floor.
+    #[tokio::test]
+    async fn a_datagram_a_stale_answer_and_a_floor_above_the_ceiling_are_dropped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        let mut ping = ping_from("loud");
+        ping.incarnation = MAX_INCARNATION + 1;
+        assert!(!node.handle_message(addr(9), ping).await);
+        assert!(node.membership.get(&NodeId::new("loud")).is_none());
+
+        let stale = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Stale {
+                held_incarnation: u64::MAX,
+                held_sequence: u64::MAX,
+                updates: vec![],
+            },
+        );
+        node.handle_message(addr(2), stale).await;
+        assert_eq!(node.incarnation, 1, "an implausible Stale moved us");
+
+        let sync = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Sync {
+                entries: vec![],
+                floors: vec![SequenceFloor {
+                    node_id: NodeId::new("victim"),
+                    incarnation: u64::MAX,
+                    sequence: u64::MAX,
+                    expires_in_secs: 60,
+                }],
+                wants_reply: false,
+                known_members: 0,
+            },
+        );
+        node.handle_message(addr(2), sync).await;
+        assert!(
+            !node.sequence_floors.contains_key(&NodeId::new("victim")),
+            "an implausible floor was kept"
+        );
+        assert_eq!(node.implausible.total, 3);
+    }
+
+    /// #2441: a relay that hears a refutation passes it on ahead of a
+    /// correlated failure's Dead rumours, as the refuting node does.
+    #[tokio::test]
+    async fn an_alive_that_overturns_a_failure_is_relayed_before_unrelated_failures() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut relay = MustardNode::new(NodeId::new("relay"), addr(1), fast_config(), t);
+        for (name, port) in [("h", 3), ("peer", 2)] {
+            relay.membership.add_node(
+                NodeId::new(name),
+                addr(port),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        relay.membership.suspect(&NodeId::new("h"));
+        for i in 0..16 {
+            relay.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: NodeId::new(format!("n{i}")),
+                    address: addr(100 + i),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                100,
+            );
+        }
+        let refutation = MembershipUpdate {
+            node_id: NodeId::new("h"),
+            address: addr(3),
+            state: NodeState::Alive,
+            incarnation: 2,
+        };
+        let ping = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![refutation.clone()],
+            },
+        );
+        relay.handle_message(addr(2), ping).await;
+        let selected = relay.dissemination.select_updates();
+        assert_eq!(selected.first(), Some(&refutation));
+    }
+
+    /// #2441: the peers a refuting node reaches directly applied its
+    /// refutation in `add_node` and passed nothing on, so it spread only as
+    /// fast as the node itself could ping. They now pass it on first.
+    #[tokio::test]
+    async fn a_refutation_heard_from_the_node_itself_is_passed_on_first() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut relay = MustardNode::new(NodeId::new("relay"), addr(1), fast_config(), t);
+        relay.membership.add_node(
+            NodeId::new("h"),
+            addr(3),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        relay.membership.suspect(&NodeId::new("h"));
+        for i in 0..16 {
+            relay.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: NodeId::new(format!("n{i}")),
+                    address: addr(100 + i),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                100,
+            );
+        }
+        let ping = GossipMessage::new(NodeId::new("h"), 2, GossipPayload::Ping { updates: vec![] });
+        relay.handle_message(addr(3), ping).await;
+        let selected = relay.dissemination.select_updates();
+        let first = selected.first().expect("something to send");
+        assert_eq!(
+            (&first.node_id, first.state, first.incarnation),
+            (&NodeId::new("h"), NodeState::Alive, 2)
+        );
+    }
+
+    /// #2441: a prober that holds its target Suspect says so in the probe,
+    /// so the target hears the claim from its suspecter and refutes, as the
+    /// ACK path already did.
+    #[tokio::test]
+    async fn a_direct_probe_carries_the_claim_about_its_target() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            3,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.suspect(&NodeId::new("n2"));
+        node.next_push_pull = Instant::now() + Duration::from_secs(3600);
+        node.run_one_cycle().await;
+        let (_, probe) = t2.try_recv().expect("n2 was probed");
+        assert!(matches!(probe.payload, GossipPayload::Ping { .. }));
+        let claim = &probe.payload.updates()[0];
+        assert_eq!(claim.node_id, NodeId::new("n2"));
+        assert_eq!(claim.state, NodeState::Suspect);
+        assert_eq!(claim.incarnation, 3);
+    }
+
     /// O9: refuting told the cluster we're alive but left our own record
     /// holding the claim we'd just refuted, so the node disagreed with
     /// everyone else about itself — including the scheduler and council reads
@@ -3626,6 +4504,7 @@ mod tests {
                 api_address: addr(9117),
                 reporting_address: addr(9445),
                 leader: None,
+                leader_age_ms: 0,
                 labels: BTreeMap::new(),
                 disk_pressured: false,
                 recovery_epoch: Some(epoch),
@@ -3659,6 +4538,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: true,
             recovery_epoch: Some(9),
@@ -3754,6 +4634,116 @@ mod tests {
         assert!(!node.handle_message(addr(7), ping_from("peer")).await);
     }
 
+    /// #2474: a peer that missed a member's death still says it's `Alive`.
+    /// Without a tombstone, one such rumour re-added the reaped member on
+    /// every node.
+    #[tokio::test]
+    async fn a_stale_alive_about_a_reaped_member_does_not_bring_it_back() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("x"),
+            addr(3),
+            4,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("x"));
+        node.reap_departed(after_the_reap());
+        assert!(node.membership.get(&NodeId::new("x")).is_none());
+
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 4)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), None);
+        assert!(
+            node.dissemination.is_empty() || {
+                let queued = node.dissemination.select_updates();
+                queued
+                    .iter()
+                    .all(|update| update.node_id != NodeId::new("x"))
+            },
+            "the stale Alive was passed on"
+        );
+
+        // A real return, at a higher incarnation, is still heard.
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 5)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), Some((NodeState::Alive, 5)));
+    }
+
+    /// The tombstone lives in the floor table, so it shares its bound
+    /// (`MAX_SEQUENCE_FLOORS`) and its expiry, and isn't sent in anti-entropy
+    /// as a floor with nothing in it.
+    #[tokio::test]
+    async fn a_tombstone_expires_with_its_floor() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("x"),
+            addr(3),
+            4,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("x"));
+        node.reap_departed(after_the_reap());
+        assert!(node.floor_window(Instant::now()).is_empty());
+
+        node.reap_departed(after_the_reap() + SEQUENCE_FLOOR_RETENTION);
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 4)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), Some((NodeState::Alive, 4)));
+    }
+
+    /// A member reaped at a higher incarnation than its last datagram to us
+    /// (it refuted by rumour, then died) restarts at 1. The `Stale` answer
+    /// names the tombstone, so it refutes past it and its rumoured `Alive`
+    /// isn't then dropped as a stale one.
+    #[tokio::test]
+    async fn a_restarted_member_refutes_past_its_tombstone() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let peer_transport = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t);
+        let old = GossipMessage::new(
+            NodeId::new("peer"),
+            3,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(node.handle_message(addr(2), old).await);
+        node.membership
+            .apply_update(&entry("peer", 2, NodeState::Alive, 6), Instant::now());
+        node.membership.declare_dead(&NodeId::new("peer"));
+        node.reap_departed(after_the_reap());
+
+        let mut restarted =
+            MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), peer_transport);
+        let first = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        // Its datagram is from incarnation 1, below the floor: answered Stale.
+        assert!(!node.handle_message(addr(2), first).await);
+        deliver(&mut restarted).await;
+        assert!(
+            restarted.incarnation > 6,
+            "refuted only to {}, not past the tombstone",
+            restarted.incarnation
+        );
+    }
+
     #[tokio::test]
     async fn a_node_that_never_heard_the_departed_member_learns_its_floor_in_push_pull() {
         let net = InMemoryNetwork::new();
@@ -3765,7 +4755,10 @@ mod tests {
         hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
 
         // The joiner's first anti-entropy exchange with a member.
-        old_hand.send_membership(addr(3), false).await;
+        let window = old_hand.membership_window();
+        old_hand
+            .send_membership(addr(3), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         let mut floors_seen = 0;
         while let Some((from, message)) = joiner.transport.try_recv() {
             if let GossipPayload::Sync {
@@ -3804,7 +4797,9 @@ mod tests {
         b.membership.declare_dead(&NodeId::new("peer"));
 
         // An exchange while the member is down but not yet reaped.
-        b.send_membership(addr(1), false).await;
+        let window = b.membership_window();
+        b.send_membership(addr(1), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         while let Some((from, message)) = a.transport.try_recv() {
             a.handle_message(from, message).await;
         }
@@ -3974,7 +4969,10 @@ mod tests {
         let mut joiner = MustardNode::new(NodeId::new("j"), addr(3), fast_config(), tj);
         let recorded = ping_from("peer");
         hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
-        old_hand.send_membership(addr(3), false).await;
+        let window = old_hand.membership_window();
+        old_hand
+            .send_membership(addr(3), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         deliver(&mut joiner).await;
 
         let mut restarted = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), tb);
@@ -4055,6 +5053,7 @@ mod tests {
         node.retain_floor(
             NodeId::new("gone"),
             freshness,
+            None,
             now + Duration::from_secs(100),
         );
 
@@ -4079,11 +5078,15 @@ mod tests {
         assert!(node.handle_message(addr(2), ping_from("live")).await);
         let floor = |name: &str| SequenceFloor {
             node_id: NodeId::new(name),
-            incarnation: u64::MAX,
+            incarnation: MAX_INCARNATION,
             sequence: u64::MAX,
             expires_in_secs: u32::MAX,
         };
-        node.merge_floors(&[floor("n1"), floor("live"), floor("gone")], Instant::now());
+        node.merge_floors(
+            &NodeId::new("peer"),
+            &[floor("n1"), floor("live"), floor("gone")],
+            Instant::now(),
+        );
 
         assert_eq!(
             node.sequence_floors.keys().cloned().collect::<Vec<_>>(),
@@ -4110,6 +5113,7 @@ mod tests {
                     incarnation: 1,
                     sequence: i,
                 },
+                None,
                 now + Duration::from_secs(i + 1),
             );
         }
@@ -4130,6 +5134,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::from([("zone".to_string(), "recorded".to_string())]),
             disk_pressured: true,
             recovery_epoch: Some(1),

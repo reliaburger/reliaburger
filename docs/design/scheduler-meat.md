@@ -1,5 +1,9 @@
 # Meat: The Reliaburger Scheduler
 
+**Status:** Partly shipped.
+**Reconciled against:** not reconciled (§4 and the scoring in §3 checked against 0.3.4, #2515, #2518)
+**Sketches:** the §4 listings marked as sketches, the dedicated CPU budget in §1, the `[scheduler]` section in §6
+
 ## 1. Overview
 
 Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, granting job tasks to workers in chunks, releasing rollouts node by node, enforcing namespace resource quotas, and driving autoscaling reactions.
@@ -107,12 +111,12 @@ Meat uses a four-phase placement pipeline for App scheduling:
 
 The filter checks every node against one `WorkloadRequirements` value built from the spec, and so do daemon placement and the leader's check that a committed placement still holds (`meat::filter::node_can_run`), so the three can't disagree.
 
-**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better) decides:
+**Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better; 15 of those points can't be reached until #1214, so 75 is the real top) decides:
 
 - **Bin-packing score (weight 50):** Prefer nodes fuller in both CPU and memory after placing this workload, evenly. This maximises density (see Bin-Packing Algorithm below).
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
-- **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
-- **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
+- **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise). The scoring is wired but inert: no node reports its cached images yet, so the leader passes an empty set for every node and every node scores 0 here (#1214).
+- **Node stability score (weight 5):** Prefer nodes the leader has known longer, full marks at 24h. Nodes don't report their uptime: the leader uses the time since its own gossip table first saw the node (`first_seen`), so the age restarts at zero for every node when the leader restarts or a new leader takes over, and council members can disagree. It only breaks ties worth 5 points.
 
 Spread was once a weight (60, scored on whether a node ran the App at all). That beat bin-packing only against a node with no replica: once every candidate ran one, the busier node took every replacement (#346). The replica count is now the first sort key, so no weight can outvote it.
 
@@ -178,6 +182,9 @@ All types are Rust structs using `serde` for serialisation (Raft log entries and
 
 ### Core Scheduling Types
 
+Original sketch, in part: `JobId` is not in the tree. `NodeId`, `AppId` and `Resources` are in `src/meat/types.rs`.
+
+<!-- sketch -->
 ```rust
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -224,6 +231,9 @@ pub struct ResourceRange {
 
 ### Placement and Constraints
 
+Original sketch; these types are not in the tree. Placement is `PlacementSpec` in `src/config/app.rs`, with `required` and `preferred` as lists of `key=value` labels, and the replica mode is the `Replicas` enum in `src/config/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// Placement constraints for an App or Job.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -250,6 +260,9 @@ pub enum ReplicaMode {
 
 ### App and Job Specs
 
+Original sketch, in part: `WorkloadSource` and `InitContainer` are not in the tree. The shipped `AppSpec`, `JobSpec` and `InitContainerSpec` are in `src/config/app.rs` and `src/config/job.rs`; a workload names its source with the `image`, `exec` or `script` field.
+
+<!-- sketch -->
 ```rust
 /// Workload source: either a container image or a host process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -442,8 +455,12 @@ pub struct NodeCapacity {
     /// Timestamp of the last state report received.
     pub last_report: Instant,
     /// Set of image references available in the local Pickle cache.
+    /// Planned (#1214): nothing reports it, so the leader's
+    /// `SchedulerNodeState.cached_images` is always empty.
     pub cached_images: HashSet<String>,
-    /// Node uptime since last Bun restart.
+    /// Planned: a reported uptime. The leader's
+    /// `SchedulerNodeState.uptime_secs` is how long its own gossip table has
+    /// known the node instead.
     pub uptime: Duration,
     /// Whether process workloads are enabled (allowlist configured).
     pub process_workloads_enabled: bool,
@@ -569,6 +586,9 @@ pub struct AppRollouts {
 
 ### Autoscaler State
 
+Original sketch; `MetricSample` is not in the tree, and the shipped `AutoscaleState` in `src/meat/autoscaler.rs` keeps only the baseline and current replica counts and the last scale event.
+
+<!-- sketch -->
 ```rust
 /// Runtime state for the autoscaler for a single App.
 #[derive(Clone, Debug)]
@@ -605,7 +625,7 @@ When an App spec with `replicas = 3` is submitted:
 1. The API validates the spec (schema, permissions) before committing it; Meat checks the namespace quota in its scheduling pass (§5.6).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
-   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5).
+   - **Score:** Rank candidates by fewest replicas of the App, then by the weighted score (bin-packing 50, preferred labels 20, image locality 15, stability 5; image locality scores 0 everywhere until #1214).
    - **Select:** Pick the highest-scoring node.
    - **Commit:** Reserve resources on the selected node in the cluster state cache, then commit the `SchedulingDecision` to the Raft log.
 3. After all replicas are committed, the decisions are disseminated to target Bun agents.
@@ -738,6 +758,14 @@ replicas from 0.
 
 Node reports lag the council. A placement committed a tick ago isn't in its node's report yet, so the pass that starts from the reports would see free room and place a second app into it. Before admitting anything, each pass rebuilds the missing reservations: for every committed placement beyond the replicas its node reports, it reserves the committed footprint in the pass's cache (#432).
 
+A reported instance is recorded as already accounted at the CPU and memory its report gives (`record_reported_instance`), so reserving its committed placement adds only the difference. The per-instance report carries no GPU count, though, while the node's `allocated.gpus` comes from `gpu_used`, which already sums every running instance's GPU request. So `reserve_committed_instance` treats a reported instance's GPU request as accounted; without that, a node running a one-GPU app counted two (#2476). An instance its node hasn't reported yet isn't in `gpu_used` and is reserved in full. The limitation: a reported instance whose committed GPU request differs from what it runs with is counted at whichever is larger. A per-instance GPU field in the report would fix that, and comes with GPU requests themselves (#1204), since `gpu > 0` is refused at validation today.
+
+#### Pass Limits
+
+A pass commits as one `SchedulingDecisions` entry, and the council refuses an entry of more than `MAX_PASS_DECISIONS` (4,096) decisions or `MAX_PASS_PLACEMENTS` (131,072) placements in total. Both constants live in `src/meat/types.rs`, and the state machine and `plan_pass` read the same ones (#2366). Before it plans an app that needs a decision, the pass checks that the decision fits: a decision holds at most the app's wanted count of placements, so the check needs no planning. An app that doesn't fit is deferred: it gets no decision, keeps whatever quota or shortfall reason the council already records for it, and counts in `PassPlan::deferred`. The leader logs one line for a pass that deferred anything, with the count. Apps are planned in name order and the committed ones converge, so the next pass, two seconds later, starts where this one stopped; 5,000 apps that all need a decision place in two passes instead of being refused whole every tick. A pass of a single decision may hold any number of placements, so an app with more than 131,072 replicas, or a daemon set on more nodes than that, places on its own pass rather than never.
+
+The entry carries the Raft log position the pass was planned from (`expected_log_id`), and the council refuses it with `admission revision changed` (`PASS_REVISION_CHANGED`) if any entry was applied after that position: the plan may rest on state that has since changed. A leader tick writes before it plans, though: the endpoint catalogue when its backends change, and a `RolloutReleased` for each finished rollout. So the tick reads the desired state again after any of those writes and plans from that read, or its own writes would refuse its pass, as they did on most ticks of a rollout until 0.3.4 (#2369). Another writer can still land in between (task-array ticks, leases, certificate serials), so a pass refused for a changed revision is planned again from a fresh read, up to `MAX_PASS_PLANS` (3) times in the tick; each try plans from scratch and never resends the old plan. After that the next tick tries again.
+
 #### Daemon Mode (`replicas = "*"`)
 
 When `replicas = "*"` is specified, Meat does not run the placement pipeline. Instead:
@@ -750,7 +778,7 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
 
 Daemon mode is not bin-packed: every qualifying node that has room gets exactly one instance. "Qualifying" is the same `filter_nodes` check fixed replicas pass (`daemon_candidates` in `src/meat/scheduler.rs`), so a node without room for the request, or one that can't run the workload, gets none. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
 
-A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, in a throwaway view of the cache, and the pass trades it for the new request; the real cache keeps the allocation, so no other app can spend the room (#433). A copy the node runs without a committed placement earns no credit.
+A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, and the pass trades it for the new request; the cache keeps the allocation, so no other app can spend the room (#433). The credit is taken off a stack copy of the node's two `Resources` values inside the filter check (`passes_filter` in `src/meat/filter.rs`), not off a copy of the cache: cloning the whole cache once per daemon set per tick cost a deep copy of every node record for nothing (#2458). A copy the node runs without a committed placement earns no credit.
 
 ### 5.2 Jobs: the Common Lifecycle
 
@@ -1009,7 +1037,7 @@ In the code a daemon set's target is the eligible nodes plus the copies it holds
 
 ### 5.6 Namespace Quota Enforcement
 
-Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass, and the pass returns the `QuotaError` beside its placements (`PassPlan::quota_blocked`). The leader keeps those reasons in council state, `DesiredState::quota_blocked`, so any node can say why an app isn't running (see §7.3). The check runs again every pass, so the app places once the namespace has room, and its reason clears in the same pass. `over_quota_app_is_not_placed_and_the_pass_says_why` pins this contract. The check, in outline:
+Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every app's committed placements, converged or not, at the footprint each was committed with (`QuotaLedger::charge_committed_placements`), then runs this check before placing each unconverged app, for what the app adds only: the resources it wants over what its committed placements hold, and the replicas over how many it has (`QuotaLedger::try_admit_growth`). An app with no committed entry also takes an app slot. A scale-down or a replacement for a lost replica adds nothing, and a request that adds nothing of a resource never exceeds that resource's limit, so a running app is never refused, even in a namespace pushed over its quota. Before 0.3.4 only converged apps were charged, so a refused scale-up's running replicas, or an app that had lost a node, vanished from the ledger and the next app took their room (#2462). An app that fails it gets no placement that pass, and the pass returns the `QuotaError` beside its placements (`PassPlan::quota_blocked`). The leader keeps those reasons in council state, `DesiredState::quota_blocked`, so any node can say why an app isn't running (see §7.3). The check runs again every pass, so the app places once the namespace has room, and its reason clears in the same pass. `over_quota_app_is_not_placed_and_the_pass_says_why` pins this contract. The check, in outline:
 
 ```rust
 fn check_namespace_quota(
@@ -1274,7 +1302,7 @@ configured was retired (§5.2).
 
 - **Namespace quotas** cap the total CPU, memory, GPU, app count, and replica count per namespace. A single tenant cannot exceed their quota.
 - **Admission validation:** Meat validates all resource requests at submission time. Requests exceeding remaining quota are rejected immediately.
-- **Job admission caps:** the council bounds active runs (128 in the cluster, 32 of them kept for cron fires and deployment hooks, 64 per namespace), job definitions and retained receipts, and a run's `per_node_concurrency` caps how many of its tasks one node runs at once. Each attempt also reserves its CPU and memory in the node's execution budget.
+- **Job admission caps:** the council bounds active runs (128 in the cluster, 32 of them kept for cron fires and deployment hooks, 64 per namespace), job definitions, retained receipts, held arrays (2,048) and held batches (120), and a run's `per_node_concurrency` caps how many of its tasks one node runs at once. Each attempt also reserves its CPU and memory in the node's execution budget. Every bound the job-state decoder checks is one `apply` enforces, so a snapshot the leader writes always reopens (#2365).
 - **Rate limiting (planned):** per-identity rate limits on deploy and job submission don't exist yet; the admission caps above are what bound a flood today.
 
 ### 8.3 Process Workload Escalation
@@ -1353,6 +1381,7 @@ This fits comfortably within a typical server's memory. The 312 MB total Bun age
 Meat's scheduling loop is designed to consume < 15% of a single core at sustained throughput. At the 1,150 jobs/sec target:
 
 - App placement is measured by `benches/scheduler.rs` (`make bench`). One leader pass placing 150 replicas (50 apps of 3) took about 29 ms on 1,000 nodes, about 190 µs per placement, and about 330 ms on 10,000 nodes, about 2.2 ms per placement, on the development laptop (an Apple silicon MacBook, October 2026). Filter and Score each walk every node for every replica, so the cost grows with the cluster. A converged pass, the one the leader runs every tick once everything is placed, took about 0.2 ms on 1,000 nodes and 1.7 ms on 10,000. The Raft commit comes on top, once per pass rather than per decision.
+- Two things every converged pass re-checks have their own cases (#2458, Mac Studio M5 Max, November 2026). With 10 converged daemon sets beside the 50 apps, a pass took 12.7 ms on 1,000 nodes and 200 ms on 10,000 while each daemon set's eligibility check cloned the whole cache; checking eligibility without the copy brought that to 4.9 ms and 78 ms. 1,000 converged apps with 200 autoscale overrides took 8.2 ms while each app scanned the override list, allocating a string per entry, and 1.6 ms with one map built per pass.
 - An earlier version of this section estimated ~270 µs per decision with nothing to measure it against. The measurement above is close at 1,000 nodes and an order of magnitude off at 10,000; App placement rates are far below the job rates below, so it fits the budget, but per-node work in Filter and Score is the place to look if large clusters need faster placement.
 - With core pinning at > 1,000 nodes, this would be isolated from other Bun tasks (core pinning is planned, not yet implemented — see Section 1).
 

@@ -38,8 +38,9 @@ impl JobStore {
                 if metadata.len() > MAX_STORE_BYTES {
                     return Err(std::io::Error::other("job store exceeds 64 MiB"));
                 }
-                let checkpoint: Checkpoint = serde_json::from_slice(&std::fs::read(&path)?)
-                    .map_err(std::io::Error::other)?;
+                let bytes = std::fs::read(&path)?;
+                let checkpoint: Checkpoint =
+                    serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
                 if checkpoint.version != crate::compatibility::CURRENT
                     || checkpoint.next_id == 0
                     || checkpoint
@@ -52,6 +53,7 @@ impl JobStore {
                         "incompatible job storage or invalid identity counter",
                     ));
                 }
+                reserve_progress(&checkpoint.arrays, bytes.len())?;
                 checkpoint
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -70,7 +72,6 @@ impl JobStore {
             }
             Err(error) => return Err(error),
         };
-        reserve_progress(&checkpoint)?;
         Ok(Self {
             path,
             checkpoint,
@@ -123,8 +124,9 @@ impl JobStore {
                 id
             })
             .map_err(|e| e.to_string())?;
-        reserve_progress(&next).map_err(|error| error.to_string())?;
+        // Serialise once: the same bytes are sized, reserved for and written.
         let bytes = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
+        reserve_progress(&next.arrays, bytes.len()).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_STORE_BYTES {
             return Err("job store exceeds 64 MiB".into());
         }
@@ -151,9 +153,10 @@ impl JobStore {
 // A bounded initial snapshot can grow as unordered grants and results arrive.
 // Reserve the worst sparse representation before admission, leaving publication
 // failure fencing for actual I/O failures rather than predictable capacity loss.
-fn reserve_progress(checkpoint: &Checkpoint) -> std::io::Result<()> {
-    let mut bytes = serde_json::to_vec(checkpoint)?.len() as u64 + 2 * 1024 * 1024;
-    for (_, record) in checkpoint.arrays.active() {
+// `serialised` is the checkpoint's length as JSON, which the caller already has.
+fn reserve_progress(arrays: &TaskArrays, serialised: usize) -> std::io::Result<()> {
+    let mut bytes = serialised as u64 + 2 * 1024 * 1024;
+    for (_, record) in arrays.active() {
         let actual = serde_json::to_vec(record)?.len() as u64;
         let reserved = 256 * 1024 + 512 * u64::from(record.state.spec.chunk_count());
         bytes = bytes.saturating_add(reserved.saturating_sub(actual));

@@ -42,6 +42,10 @@ pub struct GcConfig {
     /// Minimum on-disk age before an untracked (orphan) blob becomes
     /// a candidate. Protects blobs belonging to in-flight pushes.
     pub orphan_grace: Duration,
+    /// Untracked blobs that must stay however old they are: the binaries of
+    /// an active rolling upgrade (#2419). The Raft arbiter keeps them too;
+    /// skipping them here saves the round trip.
+    pub pinned_digests: HashSet<String>,
 }
 
 /// Deletion candidates nominated by [`gc_candidates`].
@@ -61,6 +65,8 @@ pub struct GcCandidates {
     /// Untracked blobs skipped because they're within the orphan grace
     /// window (likely mid-push).
     pub orphan_grace_protected: usize,
+    /// Blobs skipped because they're in [`GcConfig::pinned_digests`].
+    pub pinned_protected: usize,
 }
 
 impl GcCandidates {
@@ -96,6 +102,7 @@ pub fn gc_candidates(
     let mut active_count = 0;
     let mut retention_count = 0;
     let mut orphan_grace_count = 0;
+    let mut pinned_count = 0;
 
     // Running instances record `repo:tag@sha256:…` (#697): compare the
     // pinned digest, and the `repo:tag` before it, separately.
@@ -150,14 +157,22 @@ pub fn gc_candidates(
         }
     }
 
+    let holder_index = catalog.holder_index();
     let mut candidates: Vec<Digest> = Vec::new();
     for blob_digest in &local_blobs {
         if protected_digests.contains(blob_digest.as_str()) {
             continue;
         }
+        if config.pinned_digests.contains(blob_digest.as_str()) {
+            pinned_count += 1;
+            continue;
+        }
 
-        let holders = catalog.layer_holders(blob_digest.as_str());
-        if holders.is_empty() {
+        let holders = holder_index
+            .get(blob_digest.as_str())
+            .copied()
+            .filter(|holders| !holders.is_empty());
+        let Some(holders) = holders else {
             // Untracked blob: an orphan, unless it's a push still in
             // flight — its manifest hasn't committed yet, so give it a
             // grace window before nominating.
@@ -165,7 +180,10 @@ pub fn gc_candidates(
                 orphan_grace_count += 1;
                 continue;
             }
-        } else if holders.len() == 1 && holders.contains(&config.node_id) {
+            candidates.push(blob_digest.clone());
+            continue;
+        };
+        if holders.len() == 1 && holders.contains(&config.node_id) {
             // This node owns the sole advertised copy: never nominate. The arbiter re-checks this
             // authoritatively; skipping here just avoids pointless
             // round-trips.
@@ -182,6 +200,7 @@ pub fn gc_candidates(
         active_protected: active_count,
         retention_protected: retention_count,
         orphan_grace_protected: orphan_grace_count,
+        pinned_protected: pinned_count,
     })
 }
 
@@ -284,7 +303,31 @@ mod tests {
             retain_days: 0, // No retention for tests
             node_id: 1,
             orphan_grace: Duration::ZERO, // fresh test blobs are eligible
+            pinned_digests: HashSet::new(),
         }
+    }
+
+    /// #2419: the binary of a rolling upgrade is a bare blob no manifest
+    /// tracks, fetched by each node only when its turn comes. While the
+    /// upgrade runs it is pinned, however old the file is; once the upgrade
+    /// has gone it is an ordinary orphan and is collected.
+    #[test]
+    fn gc_keeps_the_binary_of_an_upgrade_that_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let catalog = ManifestCatalog::default();
+        let binary = test_digest("bun-binary");
+        write_fake_blob(&store, &binary);
+
+        let mut running = default_config();
+        running.pinned_digests = HashSet::from([binary.0.clone()]);
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &running).unwrap();
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.pinned_protected, 1);
+
+        let finished = default_config();
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &finished).unwrap();
+        assert_eq!(result.candidates, vec![binary]);
     }
 
     #[test]

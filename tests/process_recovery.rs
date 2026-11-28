@@ -35,6 +35,7 @@ fn spec(script: &str) -> OciSpec {
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: vec!["OWNER_TEST=preserved".into()],
@@ -47,6 +48,9 @@ fn spec(script: &str) -> OciSpec {
         },
         mounts: vec![],
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: vec![],
             resources: None,
             cgroups_path: None,
@@ -1080,7 +1084,7 @@ async fn exec_returns_output_only_after_retiring_surviving_children() {
 }
 
 #[tokio::test]
-async fn exec_rejects_empty_commands_and_excessive_output() {
+async fn exec_rejects_empty_commands_and_cuts_excessive_output() {
     let directory = tempfile::tempdir().unwrap();
     let grill = runtime(directory.path());
     let id = InstanceId("default__exec-limits-0".into());
@@ -1119,8 +1123,172 @@ async fn exec_rejects_empty_commands_and_excessive_output() {
         long_request.unwrap().output,
         format!("{}\n", "x".repeat(2048))
     );
-    assert!(oversized.unwrap_err().to_string().contains("1 MiB"));
+    // Past 1 MiB the output is cut, not refused (#2392).
+    let oversized = oversized.unwrap();
+    assert_eq!(oversized.exit_code, 0);
+    assert!(oversized.output.ends_with(CUT_MARKER), "not cut");
     assert_eq!(following.unwrap().output, "still-running\n");
+}
+
+/// What an exec's output ends with once it's been cut at 1 MiB.
+const CUT_MARKER: &str = "[output cut at 1 MiB]\n";
+const MEBIBYTE: usize = 1024 * 1024;
+
+/// #2392: a command that prints 4 MiB gets its first mebibyte back, and a
+/// marker saying the rest was cut, instead of an error and nothing.
+#[tokio::test]
+async fn exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-cut-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let result = grill
+        .exec(
+            &id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 4194304 /dev/zero | tr '\\0' 'a'".into(),
+            ],
+        )
+        .await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    let result = result.unwrap();
+    assert_eq!(result.exit_code, 0);
+    let output = result.output;
+    assert!(output.len() > MEBIBYTE, "{} bytes", output.len());
+    assert!(
+        output.len() <= MEBIBYTE + 1 + CUT_MARKER.len(),
+        "{} bytes",
+        output.len()
+    );
+    assert!(output.ends_with(CUT_MARKER), "{:?}", &output[MEBIBYTE..]);
+    assert!(output[..MEBIBYTE].bytes().all(|byte| byte == b'a'));
+}
+
+/// The largest `output.stdout` of any exec helper under `owners`.
+fn largest_exec_output(owners: &Path) -> u64 {
+    let Ok(instances) = std::fs::read_dir(owners) else {
+        return 0;
+    };
+    let mut largest = 0;
+    for instance in instances.filter_map(Result::ok) {
+        let Ok(helpers) = std::fs::read_dir(instance.path()) else {
+            continue;
+        };
+        for helper in helpers.filter_map(Result::ok) {
+            if let Ok(metadata) = std::fs::metadata(helper.path().join("output.stdout")) {
+                largest = largest.max(metadata.len());
+            }
+        }
+    }
+    largest
+}
+
+/// #2392: the cap holds while the command runs, not only when its output
+/// is read back, so a chatty command can't fill the node's disk.
+#[tokio::test]
+async fn exec_output_file_never_grows_past_its_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = std::sync::Arc::new(runtime(directory.path()));
+    let id = InstanceId("default__exec-disk-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let task = {
+        let grill = grill.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let command = "yes & writer=$!; sleep 2; kill $writer".to_string();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                grill.exec(&id, &["/bin/sh".into(), "-c".into(), command]),
+            )
+            .await
+        })
+    };
+    let owners = directory.path().join("process-owners");
+    let mut largest = 0;
+    while !task.is_finished() {
+        largest = largest.max(largest_exec_output(&owners));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let result = task.await.unwrap();
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert!(
+        largest <= 2 * MEBIBYTE as u64,
+        "output.stdout reached {largest} bytes"
+    );
+    let output = result.expect("exec timed out").unwrap().output;
+    assert!(output.ends_with(CUT_MARKER), "not cut");
+}
+
+/// `voluntary_ctxt_switches` of `pid`: how many times it has gone to sleep.
+#[cfg(target_os = "linux")]
+fn voluntary_switches(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// #2447: an owner whose workload is idle sleeps until something happens,
+/// rather than waking a hundred times a second to look.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_idle_owner_does_not_wake_on_a_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__idle-owner-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let (record, _) = owner_file(directory.path(), &id);
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    let workload = record["phase"]["pid"].as_u64().unwrap();
+    // The workload is the owner's child: field 4 of its stat, after the
+    // parenthesised name.
+    let stat = std::fs::read_to_string(format!("/proc/{workload}/stat")).unwrap();
+    let owner: u32 = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Let the start's own traffic settle first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = voluntary_switches(owner);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let woken = voluntary_switches(owner) - before;
+    // What one owner costs in memory, for the design doc's per-app figure.
+    let memory = std::fs::read_to_string(format!("/proc/{owner}/smaps_rollup")).unwrap_or_default();
+    let proportional = memory.lines().find(|line| line.starts_with("Pss:"));
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    eprintln!("the idle owner woke {woken} times in 2 s; {proportional:?}");
+    assert!(woken < 40, "the idle owner woke {woken} times in 2 s");
+}
+
+/// #2447: an owner that sleeps until something happens still sees its
+/// workload exit at once.
+#[tokio::test]
+async fn an_owner_sees_its_workload_exit_promptly() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__prompt-exit-0".into());
+    grill.create(&id, &spec("sleep 1")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let started = std::time::Instant::now();
+    stopped(&grill, &id).await;
+    let took = started.elapsed();
+    // One second of sleep, then the exit: well inside the owner's long
+    // safety-net wait, so only a prompt wake-up gets here in time.
+    assert!(took < Duration::from_secs(3), "exit seen after {took:?}");
 }
 
 #[tokio::test]

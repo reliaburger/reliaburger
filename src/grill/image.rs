@@ -4,7 +4,9 @@
 /// GHCR, etc.) using the OCI Distribution API. Layers are cached as
 /// content-addressed blobs and unpacked into a rootfs directory that
 /// runc can use directly.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +16,9 @@ use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
 use super::whiteout::{self, LayerEntries, LayerEntry};
+
+mod gc;
+pub use gc::{CollectionProblem, ImageStoreStatus, RootfsGcReport};
 
 /// A parsed OCI image reference.
 ///
@@ -252,6 +257,22 @@ pub struct LocalImageBlobs {
     pub config: PathBuf,
     /// The config blob's digest, as the manifest names it.
     pub config_digest: String,
+    /// The platform manifest that names the config and layers.
+    pub manifest: Option<LocalMetadataBlob>,
+    /// The image index that named the platform manifest, when the image was
+    /// asked for by its index.
+    pub index: Option<LocalMetadataBlob>,
+}
+
+/// A manifest or index blob held locally: its digest and where its bytes
+/// are. Kept as pin metadata after an unpack, so a warm digest pin starts
+/// without asking the source again (#2421).
+#[derive(Debug, Clone)]
+pub struct LocalMetadataBlob {
+    /// The digest that names the bytes, `sha256:…`.
+    pub digest: String,
+    /// The blob's path in local storage.
+    pub path: PathBuf,
 }
 
 /// An unpacked image: its root filesystem and the config that says how
@@ -302,6 +323,64 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<LocalImageBlobs>, String>> + Send + 'a>,
 >;
 
+/// Most bytes of file content one unpack may write, across all of an
+/// image's layers (#2385). A gzip of zeros expands about a thousandfold,
+/// so a layer's compressed size says nothing about this.
+pub const MAX_UNPACKED_BYTES: u64 = 16 << 30;
+
+/// Most tar entries one unpack may read, across all of an image's layers,
+/// whiteouts and skipped device nodes included.
+pub const MAX_UNPACKED_ENTRIES: u64 = 1_000_000;
+
+/// Free space an unpack always leaves on the image filesystem, so a large
+/// image can't take the room logs, metrics and the Raft log need.
+pub const UNPACK_FREE_RESERVE_BYTES: u64 = 1 << 30;
+
+/// Ceilings on what one unpack may write (#2385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpackLimits {
+    /// Bytes of file content, counted from each entry's header before it is
+    /// written (a sparse file counts its full size).
+    pub max_bytes: u64,
+    /// Tar entries read.
+    pub max_entries: u64,
+}
+
+impl Default for UnpackLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_UNPACKED_BYTES,
+            max_entries: MAX_UNPACKED_ENTRIES,
+        }
+    }
+}
+
+/// The per-generation publication locks of an [`ImageStore`].
+type GenerationLocks = tokio::sync::Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+/// What an [`ImageStore`]'s clones share about unpacking.
+#[derive(Default)]
+struct UnpackState {
+    /// Ceilings on each unpack, before the free-space reserve lowers them.
+    limits: UnpackLimits,
+    /// One lock per generation directory being published or collected
+    /// (#2456). Re-unpacking a generation clears its directory, which can
+    /// destroy a running container's rootfs; the lock and a marker check
+    /// under it make a second pull reuse the published tree instead.
+    /// Different images never wait for each other. An entry lives while
+    /// someone holds its lock and is dropped afterwards.
+    generation_locks: GenerationLocks,
+    /// When each generation was last handed to a caller. A caller names
+    /// the generation in its bundle only after `pull_and_unpack` returns, so
+    /// until then this record is what keeps the collector off it (#2423).
+    handed_out: tokio::sync::Mutex<HashMap<PathBuf, std::time::Instant>>,
+    /// When the last collection pass started. Held for the whole pass, so
+    /// at most one runs at a time.
+    last_collection: std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// What `relish images` and `relish wtf` read about this store (#2524).
+    status: ImageStoreStatus,
+}
+
 /// Content-addressed image store on disk.
 ///
 /// Disk layout:
@@ -322,11 +401,10 @@ pub struct ImageStore {
     /// clones (the runc grill holds one). A lock-free `OnceLock` read
     /// sits on every pull, a set happens at most once.
     cluster_source: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn ClusterImageSource>>>,
-    /// Serialises generation publication across clones. Re-unpacking the same
-    /// generation clears its directory, which can destroy a running
-    /// container's rootfs; the completion marker makes subsequent pulls reuse
-    /// the published tree instead.
-    unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Unpack limits and the locks and records shared by every clone's
+    /// unpacks and collections. One `Arc` for all of them keeps the store
+    /// small: the runtime enums that hold it are moved around by value.
+    unpacking: std::sync::Arc<UnpackState>,
     /// Added to every file's uid and gid at unpack time, so a user
     /// namespace mapping container id 0 to this host id sees the image's
     /// own ownership (see `grill::userns`). `None` keeps the unpacking
@@ -345,10 +423,13 @@ impl ImageStore {
     /// Create a new image store at the given root directory.
     pub fn new(store_root: PathBuf) -> Self {
         Self {
+            unpacking: std::sync::Arc::new(UnpackState {
+                status: ImageStoreStatus::new(store_root.clone()),
+                ..UnpackState::default()
+            }),
             store_root,
             blob_store: std::sync::Arc::new(std::sync::OnceLock::new()),
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
-            unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
         }
@@ -365,6 +446,33 @@ impl ImageStore {
         self.blob_store
             .set(store)
             .map_err(|_| "runtime blob store already configured".into())
+    }
+
+    /// Unpack with `limits` instead of the defaults.
+    pub fn with_unpack_limits(mut self, limits: UnpackLimits) -> Self {
+        self.unpacking = std::sync::Arc::new(UnpackState {
+            limits,
+            status: self.unpacking.status.clone(),
+            ..UnpackState::default()
+        });
+        self
+    }
+
+    /// The limits for the next unpack: the store's own, with the byte ceiling
+    /// lowered to the image filesystem's free space less
+    /// [`UNPACK_FREE_RESERVE_BYTES`]. A filesystem that can't be measured
+    /// leaves the store's limits as they are.
+    async fn unpack_limits_now(&self) -> UnpackLimits {
+        let mut limits = self.unpacking.limits;
+        if let Ok(usage) =
+            crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root).await
+        {
+            let room = usage
+                .available_bytes
+                .saturating_sub(UNPACK_FREE_RESERVE_BYTES);
+            limits.max_bytes = limits.max_bytes.min(room);
+        }
+        limits
     }
 
     /// Try `mirrors` before an image's own registry for digest-pinned pulls.
@@ -411,22 +519,87 @@ impl ImageStore {
         layer_paths: Vec<PathBuf>,
         rootfs: PathBuf,
     ) -> Result<PathBuf, ImageError> {
-        let _guard = self.unpack_lock.lock().await;
         let generation = self.rootfs_generation_path(&rootfs, &layer_paths);
-        let complete = generation.with_extension("complete");
-        if complete.is_file() {
+        // A published generation needs no lock: its marker is written only
+        // after the tree is flushed, and atomically, so reading it is safe
+        // while any other image unpacks (#2456).
+        if self.claim_published(&generation).await {
             return Ok(generation);
         }
-        let target = generation.clone();
+        let lock = self.generation_lock(&generation).await;
+        let published = {
+            let _guard = lock.lock().await;
+            self.publish_generation(layer_paths, &generation).await
+        };
+        drop(lock);
+        self.release_generation_locks().await;
+        published.map(|()| generation)
+    }
+
+    /// The publication lock of `generation`, made on first use.
+    async fn generation_lock(&self, generation: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.unpacking
+            .generation_locks
+            .lock()
+            .await
+            .entry(generation.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// Forget the locks nobody holds or waits for: the map's own reference
+    /// is then the only one.
+    async fn release_generation_locks(&self) {
+        self.unpacking
+            .generation_locks
+            .lock()
+            .await
+            .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    }
+
+    /// Unpack `layer_paths` into `generation` and publish it, unless another
+    /// pull published it while this one waited. The caller holds the
+    /// generation's lock.
+    async fn publish_generation(
+        &self,
+        layer_paths: Vec<PathBuf>,
+        generation: &Path,
+    ) -> Result<(), ImageError> {
+        if self.claim_published(generation).await {
+            return Ok(());
+        }
+        let target = generation.to_path_buf();
+        let complete = generation.with_extension("complete");
         let owner_shift = self.owner_shift;
+        let limits = self.unpack_limits_now().await;
         tokio::task::spawn_blocking(move || {
-            unpack_layers_with_owner(&layer_paths, &target, owner_shift)?;
+            if let Err(error) = unpack_layers_with_owner(&layer_paths, &target, owner_shift, limits)
+            {
+                // Nothing runs from a generation without its marker: the
+                // partial tree is only disk taken (#2385).
+                if let Err(cleanup) = std::fs::remove_dir_all(&target)
+                    && cleanup.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "warning: could not remove partial image tree {}: {cleanup}",
+                        target.display()
+                    );
+                }
+                return Err(error);
+            }
             // The marker is the only thing a later pull checks. Flush the
             // unpacked tree before writing it: after a power cut the V02 soak
             // found `.complete` present and `redis-server` empty, and every
-            // redeploy failed with "exec format error".
+            // redeploy failed with "exec format error". `syncfs` waits for
+            // every writer on the filesystem, but only this generation's
+            // lock is held meanwhile, so it delays this image alone.
             sync_filesystem(&target)?;
-            crate::sesame::identity::atomic_write(&complete, b"complete\n")?;
+            // Measured once here, so `relish images` never walks a tree.
+            let bytes = gc::tree_bytes(&target).map_err(|e| ImageError::UnpackFailed {
+                digest: "rootfs".to_string(),
+                reason: format!("failed to measure the unpacked tree: {e}"),
+            })?;
+            crate::sesame::identity::atomic_write(&complete, &gc::marker_contents(bytes))?;
             Ok::<(), ImageError>(())
         })
         .await
@@ -434,7 +607,154 @@ impl ImageStore {
             digest: "join".to_string(),
             reason: e.to_string(),
         })??;
-        Ok(generation)
+        // The marker was written under the generation's lock, which the
+        // collector also takes: nothing can have retired it since.
+        self.claim_published(generation).await;
+        Ok(())
+    }
+
+    /// Hand `generation` to a caller if it is published, recording when.
+    /// The marker check and the record share one lock with the collector's
+    /// own check-and-retire, so a generation this returns `true` for is never
+    /// retired under the caller.
+    async fn claim_published(&self, generation: &Path) -> bool {
+        let mut handed_out = self.unpacking.handed_out.lock().await;
+        if !generation.with_extension("complete").is_file() {
+            return false;
+        }
+        handed_out.insert(generation.to_path_buf(), std::time::Instant::now());
+        true
+    }
+
+    /// Start a collection pass unless one is running or the last one started
+    /// less than `interval` ago. A full image filesystem collects at once.
+    /// The pass lasts as long as the returned guard.
+    pub async fn start_collection(
+        &self,
+        interval: Duration,
+    ) -> Option<tokio::sync::OwnedMutexGuard<Option<std::time::Instant>>> {
+        let mut pass = self
+            .unpacking
+            .last_collection
+            .clone()
+            .try_lock_owned()
+            .ok()?;
+        let due = pass.is_none_or(|started| started.elapsed() >= interval)
+            || crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root)
+                .await
+                .is_ok_and(|usage| usage.is_pressured());
+        if !due {
+            return None;
+        }
+        *pass = Some(std::time::Instant::now());
+        Some(pass)
+    }
+
+    /// This store's status handle: its unpacked sizes and how its last
+    /// collection pass went.
+    pub fn status(&self) -> ImageStoreStatus {
+        self.unpacking.status.clone()
+    }
+
+    /// Run one collection pass over `live`, the generations instances use,
+    /// and record how it went at `now` (Unix seconds) for `relish wtf`
+    /// (#2524). An `Err` live set means the caller couldn't tell which are
+    /// live: nothing is removed, and the pass counts as refused.
+    pub async fn run_collection(
+        &self,
+        live: std::io::Result<HashSet<PathBuf>>,
+        grace: Duration,
+        now: u64,
+    ) -> Option<RootfsGcReport> {
+        let live = match live {
+            Ok(live) => live,
+            Err(error) => {
+                eprintln!("warning: image collection skipped: {error}");
+                self.unpacking
+                    .status
+                    .record(Some(CollectionProblem::Refused), now);
+                return None;
+            }
+        };
+        match self.collect_rootfs_garbage(&live, grace).await {
+            Ok(report) => {
+                self.unpacking.status.record(None, now);
+                Some(report)
+            }
+            Err(error) => {
+                eprintln!("warning: image collection failed: {error}");
+                self.unpacking
+                    .status
+                    .record(Some(CollectionProblem::Failed), now);
+                None
+            }
+        }
+    }
+
+    /// Remove every rootfs generation whose canonical path is not in `live`,
+    /// then the cached manifests and pin metadata only those generations
+    /// needed (#2423).
+    ///
+    /// A generation handed out by a pull less than `grace` ago is kept, as
+    /// is a marker-less tree (an unpack that never finished) younger than
+    /// `grace`. Each generation is removed under its own publication lock,
+    /// and one an unpack holds is skipped, so the pass never waits for an
+    /// unpack and an unpack waits for at most one removal.
+    pub async fn collect_rootfs_garbage(
+        &self,
+        live: &HashSet<PathBuf>,
+        grace: Duration,
+    ) -> std::io::Result<RootfsGcReport> {
+        let live = live.clone();
+        let store_root = self.store_root.clone();
+        let state = self.unpacking.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            // Compare canonical paths: the live set comes from bundle
+            // markers, which hold the canonical lower directory.
+            let live: HashSet<PathBuf> = live
+                .into_iter()
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                .collect();
+            let mut report = RootfsGcReport::default();
+            for generation in gc::generations(&store_root.join("rootfs"))? {
+                let canonical = std::fs::canonicalize(&generation).unwrap_or(generation.clone());
+                if live.contains(&canonical) {
+                    continue;
+                }
+                let lock = state
+                    .generation_locks
+                    .blocking_lock()
+                    .entry(generation.clone())
+                    .or_default()
+                    .clone();
+                let Ok(_publishing) = lock.try_lock_owned() else {
+                    continue; // an unpack is filling or reusing it
+                };
+                // Checked and retired under one lock: a pull either claims
+                // the generation first, and it stays, or finds no marker.
+                let published = {
+                    let mut handed_out = state.handed_out.blocking_lock();
+                    handed_out.retain(|_, at| at.elapsed() < grace);
+                    if handed_out.contains_key(&generation) {
+                        continue;
+                    }
+                    gc::retire_marker(&generation)?
+                };
+                if gc::remove_tree_after(&generation, published, grace)? {
+                    if published {
+                        report.generations_removed += 1;
+                    } else {
+                        report.partials_removed += 1;
+                    }
+                }
+            }
+            gc::tidy_store(&store_root, grace, &mut report)?;
+            Ok::<_, std::io::Error>(report)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        self.release_generation_locks().await;
+        report
     }
 
     /// The content-addressed rootfs generation directory for a set of
@@ -503,6 +823,21 @@ impl ImageStore {
         // cluster or cache lookup acts on it.
         image_ref.to_oci_reference()?;
 
+        // Unpacked trees keep their set-id bits, owned by the container id
+        // range, so no other local user may reach them (#2412). With an
+        // owner shift, container root's group still passes through: runc
+        // hands a read-only root straight from here.
+        let unpacked = self.store_root.join("rootfs");
+        let group = self.owner_shift;
+        tokio::task::spawn_blocking(move || super::bundle::close_to_other_users(&unpacked, group))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|closed| closed)
+            .map_err(|error| ImageError::UnpackFailed {
+                digest: "rootfs".to_string(),
+                reason: format!("failed to close the unpacked image store: {error}"),
+            })?;
+
         let rootfs = self.rootfs_path(&image_ref);
 
         // A digest names exact bytes. When this node already holds them,
@@ -522,7 +857,7 @@ impl ImageStore {
             for (repo, tag) in cluster_candidates(&image_ref) {
                 match source.fetch_cluster_image(&repo, &tag).await {
                     Ok(Some(blobs)) => {
-                        return self.unpack_local(blobs, rootfs).await;
+                        return self.unpack_local(&image_ref, blobs, rootfs).await;
                     }
                     Ok(None) => continue,
                     // The catalog knows the image but its layers are
@@ -542,7 +877,7 @@ impl ImageStore {
             // the same either way, so degrading is safe (and logged).
             match source.fetch_pull_through(&image_ref).await {
                 Ok(Some(blobs)) => {
-                    return self.unpack_local(blobs, rootfs).await;
+                    return self.unpack_local(&image_ref, blobs, rootfs).await;
                 }
                 Ok(None) => {}
                 Err(reason) => {
@@ -616,6 +951,15 @@ impl ImageStore {
             reason: e.to_string(),
         })?;
 
+        // Refuse a layer format nothing here can unpack before fetching it.
+        // Only a runtime pull checks: the cache also holds signature images,
+        // whose layers aren't tars at all.
+        super::oci_pull::check_layer_media_types(&verified.manifest).map_err(|e| {
+            ImageError::ManifestPull {
+                image: source.full_reference(),
+                reason: e.to_string(),
+            }
+        })?;
         let config = parse_config(&verified.config_bytes, &verified.manifest.config.digest)?;
         if image_ref.tag.starts_with("sha256:") {
             self.remember_pin(&image_ref.tag, &verified).await?;
@@ -634,94 +978,64 @@ impl ImageStore {
             })?;
         tokio::fs::write(&manifest_path, &manifest_json).await?;
 
-        // Download each layer blob (skip if cached)
+        let store = self.blob_store.get().cloned().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::pickle::store::BlobStore::new(
+                self.store_root.clone(),
+            ))
+        });
+        let layer_error = |digest: &str, reason: String| ImageError::LayerPull {
+            digest: digest.to_string(),
+            reason,
+        };
+        // Layers already held, re-verified: a corrupt one is removed and
+        // returns its bytes to the budget before the room check below.
+        let mut missing = Vec::new();
         for layer in &manifest.layers {
             let digest = &layer.digest;
-            let blob_path = self.blob_path(digest);
-            let expected_size = u64::try_from(layer.size).map_err(|_| ImageError::LayerPull {
-                digest: digest.clone(),
-                reason: "negative layer size".into(),
-            })?;
-            let verify_size = |actual: u64| -> Result<(), ImageError> {
-                if actual != expected_size {
-                    return Err(ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: format!(
-                            "layer size mismatch: expected {expected_size}, received {actual}"
-                        ),
-                    });
-                }
-                Ok(())
-            };
-            let store = self.blob_store.get().cloned().unwrap_or_else(|| {
-                std::sync::Arc::new(crate::pickle::store::BlobStore::new(
-                    self.store_root.clone(),
-                ))
-            });
-            let expected = crate::pickle::types::Digest::new(digest).map_err(|error| {
-                ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
+            let expected = crate::pickle::types::Digest::new(digest)
+                .map_err(|error| layer_error(digest, error.to_string()))?;
             let cached_store = store.clone();
-            let cached_digest = expected.clone();
             let cached =
-                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&cached_digest))
+                tokio::task::spawn_blocking(move || cached_store.revalidate_blob(&expected))
                     .await
-                    .map_err(|error| ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: error.to_string(),
-                    })?
-                    .map_err(|error| ImageError::LayerPull {
-                        digest: digest.clone(),
-                        reason: error.to_string(),
-                    })?;
+                    .map_err(|error| layer_error(digest, error.to_string()))?
+                    .map_err(|error| layer_error(digest, error.to_string()))?;
             if cached {
-                verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
-                continue;
+                let actual = tokio::fs::metadata(self.blob_path(digest)).await?.len();
+                if u64::try_from(layer.size).ok() != Some(actual) {
+                    return Err(layer_error(
+                        digest,
+                        format!(
+                            "layer size mismatch: expected {}, received {actual}",
+                            layer.size
+                        ),
+                    ));
+                }
+            } else {
+                missing.push(layer);
             }
+        }
 
-            let blob_data = retry_registry_read(super::oci_pull::LAYER_READ, || async {
-                // A failed transfer may have written a prefix. Each attempt
-                // owns a fresh buffer; no partial bytes reach the cache.
-                let mut blob_data = Vec::new();
-                client.pull_blob(&oci_ref, layer, &mut blob_data).await?;
-                Ok(blob_data)
-            })
-            .await
-            .map_err(|e| ImageError::LayerPull {
-                digest: digest.clone(),
-                reason: e.to_string(),
-            })?;
+        // The manifest says how much the missing layers need. Refuse an image
+        // that can't fit before asking for a single byte of it (#2424).
+        // check_layer_sizes already refused negative sizes and overflow.
+        let needed = missing
+            .iter()
+            .map(|layer| layer.size.max(0) as u64)
+            .sum::<u64>();
+        super::oci_pull::check_room(&store, &image_ref.full_reference(), needed).map_err(
+            |error| ImageError::LayerPull {
+                digest: image_ref.full_reference(),
+                reason: error.to_string(),
+            },
+        )?;
 
-            // Verify the SHA-256 digest
-            let computed = format!("sha256:{}", sha256_hex(&blob_data));
-            if computed != *digest {
-                return Err(ImageError::DigestMismatch {
-                    digest: digest.clone(),
-                    expected: digest.clone(),
-                    actual: computed,
-                });
-            }
-
-            verify_size(blob_data.len() as u64)?;
-
-            // Write atomically (temp + rename) so a crash mid-write can't leave
-            // a truncated blob at the final path that a later pull treats as a
-            // valid cache hit (M3). Warm and cold paths both verify the
-            // digest through the shared store before use. Publication syncs
-            // the payload and each required ancestor directory entry.
-            tokio::task::spawn_blocking(move || store.write_blob(&blob_data, &expected))
+        // Each layer streams to an upload file while it is hashed, and is
+        // published only once its digest and size match the manifest.
+        for layer in missing {
+            super::oci_pull::pull_layer_to_store(&client, &oci_ref, layer, &store)
                 .await
-                .map_err(|e| ImageError::UnpackFailed {
-                    digest: digest.clone(),
-                    reason: e.to_string(),
-                })?
-                .map_err(|error| ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: error.to_string(),
-                })?;
+                .map_err(|error| layer_error(&layer.digest, error.to_string()))?;
         }
         Ok((manifest.layers, config))
     }
@@ -844,19 +1158,24 @@ impl ImageStore {
         // marker is written only after the unpacked tree is flushed: the
         // same proof a registry pull relies on before reusing it.
         let generation = self.rootfs_generation_path(rootfs, &layer_paths);
-        generation
-            .with_extension("complete")
-            .is_file()
-            .then_some(PulledImage {
-                rootfs: generation,
-                config,
-            })
+        if !self.claim_published(&generation).await {
+            return None;
+        }
+        Some(PulledImage {
+            rootfs: generation,
+            config,
+        })
     }
 
     /// Unpack blobs the cluster already holds, re-checking the config
     /// blob's digest: it decides what the container runs, and as whom.
+    ///
+    /// For a digest pin, the index, manifest and config are then kept as pin
+    /// metadata, as a direct pull keeps them, so the next start of this
+    /// image needs neither the catalogue nor the council leader (#2421).
     async fn unpack_local(
         &self,
+        image_ref: &ImageReference,
         blobs: LocalImageBlobs,
         rootfs: PathBuf,
     ) -> Result<PulledImage, ImageError> {
@@ -871,6 +1190,26 @@ impl ImageStore {
         }
         let config = parse_config(&bytes, &blobs.config_digest)?;
         let rootfs = self.unpack_to(blobs.layers, rootfs).await?;
+        if image_ref.tag.starts_with("sha256:") {
+            let metadata = [blobs.index, blobs.manifest]
+                .into_iter()
+                .flatten()
+                .map(|blob| (blob.digest, blob.path));
+            for (digest, path) in metadata {
+                // A cache, not the pull: a miss only means the next start
+                // asks the source again.
+                let stored = match tokio::fs::read(&path).await {
+                    Ok(bytes) => self.store_metadata(&digest, bytes).await,
+                    Err(error) => Err(error.into()),
+                };
+                if let Err(error) = stored {
+                    eprintln!("warning: could not keep pin metadata {digest}: {error}");
+                }
+            }
+            if let Err(error) = self.store_metadata(&blobs.config_digest, bytes).await {
+                eprintln!("warning: could not keep pin metadata for {image_ref:?}: {error}");
+            }
+        }
         Ok(PulledImage { rootfs, config })
     }
 }
@@ -928,7 +1267,49 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Unpack OCI image layers (gzipped tarballs) into a rootfs directory.
+/// A layer blob as a tar stream, whichever way it was compressed (#2465).
+///
+/// The layer's first bytes decide: `1f 8b` is gzip, `28 b5 2f fd` is zstd,
+/// and `ustar` at offset 257 (or an all-zero first block, an empty tar) is a
+/// plain tar. Cluster and pull-through blobs arrive as paths with no media
+/// type, so the bytes are the only evidence every path shares.
+fn layer_reader(file: std::fs::File, digest: &str) -> Result<Box<dyn std::io::Read>, ImageError> {
+    use std::io::BufRead;
+    let failed = |reason: String| ImageError::UnpackFailed {
+        digest: digest.to_string(),
+        reason,
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let head = reader
+        .fill_buf()
+        .map_err(|e| failed(format!("failed to read layer blob: {e}")))?;
+    if head.starts_with(&[0x1f, 0x8b]) {
+        return Ok(Box::new(flate2::read::GzDecoder::new(reader)));
+    }
+    if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let decoder = zstd::stream::read::Decoder::with_buffer(reader)
+            .map_err(|e| failed(format!("failed to start zstd decoder: {e}")))?;
+        return Ok(Box::new(decoder));
+    }
+    let ustar = head.get(257..262) == Some(b"ustar".as_slice());
+    let empty_tar = head.len() >= 512 && head[..512].iter().all(|byte| *byte == 0);
+    if ustar || empty_tar {
+        return Ok(Box::new(reader));
+    }
+    let start: Vec<String> = head
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Err(failed(format!(
+        "unsupported layer compression: the layer starts with {}; \
+         a layer must be a tar, compressed with gzip or zstd or not at all",
+        start.join(" ")
+    )))
+}
+
+/// Unpack OCI image layers (tarballs, gzip- or zstd-compressed or plain)
+/// into a rootfs directory.
 ///
 /// Layers are applied base-first (index 0 is the bottom layer).
 /// Handles OCI whiteout files (see the `whiteout` module):
@@ -939,15 +1320,18 @@ fn sha256_hex(data: &[u8]) -> String {
 /// A whiteout never follows a symlink, and never removes an entry of its
 /// own layer, wherever it sits in the layer's tar.
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
-    unpack_layers_with_owner(layer_paths, rootfs, None)
+    unpack_layers_with_owner(layer_paths, rootfs, None, UnpackLimits::default())
 }
 
 /// [`unpack_layers`], optionally shifting every entry's owner by
-/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`).
+/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`), and
+/// failing once the layers together pass either of `limits`. A failed
+/// unpack leaves what it had written; the caller removes it.
 pub fn unpack_layers_with_owner(
     layer_paths: &[PathBuf],
     rootfs: &Path,
     owner_shift: Option<u32>,
+    limits: UnpackLimits,
 ) -> Result<(), ImageError> {
     // Clear and recreate rootfs
     if rootfs.exists() {
@@ -961,6 +1345,7 @@ pub fn unpack_layers_with_owner(
         reason: format!("failed to create rootfs: {e}"),
     })?;
 
+    let (mut bytes, mut entries) = (0u64, 0u64);
     for layer_path in layer_paths {
         let digest = layer_path
             .file_name()
@@ -973,8 +1358,7 @@ pub fn unpack_layers_with_owner(
             reason: format!("failed to open layer blob: {e}"),
         })?;
 
-        let decoder = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
+        let mut archive = tar::Archive::new(layer_reader(file, &digest)?);
         archive.set_preserve_permissions(true);
         archive.set_unpack_xattrs(true);
         archive.set_overwrite(true);
@@ -989,6 +1373,28 @@ pub fn unpack_layers_with_owner(
                 digest: digest.clone(),
                 reason: format!("failed to read tar entry: {e}"),
             })?;
+            // Count before writing: the entry that crosses a ceiling is
+            // never written. `size` is the expanded size of a sparse file.
+            entries += 1;
+            bytes = bytes.saturating_add(entry.size());
+            if entries > limits.max_entries {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image has more than {} entries, the unpack ceiling",
+                        limits.max_entries
+                    ),
+                });
+            }
+            if bytes > limits.max_bytes {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image expands past the unpack ceiling of {} bytes",
+                        limits.max_bytes
+                    ),
+                });
+            }
 
             let path = entry.path().map_err(|e| ImageError::UnpackFailed {
                 digest: digest.clone(),
@@ -1408,6 +1814,381 @@ mod tests {
         );
     }
 
+    /// A layer blob at `{root}/{digest}/data`, the shape the store gives
+    /// every blob: the generation id hashes the parent directory's name.
+    fn blob_layer(root: &Path, digest: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let layer = root.join("blobs").join(digest).join("data");
+        std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+        create_test_layer(&layer, files);
+        layer
+    }
+
+    #[tokio::test]
+    async fn a_published_generation_is_returned_while_another_unpack_holds_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "aaaa", &[("bin/tool", b"tool")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store
+            .unpack_to(vec![layer.clone()], tag_root.clone())
+            .await
+            .unwrap();
+
+        // Something holds the generation's own lock, as a collection pass
+        // or a second pull of it would.
+        let lock = store.generation_lock(&generation).await;
+        let _busy = lock.lock().await;
+        let again = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.unpack_to(vec![layer], tag_root),
+        )
+        .await;
+
+        assert!(
+            matches!(&again, Ok(Ok(path)) if *path == generation),
+            "{again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpack_of_one_image_does_not_wait_for_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slow = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let other = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"b")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        // The slow image's unpack holds its generation's lock throughout.
+        let slow_generation = store.rootfs_generation_path(&tag_root, &[slow]);
+        let lock = store.generation_lock(&slow_generation).await;
+        let _unpacking = lock.lock().await;
+
+        let unpacked = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.unpack_to(vec![other], tag_root),
+        )
+        .await;
+
+        assert!(matches!(unpacked, Ok(Ok(_))), "{unpacked:?}");
+    }
+
+    #[tokio::test]
+    async fn the_collector_skips_a_generation_being_unpacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let partial = tmp
+            .path()
+            .join("store/rootfs/docker.io/acme/web/v1/gen-0123456789abcdef");
+        std::fs::create_dir_all(partial.join("bin")).unwrap();
+        let lock = store.generation_lock(&partial).await;
+        let unpacking = lock.lock().await;
+
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(partial.exists(), "a tree an unpack is filling stays");
+        assert_eq!(report.partials_removed, 0);
+
+        drop(unpacking);
+        drop(lock);
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!partial.exists());
+        assert_eq!(report.partials_removed, 1);
+        assert!(
+            store.unpacking.generation_locks.lock().await.is_empty(),
+            "locks nobody holds are forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_no_instance_uses_is_removed_and_a_live_one_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_a = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let layer_b = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"b")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+
+        let a = store
+            .unpack_to(vec![layer_a], tag_root.clone())
+            .await
+            .unwrap();
+        let b = store.unpack_to(vec![layer_b], tag_root).await.unwrap();
+        assert_ne!(a, b);
+
+        let live = HashSet::from([std::fs::canonicalize(&a).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(a.exists());
+        assert!(a.with_extension("complete").is_file());
+        assert!(!b.exists());
+        assert!(!b.with_extension("complete").exists());
+        assert_eq!(report.generations_removed, 1);
+    }
+
+    /// #2524: `relish images` shows how much disk each image's unpacked
+    /// trees take on the node. The size is measured once, when a
+    /// generation is published, and kept in its marker.
+    #[tokio::test]
+    async fn a_published_generation_records_its_unpacked_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_a = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"12345")]);
+        let layer_b = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"1234567")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let tag_root = tmp
+            .path()
+            .join("store/rootfs/docker.io/acme/web")
+            .join(digest.replace(':', "%3A"));
+        store
+            .unpack_to(vec![layer_a], tag_root.clone())
+            .await
+            .unwrap();
+        store.unpack_to(vec![layer_b], tag_root).await.unwrap();
+        // A tag that isn't a digest has no row in `relish images` to join.
+        let tagged = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let layer_c = blob_layer(tmp.path(), "cccc", &[("bin/c", b"1")]);
+        store.unpack_to(vec![layer_c], tagged).await.unwrap();
+
+        let sizes = store.status().unpacked_sizes().await.unwrap();
+        assert_eq!(sizes, HashMap::from([(digest, 12)]));
+    }
+
+    /// #2524: `relish wtf` says when a node's image collection can't run.
+    /// A pass that can't read which generations are live removes nothing
+    /// and is recorded as refused; a later pass that works clears it.
+    #[tokio::test]
+    async fn a_refused_collection_is_recorded_until_a_pass_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let status = store.status();
+        assert_eq!(status.problem(), None);
+
+        let unreadable = Err(std::io::Error::other("bad bundle spec"));
+        store.run_collection(unreadable, Duration::ZERO, 100).await;
+        assert_eq!(status.problem(), Some((CollectionProblem::Refused, 100)));
+        // Still refused: it has been since the first one.
+        let unreadable = Err(std::io::Error::other("bad bundle spec"));
+        store.run_collection(unreadable, Duration::ZERO, 160).await;
+        assert_eq!(status.problem(), Some((CollectionProblem::Refused, 100)));
+
+        store
+            .run_collection(Ok(HashSet::new()), Duration::ZERO, 220)
+            .await;
+        assert_eq!(status.problem(), None);
+    }
+
+    #[tokio::test]
+    async fn a_partial_generation_older_than_the_grace_period_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        // An unpack that died before its marker: a tree, no `.complete`.
+        let partial = tag.join("gen-0123456789abcdef");
+        std::fs::create_dir_all(partial.join("bin")).unwrap();
+        std::fs::write(partial.join("bin/half"), b"half").unwrap();
+
+        let kept = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            partial.exists(),
+            "a young partial tree may still be filling"
+        );
+        assert_eq!(kept.partials_removed, 0);
+
+        let removed = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!partial.exists());
+        assert_eq!(removed.partials_removed, 1);
+        assert!(
+            !tag.exists(),
+            "directories the collection empties are removed too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_handed_out_within_the_grace_period_is_kept() {
+        // Between `unpack_to` returning and the bundle's `rootfs-lower`
+        // marker (or config.json) naming it, no live set holds the
+        // generation: the store's own record of what it handed out does.
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.unpack_to(vec![layer], tag_root).await.unwrap();
+
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(generation.with_extension("complete").is_file());
+        assert_eq!(report.generations_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_removes_manifests_and_pin_metadata_of_removed_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let root = tmp.path().join("store");
+        let hex = |c: char| std::iter::repeat_n(c, 64).collect::<String>();
+        let (kept_pin, gone_pin, config) = (hex('a'), hex('b'), hex('c'));
+        // A pinned image whose generation is live, and one whose is gone.
+        let kept_tag = root.join(format!(
+            "rootfs/docker.io/acme/web/sha256%3A{kept_pin}/gen-0123456789abcdef"
+        ));
+        std::fs::create_dir_all(&kept_tag).unwrap();
+        std::fs::write(kept_tag.with_extension("complete"), b"complete\n").unwrap();
+        let manifests = root.join("manifests/docker.io/acme/web");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let kept_manifest = manifests.join(format!("sha256:{kept_pin}.json"));
+        let gone_manifest = manifests.join(format!("sha256:{gone_pin}.json"));
+        std::fs::write(&kept_manifest, b"{}").unwrap();
+        std::fs::write(&gone_manifest, b"{}").unwrap();
+        let metadata = root.join("metadata/sha256");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": 2
+            },
+            "layers": []
+        });
+        std::fs::write(metadata.join(&kept_pin), manifest.to_string()).unwrap();
+        std::fs::write(metadata.join(&config), b"{}").unwrap();
+        std::fs::write(metadata.join(&gone_pin), manifest.to_string()).unwrap();
+
+        let live = HashSet::from([std::fs::canonicalize(&kept_tag).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(kept_manifest.is_file());
+        assert!(!gone_manifest.exists());
+        assert!(metadata.join(&kept_pin).is_file());
+        assert!(metadata.join(&config).is_file(), "the kept pin's config");
+        assert!(!metadata.join(&gone_pin).exists());
+        assert_eq!(report.manifests_removed, 1);
+        assert_eq!(report.metadata_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_collection_inside_the_interval_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let interval = Duration::from_secs(3600);
+        let first = store.start_collection(interval).await;
+        assert!(first.is_some());
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "one pass at a time"
+        );
+        drop(first);
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "the next pass waits for the interval"
+        );
+        assert!(store.start_collection(Duration::ZERO).await.is_some());
+    }
+
+    /// Apparent bytes of every regular file under `root`.
+    fn tree_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn unpack_refuses_a_layer_that_expands_past_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("zeros.tar.gz");
+        // 8 MiB of zeros compresses to a few kilobytes.
+        create_test_layer(&layer, &[("fill", &vec![0u8; 8 << 20])]);
+        assert!(std::fs::metadata(&layer).unwrap().len() < 1 << 20);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1048576"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        assert!(tree_bytes(&rootfs) < 2 << 20);
+    }
+
+    #[test]
+    fn unpack_refuses_more_entries_than_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("many.tar.gz");
+        let names: Vec<String> = (0..10_000).map(|index| format!("f/{index}")).collect();
+        let files: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        create_test_layer(&layer, &files);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 30,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1000 entries"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        let written = std::fs::read_dir(rootfs.join("f")).unwrap().count();
+        assert!(written <= 1_000, "{written} files written");
+    }
+
+    #[tokio::test]
+    async fn a_refused_unpack_leaves_no_partial_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "zeros", &[("fill", &vec![0u8; 4 << 20])]);
+        let store = ImageStore::new(tmp.path().join("store")).with_unpack_limits(UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        });
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.rootfs_generation_path(&tag_root, std::slice::from_ref(&layer));
+
+        assert!(store.unpack_to(vec![layer], tag_root).await.is_err());
+        assert!(!generation.exists(), "the partial tree stays on disk");
+        assert!(!generation.with_extension("complete").exists());
+    }
+
     #[test]
     fn rootfs_path_from_reference() {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
@@ -1447,6 +2228,76 @@ mod tests {
 
         let content = std::fs::read_to_string(rootfs.join("hello.txt")).unwrap();
         assert_eq!(content, "hello world");
+    }
+
+    /// An uncompressed tar holding `bin/tool`.
+    fn plain_tar_with_a_tool() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(9);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "bin/tool", &b"#!/bin/sh"[..])
+            .unwrap();
+        tar.into_inner().unwrap()
+    }
+
+    /// #2465: BuildKit's `compression=zstd` layers unpack like gzip ones.
+    #[test]
+    fn unpack_accepts_a_zstd_compressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.zst");
+        std::fs::write(
+            &layer,
+            zstd::stream::encode_all(&plain_tar_with_a_tool()[..], 3).unwrap(),
+        )
+        .unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/tool")).unwrap(),
+            b"#!/bin/sh"
+        );
+    }
+
+    /// #2465: an uncompressed `application/vnd.oci.image.layer.v1.tar` layer.
+    #[test]
+    fn unpack_accepts_an_uncompressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar");
+        std::fs::write(&layer, plain_tar_with_a_tool()).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/tool")).unwrap(),
+            b"#!/bin/sh"
+        );
+    }
+
+    /// An empty tar is all zeros, with no `ustar` magic anywhere.
+    #[test]
+    fn unpack_accepts_an_empty_uncompressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar");
+        std::fs::write(&layer, tar::Builder::new(Vec::new()).into_inner().unwrap()).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert!(rootfs.is_dir());
+    }
+
+    /// A format we can't read says so, rather than `invalid gzip header`.
+    #[test]
+    fn unpack_names_an_unknown_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.bz2");
+        let mut bytes = b"BZh91AY&SY".to_vec();
+        bytes.resize(1024, 7);
+        std::fs::write(&layer, bytes).unwrap();
+        let error = unpack_layers(&[layer], &tmp.path().join("rootfs")).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported layer compression"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1881,7 +2732,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let rootfs = tmp.path().join("rootfs");
-        unpack_layers_with_owner(&[layer], &rootfs, Some(base)).unwrap();
+        unpack_layers_with_owner(&[layer], &rootfs, Some(base), UnpackLimits::default()).unwrap();
 
         let data = std::fs::metadata(rootfs.join("data")).unwrap();
         assert_eq!((data.uid(), data.gid()), (base + 999, base + 1000));
@@ -1960,7 +2811,16 @@ mod tests {
         remaining: Arc<AtomicUsize>,
         delay: std::time::Duration,
         received: Arc<tokio::sync::Notify>,
+        /// Send the body in [`TRICKLE_PIECES`] pieces this far apart,
+        /// instead of the fault's status.
+        trickle: Option<std::time::Duration>,
+        /// A disconnect sends a true prefix of the body, and the layer
+        /// honours `Range: bytes=N-` requests, as a CDN-backed registry does.
+        resumable: bool,
     }
+
+    /// How many pieces a trickled body arrives in.
+    const TRICKLE_PIECES: usize = 5;
 
     fn registry_fault(
         layer: bool,
@@ -1980,6 +2840,8 @@ mod tests {
             remaining: Arc::new(AtomicUsize::new(count)),
             delay: std::time::Duration::ZERO,
             received: Arc::new(tokio::sync::Notify::new()),
+            trickle: None,
+            resumable: false,
         }
     }
 
@@ -1996,6 +2858,10 @@ mod tests {
         NegativeLayerSize,
         OverflowingLayerSizes,
         WrongLayerSize,
+        UnknownLayerMediaType,
+        /// Not a fault: the layer is zstd-compressed, as BuildKit's
+        /// `compression=zstd` writes it.
+        ZstdLayer,
     }
 
     #[derive(Clone)]
@@ -2008,6 +2874,8 @@ mod tests {
         layer_path: String,
         layer: Vec<u8>,
         layer_requests: Arc<AtomicUsize>,
+        /// Layer requests answered with part of the layer.
+        ranged_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
         /// Every request the registry answers, the version check included.
         requests: Arc<AtomicUsize>,
@@ -2017,6 +2885,7 @@ mod tests {
     struct RegistryFixture {
         reference: String,
         layer_requests: Arc<AtomicUsize>,
+        ranged_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
         /// The manifest fault's remaining count, when there is one.
@@ -2074,11 +2943,42 @@ mod tests {
         {
             fault.received.notify_one();
             tokio::time::sleep(fault.delay).await;
+            if let Some(gap) = fault.trickle {
+                use futures_util::StreamExt;
+                let body = match fault.target {
+                    RegistryFaultTarget::Layer => state.layer.clone(),
+                    RegistryFaultTarget::Manifest => state.manifest.clone(),
+                    RegistryFaultTarget::Configuration => state.config.clone(),
+                };
+                let length = body.len();
+                let piece = length.div_ceil(TRICKLE_PIECES);
+                let pieces: Vec<axum::body::Bytes> = body
+                    .chunks(piece)
+                    .map(axum::body::Bytes::copy_from_slice)
+                    .collect();
+                let stream = futures_util::stream::iter(pieces.into_iter().enumerate()).then(
+                    move |(index, piece)| async move {
+                        if index > 0 {
+                            tokio::time::sleep(gap).await;
+                        }
+                        Ok::<_, std::io::Error>(piece)
+                    },
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, length)
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+            }
             if fault.disconnect {
                 use futures_util::StreamExt;
-                let prefix = futures_util::stream::once(async {
-                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial response"))
-                });
+                let prefix = if fault.resumable {
+                    axum::body::Bytes::copy_from_slice(&state.layer[..16])
+                } else {
+                    axum::body::Bytes::from_static(b"partial response")
+                };
+                let prefix =
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(prefix) });
                 let failure = futures_util::stream::once(async {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     Err::<axum::body::Bytes, _>(std::io::Error::new(
@@ -2096,6 +2996,35 @@ mod tests {
                 .status(fault.status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::json!({"errors": [{"code": fault.code, "message": "injected registry failure"}]}).to_string()))
+                .unwrap();
+        }
+
+        let resumable = state.fault.as_ref().is_some_and(|fault| fault.resumable);
+        let range_start = request
+            .headers()
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.strip_suffix('-'))
+            .and_then(|value| value.parse::<usize>().ok());
+        if path == state.layer_path
+            && resumable
+            && let Some(start) = range_start
+        {
+            state.ranged_requests.fetch_add(1, Ordering::SeqCst);
+            let rest = state.layer[start..].to_vec();
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!(
+                        "bytes {start}-{}/{}",
+                        state.layer.len() - 1,
+                        state.layer.len()
+                    ),
+                )
+                .header(header::CONTENT_LENGTH, rest.len())
+                .body(Body::from(rest))
                 .unwrap();
         }
 
@@ -2158,7 +3087,15 @@ mod tests {
             &["bin/", "etc/"],
             &[("bin/sh", b"fixture shell"), ("etc/os-release", b"fixture")],
         );
-        let layer = std::fs::read(layer_path).unwrap();
+        let mut layer = std::fs::read(layer_path).unwrap();
+        let mut layer_media_type = "application/vnd.oci.image.layer.v1.tar+gzip";
+        if matches!(integrity, Some(RegistryIntegrityCase::ZstdLayer)) {
+            let mut tar = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&layer[..]), &mut tar)
+                .unwrap();
+            layer = zstd::stream::encode_all(&tar[..], 3).unwrap();
+            layer_media_type = "application/vnd.oci.image.layer.v1.tar+zstd";
+        }
         let layer_digest = format!("sha256:{}", sha256_hex(&layer));
 
         let config = br#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/sh"],"Cmd":["-c","true"],"Env":["FIXTURE=1"],"WorkingDir":"/etc"},"rootfs":{"type":"layers","diff_ids":[]}}"#
@@ -2173,7 +3110,7 @@ mod tests {
                 "size": config.len(),
             },
             "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "mediaType": layer_media_type,
                 "digest": layer_digest,
                 "size": layer.len(),
             }],
@@ -2185,6 +3122,15 @@ mod tests {
         ) {
             let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
             value["config"]["size"] = serde_json::json!(config.len() + 1);
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
+        if matches!(
+            integrity,
+            Some(RegistryIntegrityCase::UnknownLayerMediaType)
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            value["layers"][0]["mediaType"] =
+                serde_json::json!("application/vnd.oci.image.layer.v1.tar+bzip2");
             manifest = serde_json::to_vec(&value).unwrap();
         }
         if matches!(
@@ -2216,6 +3162,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
+        let ranged_requests = Arc::new(AtomicUsize::new(0));
         let manifest_requests = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
         let fault_remaining = fault.as_ref().map(|fault| Arc::clone(&fault.remaining));
@@ -2228,6 +3175,7 @@ mod tests {
             layer_path: format!("/v2/fixture/blobs/{layer_digest}"),
             layer,
             layer_requests: Arc::clone(&layer_requests),
+            ranged_requests: Arc::clone(&ranged_requests),
             manifest_requests: Arc::clone(&manifest_requests),
             requests: Arc::clone(&requests),
             fault,
@@ -2297,6 +3245,7 @@ mod tests {
         RegistryFixture {
             reference: format!("{address}/fixture@{root_digest}"),
             layer_requests,
+            ranged_requests,
             manifest_requests,
             requests,
             fault_remaining,
@@ -2325,6 +3274,41 @@ mod tests {
             assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
             assert!(!store.manifest_path(&reference).exists());
         }
+    }
+
+    /// #2465: a layer format no node can unpack fails the pull before
+    /// any layer is downloaded, and the error names the media type.
+    #[tokio::test]
+    async fn a_layer_of_an_unknown_media_type_is_refused_before_it_is_downloaded() {
+        let fixture = start_registry_fixture_with_options(
+            None,
+            Some(RegistryIntegrityCase::UnknownLayerMediaType),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let error = store.pull_and_unpack(&fixture.reference).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("application/vnd.oci.image.layer.v1.tar+bzip2"),
+            "{error}"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// #2465: a whole zstd image, pulled from a registry and unpacked.
+    #[tokio::test]
+    async fn a_zstd_image_pulls_and_unpacks() {
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ZstdLayer)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
     }
 
     #[tokio::test]
@@ -2591,25 +3575,66 @@ mod tests {
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
     }
 
+    /// #2424: a layer that breaks off part way is resumed from the bytes
+    /// already received when the registry honours a range request.
+    #[tokio::test]
+    async fn an_interrupted_layer_resumes_from_the_bytes_it_has() {
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        fault.resumable = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.ranged_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A layer streamed into the cache that breaks off is asked for again.
+    /// The fixture ignores the range request and sends the whole blob, so
+    /// the partial upload starts over: the junk prefix the broken response
+    /// carried never reaches the published blob.
+    #[tokio::test]
+    async fn pull_through_registry_restarts_an_interrupted_layer_the_registry_will_not_resume() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let layer = upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        upstream
+            .store_blob(&reference, &layer, &store)
+            .await
+            .unwrap();
+        assert!(store.revalidate_blob(&layer.digest).unwrap());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+        let uploads = std::fs::read_dir(directory.path().join("uploads")).unwrap();
+        assert_eq!(uploads.count(), 0, "no partial upload is left behind");
+    }
+
     /// Let one stalled request hit its per-attempt ceiling in simulated time,
     /// then return to real time so the retry reaches the real HTTP fixture.
-    async fn expire_stalled_attempt(
-        received: &tokio::sync::Notify,
-        budget: super::super::oci_pull::RegistryReadBudget,
-    ) {
+    async fn expire_stalled_attempt(received: &tokio::sync::Notify, ceiling: std::time::Duration) {
         tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
             .await
             .unwrap();
         // Pause only after the real HTTP server receives the request, so
         // simulated time cannot race socket readiness during setup.
         tokio::time::pause();
-        tokio::time::advance(budget.attempt + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(ceiling + std::time::Duration::from_secs(1)).await;
         tokio::time::resume();
     }
 
     #[tokio::test]
     async fn pull_through_registry_retries_a_stalled_read() {
-        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        use super::super::oci_pull::{LAYER_IDLE, METADATA_READ};
         use crate::pickle::upstream::UpstreamRegistry;
         for mode in ["head", "manifest", "layer"] {
             let mut fault = registry_fault(
@@ -2628,22 +3653,27 @@ mod tests {
             } else {
                 None
             };
+            let directory = tempfile::tempdir().unwrap();
+            let store = crate::pickle::store::BlobStore::new(directory.path());
             let read = tokio::spawn(async move {
                 match mode {
                     "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
                     "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
-                    _ => upstream
-                        .fetch_blob(&reference, &layer.unwrap())
-                        .await
-                        .map(|_| ()),
+                    _ => {
+                        upstream
+                            .store_blob(&reference, &layer.unwrap(), &store)
+                            .await
+                    }
                 }
             });
-            let budget = if mode == "layer" {
-                LAYER_READ
+            // A layer attempt ends when no bytes arrive for the idle
+            // deadline; a metadata attempt has a ceiling of its own.
+            let ceiling = if mode == "layer" {
+                LAYER_IDLE
             } else {
-                METADATA_READ
+                METADATA_READ.attempt
             };
-            expire_stalled_attempt(&received, budget).await;
+            expire_stalled_attempt(&received, ceiling).await;
             tokio::time::timeout(std::time::Duration::from_secs(10), read)
                 .await
                 .expect("the retry never completed")
@@ -2835,7 +3865,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_stalled_manifest_and_layer_reads_are_retried() {
-        use super::super::oci_pull::{LAYER_READ, METADATA_READ};
+        use super::super::oci_pull::{LAYER_IDLE, METADATA_READ};
         for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
             let layer = matches!(target, RegistryFaultTarget::Layer);
             let mut fault =
@@ -2847,7 +3877,15 @@ mod tests {
             let store = ImageStore::new(tmp.path().to_path_buf());
             let reference = fixture.reference.clone();
             let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
-            expire_stalled_attempt(&received, if layer { LAYER_READ } else { METADATA_READ }).await;
+            expire_stalled_attempt(
+                &received,
+                if layer {
+                    LAYER_IDLE
+                } else {
+                    METADATA_READ.attempt
+                },
+            )
+            .await;
             // The retry backs off for 1 to 1.25 s, reconnects, reads again
             // and unpacks with fsyncs. Beside F_FULLFSYNC writers and CPU
             // spinners that took 3 to 6 s, and once on a loaded host past
@@ -2909,6 +3947,29 @@ mod tests {
         assert_eq!(pulled.config.working_dir.as_deref(), Some("/etc"));
     }
 
+    /// #2412: an unpacked image keeps its set-id bits, so the tree must be
+    /// closed to other local users. A tighter store is tightened again.
+    #[tokio::test]
+    async fn the_unpacked_image_store_is_closed_to_other_local_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(store_root.join("rootfs")).unwrap();
+        std::fs::set_permissions(
+            store_root.join("rootfs"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let store = ImageStore::new(store_root.clone());
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let mode = std::fs::metadata(store_root.join("rootfs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o007, 0, "{mode:o}");
+    }
+
     #[tokio::test]
     async fn runtime_pull_shares_the_registry_physical_storage_ceiling() {
         let fixture = start_registry_fixture().await;
@@ -2928,6 +3989,121 @@ mod tests {
         assert!(!registry.base_dir().join("blobs/sha256").exists());
         let reference = ImageReference::parse(&fixture.reference).unwrap();
         assert!(!image.rootfs_path(&reference).exists());
+    }
+
+    /// #2424: the manifest says how big the layers are, so a pull that can't
+    /// fit under the storage ceiling is refused before any layer request.
+    #[tokio::test]
+    async fn a_layer_larger_than_the_storage_ceiling_is_refused_before_it_is_downloaded() {
+        let fixture = start_registry_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let registry = std::sync::Arc::new(crate::pickle::store::BlobStore::new(directory.path()));
+        registry.configure_storage_limit(1).await.unwrap();
+        let image = ImageStore::new(directory.path().to_path_buf());
+        image.set_blob_store(registry.clone()).unwrap();
+        let error = image.pull_and_unpack(&fixture.reference).await.unwrap_err();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0, "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("physical image storage quota exceeded"),
+            "{message}"
+        );
+        assert!(message.contains("1 byte"), "{message}");
+    }
+
+    /// The same refusal on the pull-through path: the layer is not requested.
+    #[tokio::test]
+    async fn a_pull_through_layer_larger_than_the_storage_ceiling_is_refused_before_it_is_downloaded()
+     {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture().await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        store.configure_storage_limit(1).await.unwrap();
+        let error = upstream
+            .store_blob(&reference, &manifest.layers[0], &store)
+            .await
+            .unwrap_err();
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0, "{error}");
+        assert!(store.list_blobs().unwrap().is_empty());
+    }
+
+    /// Let a trickled layer arrive one piece at a time, each gap inside the
+    /// idle deadline but all of them past the old 120 s ceiling on a whole
+    /// attempt, then return to real time.
+    async fn trickle_past_the_old_attempt_ceiling(received: &tokio::sync::Notify) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // One advance per piece, the first included: hyper may hold the
+        // first piece until the stream is polled again.
+        for _ in 0..TRICKLE_PIECES {
+            tokio::time::pause();
+            tokio::time::advance(TRICKLE_GAP).await;
+            tokio::time::resume();
+            // Real time for the piece to cross the socket before the next gap.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 40 s between pieces: inside the 60 s idle deadline, and the five
+    /// advances take 200 s, past the 120 s a whole attempt used to get.
+    const TRICKLE_GAP: std::time::Duration = std::time::Duration::from_secs(40);
+
+    /// #2424: a slow layer that keeps arriving is not abandoned and
+    /// requested again from byte 0.
+    #[tokio::test]
+    async fn a_layer_that_keeps_arriving_past_the_attempt_deadline_is_not_abandoned() {
+        let mut fault = registry_fault(true, StatusCode::OK, "UNUSED", 1);
+        fault.trickle = Some(TRICKLE_GAP);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let reference = fixture.reference.clone();
+        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+        trickle_past_the_old_attempt_ceiling(&received).await;
+        let pulled = tokio::time::timeout(std::time::Duration::from_secs(30), pull)
+            .await
+            .expect("the pull never completed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// The same on the pull-through path.
+    #[tokio::test]
+    async fn a_pull_through_layer_that_keeps_arriving_past_the_attempt_deadline_is_not_abandoned() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNUSED", 1);
+        fault.trickle = Some(TRICKLE_GAP);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let layer = upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::pickle::store::BlobStore::new(directory.path());
+        let read = {
+            let store = store.clone();
+            let layer = layer.clone();
+            tokio::spawn(async move { upstream.store_blob(&reference, &layer, &store).await })
+        };
+        trickle_past_the_old_attempt_ceiling(&received).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), read)
+            .await
+            .expect("the read never completed")
+            .unwrap()
+            .unwrap();
+        assert!(store.revalidate_blob(&layer.digest).unwrap());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2987,6 +4163,151 @@ mod tests {
             assert_eq!(warm.rootfs, cold.rootfs);
             assert_eq!(warm.config, cold.config);
         }
+    }
+
+    /// A cluster source that serves one image once and then fails, as the
+    /// Pickle catalogue does when there is no council leader to confirm a
+    /// read. `pull_through` picks which of the two lookups answers.
+    struct OnceThenNoLeader {
+        blobs: LocalImageBlobs,
+        pull_through: bool,
+        calls: AtomicUsize,
+    }
+
+    impl OnceThenNoLeader {
+        fn answer(&self) -> Result<Option<LocalImageBlobs>, String> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(Some(self.blobs.clone())),
+                _ => Err("no leader".into()),
+            }
+        }
+    }
+
+    impl ClusterImageSource for OnceThenNoLeader {
+        fn fetch_cluster_image<'a>(
+            &'a self,
+            _repository: &'a str,
+            _tag: &'a str,
+        ) -> ClusterFetchFuture<'a> {
+            let answer = if self.pull_through {
+                Ok(None)
+            } else {
+                self.answer()
+            };
+            Box::pin(std::future::ready(answer))
+        }
+
+        fn fetch_pull_through<'a>(&'a self, _image: &'a ImageReference) -> ClusterFetchFuture<'a> {
+            let answer = if self.pull_through {
+                self.answer()
+            } else {
+                Ok(None)
+            };
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    /// Write an image's layer, config and manifest into the blob store at
+    /// `root`, as Pickle leaves them after a peer pull or a cache fill, and
+    /// return the manifest's digest with the blobs a source hands over.
+    fn cluster_image_blobs(root: &Path) -> (String, LocalImageBlobs) {
+        let store = ImageStore::new(root.to_path_buf());
+        let write = |bytes: &[u8]| {
+            let digest = format!("sha256:{}", sha256_hex(bytes));
+            let path = store.blob_path(&digest);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            (digest, path)
+        };
+        let staging = tempfile::tempdir().unwrap();
+        let layer_file = staging.path().join("layer.tar.gz");
+        create_test_layer(&layer_file, &[("bin/app", b"cluster app")]);
+        let layer = std::fs::read(layer_file).unwrap();
+        let (layer_digest, layer_path) = write(&layer);
+        let config = br#"{"config":{"Entrypoint":["/bin/app"]}}"#;
+        let (config_digest, config_path) = write(config);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        let (manifest_digest, manifest_path) = write(&manifest);
+        let blobs = LocalImageBlobs {
+            layers: vec![layer_path],
+            config: config_path,
+            config_digest,
+            manifest: Some(LocalMetadataBlob {
+                digest: manifest_digest.clone(),
+                path: manifest_path,
+            }),
+            index: None,
+        };
+        (manifest_digest, blobs)
+    }
+
+    /// #2421: a node that unpacked a pinned cluster or pull-through image
+    /// restarts it with no leader; a pin whose local metadata was tampered
+    /// with goes back to the source.
+    #[tokio::test]
+    async fn a_warm_pinned_cluster_image_starts_without_the_cluster_source() {
+        // The pull-through image's registry is a closed loopback port: a
+        // source error falls through to a direct pull, which must fail fast
+        // and offline.
+        for (pull_through, name) in [(false, "web"), (true, "127.0.0.1:1/acme/web")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pin, blobs) = cluster_image_blobs(tmp.path());
+            let source = std::sync::Arc::new(OnceThenNoLeader {
+                blobs,
+                pull_through,
+                calls: AtomicUsize::new(0),
+            });
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            store.set_cluster_source(source.clone());
+            let reference = format!("{name}@{pin}");
+
+            let cold = store.pull_and_unpack(&reference).await.unwrap();
+            let warm = store
+                .pull_and_unpack(&reference)
+                .await
+                .unwrap_or_else(|error| panic!("pull_through={pull_through}: {error}"));
+            assert_eq!(warm.rootfs, cold.rootfs);
+            assert_eq!(warm.config, cold.config);
+            assert_eq!(source.calls.load(Ordering::SeqCst), 1, "{name}");
+
+            for file in stored_metadata(tmp.path()) {
+                std::fs::write(file, b"tampered").unwrap();
+            }
+            assert!(store.pull_and_unpack(&reference).await.is_err());
+            assert_eq!(source.calls.load(Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
+    /// A tag is never resolved locally, cluster image or not: only a digest
+    /// says which bytes are right.
+    #[tokio::test]
+    async fn a_warm_cluster_image_named_by_tag_still_asks_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, blobs) = cluster_image_blobs(tmp.path());
+        let source = std::sync::Arc::new(OnceThenNoLeader {
+            blobs,
+            pull_through: false,
+            calls: AtomicUsize::new(0),
+        });
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        store.set_cluster_source(source.clone());
+        store.pull_and_unpack("web:v1").await.unwrap();
+        assert!(store.pull_and_unpack("web:v1").await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

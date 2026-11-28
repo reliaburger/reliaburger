@@ -1,4 +1,5 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
+import datetime
 import os
 from pathlib import Path
 import re
@@ -75,6 +76,20 @@ class LocalGateTests(unittest.TestCase):
         _, ci = dry_run("ci")
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
+
+    def test_the_ci_scripts_target_runs_the_image_script_tests(self):
+        # The appliance's Python tests ran only in appliance.yml, which the
+        # merge queue never waits for; they skip cleanly off Linux (#2484).
+        recipe = re.search(r"^test-ci-scripts:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text(), re.M)
+        self.assertIsNotNone(recipe)
+        self.assertIn("discover -s image/tests", recipe.group(1))
+
+    def test_the_audit_expiry_in_the_design_doc_is_the_makefiles(self):
+        # The doc said 18 August 2026 long after the Makefile moved on (#2494).
+        expiry = re.search(r"expiry=(\d{8})", (REPO / "Makefile").read_text()).group(1)
+        when = datetime.date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:]))
+        doc = " ".join((REPO / "docs" / "design" / "test-harness.md").read_text().split())
+        self.assertIn(f"{when.day} {when:%B} {when.year}", doc)
 
     def test_make_ci_runs_the_quick_checks_before_any_build(self):
         # A format slip or an unowned #[ignore] fails in seconds, not after
@@ -502,6 +517,43 @@ class TrainAndQueueTests(unittest.TestCase):
         # for a merge group.
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
 
+    def test_the_harness_design_doc_agrees_about_fuzz_and_macos(self):
+        # The design doc kept saying decoder PRs were fuzzed and the queue ran
+        # portable macOS after 24 November moved both to nightlies (#2494).
+        doc = (REPO / "docs" / "design" / "test-harness.md").read_text()
+        fuzz_triggers = (WORKFLOWS / "fuzz.yml").read_text().split("\njobs:")[0]
+        self.assertNotIn("pull_request", fuzz_triggers)
+        self.assertNotIn("on PRs touching a decoder", doc)
+        self.assertIn("never on pull requests", doc)
+        # select-jobs.sh never picks macOS for a merge group (the test above).
+        self.assertNotIn("portable macOS included", doc)
+        self.assertIn("macos-nightly.yml", doc)
+        # macOS runs its own lint and test targets, not make lint and make test.
+        rows = {row.split("|")[1].strip(): row for row in doc.splitlines() if row.startswith("| `make ")}
+        for command in ("`make lint`", "`make test`", "`make test-doc`"):
+            with self.subTest(command=command):
+                self.assertNotIn("Linux and hosted macOS", rows[command])
+        self.assertIn("`make lint-macos`", doc)
+        self.assertIn("`make test-macos`", doc)
+        # The S3 job starts scripts/test-s3.sh's pinned binary, not a service.
+        self.assertNotIn("services:", (WORKFLOWS / "ci.yml").read_text())
+        self.assertNotIn("service container", doc)
+
+    def test_every_nightly_that_replaced_a_pull_request_job_tests_the_newest_train(self):
+        # macOS left the queue, and fuzzing and mutants left pull requests,
+        # on 24 November 2026 for nightlies. A scheduled run checks out main,
+        # so each must switch to the train itself, or train work goes
+        # untested until the gate PR merges (#2482).
+        for name in ("macos-nightly.yml", "fuzz.yml", "mutants.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text()
+                triggers = text.split("\njobs:")[0]
+                self.assertRegex(triggers, r"\n  schedule:\n(    #.*\n)*    - cron: \"[^\"]* \* \* \*\"")
+                self.assertNotIn("pull_request", triggers)
+                self.assertIn("fetch-depth: 0", text)
+                self.assertIn("git branch -r --list 'origin/release-*'", text)
+                self.assertIn("sort -V | tail -n 1", text)
+
     def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
         self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
                       self.jobs["changes"])
@@ -596,6 +648,12 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       blocks[aggregate])
         self.assertIn('--release-gate "$RELEASE_GATE"', blocks[aggregate])
+        # A ready gate PR without the label is refused there (#2483).
+        for line in ("HEAD_REF: ${{ github.event.pull_request.head.ref }}",
+                     "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+                     "DRAFT: ${{ github.event.pull_request.draft == true }}",
+                     '--head-ref "$HEAD_REF" --base-ref "$BASE_REF" --draft "$DRAFT"'):
+            self.assertIn(line, blocks[aggregate])
         # The owner check still reports when another job failed, so one red
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
@@ -803,6 +861,26 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("target/criterion", upload)
         self.assertIn("name: criterion-task-arrays", upload)
 
+    def test_pull_requests_and_merge_groups_build_the_benchmarks_with_sixteen_codegen_units(self):
+        # The release profile's one codegen unit made the workspace crate a
+        # 20-minute single-threaded build, and `benchmarks` was the merge
+        # queue's last job in 18 of 29 groups (25-27 Nov 2026, #1723). Its
+        # output is uploaded, never gated, so a group only needs it to run.
+        # Only the workspace crate changes: the dependencies keep the cache
+        # task-array benchmarks shares, and the nightly and pushes measure
+        # the release profile's code as before.
+        job = self.jobs["benchmarks"]
+        header = job.split("\n    steps:", 1)[0]
+        self.assertIn(
+            "BENCH_CARGO: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group')"
+            " && 'cargo --config profile.bench.package.reliaburger.codegen-units=16' || 'cargo' }}",
+            header)
+        for target in ("bench", "bench-large"):
+            with self.subTest(target=target):
+                self.assertRegex(job, rf'(?m)^      - run: make {target} CARGO="\$BENCH_CARGO"$')
+        self.assertNotIn("CARGO_PROFILE_", job)
+        self.assertNotIn("BENCH_CARGO", self.jobs["task-array-benchmarks"])
+
     def test_every_benchmark_target_is_run_by_a_workflow(self):
         makefile = (REPO / "Makefile").read_text()
         targets = re.findall(r"(?m)^(bench[a-z-]*):", makefile)
@@ -810,7 +888,55 @@ class BenchmarkTests(unittest.TestCase):
         workflows = "\n".join(path.read_text() for path in WORKFLOWS.glob("*.yml"))
         for target in targets:
             with self.subTest(target=target):
-                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}(?: [A-Z_]+=\S+)*$")
+
+
+def hands_the_build_back(job):
+    """Whether a job that runs cargo as root returns its build to the runner
+    after the last root step, whatever happened, so rust-cache can save it."""
+    blocks = steps(job)
+    root = [index for index, block in enumerate(blocks)
+            if "scripts/ci/as-root" in block.split("run:", 1)[-1] and "run:" in block]
+    if not root:
+        return True
+    back = [index for index, block in enumerate(blocks)
+            if 'sudo chown -R "$(id -u):$(id -g)" -- "$CARGO_HOME" target' in block
+            and "if: always()" in block]
+    return bool(back) and back[-1] > root[-1]
+
+
+class RootBuildCacheTests(unittest.TestCase):
+    """A job that runs cargo as root hands the build back before its cache
+    saves (#1723).
+
+    linux-next runs `make test-linux` as root, so the crates it unpacks under
+    $CARGO_HOME and what it writes under target/ were root's, and rust-cache's
+    post step, which runs as the runner, failed to save on main ("Permission
+    denied", run 45997532768). The job never found a cache and built every
+    dependency cold, about four of its 31 minutes, in every merge group."""
+
+    def setUp(self):
+        self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def test_every_job_that_builds_as_root_hands_the_build_back_to_its_cache(self):
+        root_jobs = [name for name, job in self.jobs.items()
+                     if "scripts/ci/as-root" in job and "Swatinem/rust-cache@" in job]
+        self.assertEqual(sorted(root_jobs), ["linux", "linux-next"])
+        for name in root_jobs:
+            with self.subTest(job=name):
+                self.assertTrue(hands_the_build_back(self.jobs[name]))
+
+    def test_a_missing_early_or_conditional_hand_back_is_detected(self):
+        job = self.jobs["linux-next"]
+        blocks = steps(job)
+        back = next(block for block in blocks if '-- "$CARGO_HOME" target' in block)
+        missing = job.replace(back, "")
+        self.assertFalse(hands_the_build_back(missing))
+        conditional = job.replace(back, back.replace("if: always()", "if: success()"))
+        self.assertFalse(hands_the_build_back(conditional))
+        tests = next(block for block in blocks if "make test-linux" in block)
+        early = job.replace(back, "").replace(tests, back + "\n" + tests)
+        self.assertFalse(hands_the_build_back(early))
 
 
 class S3Tests(unittest.TestCase):
@@ -1695,6 +1821,20 @@ class ApplianceTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, paths)
 
+    def test_the_image_tests_run_when_the_code_they_boot_changes(self):
+        # The image carries the PR's own bun and relish, and the boot, OS
+        # update and fallback tests run bun's start-up and its OS API, so a
+        # change there must build the image too (#2484). os_release.py is
+        # what the plan job calls.
+        triggers = self.text.split("\njobs:", 1)[0]
+        pull_request = triggers.split("\n  pull_request:", 1)[1]
+        paths = re.findall(r'(?m)^      - "([^"]+)"$', pull_request)
+        for path in ("src/bun/**", "src/relish/os.rs", "src/relish/image.rs",
+                     "scripts/release/os_release.py"):
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+                self.assertTrue(list(REPO.glob(path)), f"{path} matches no file")
+
     def test_every_build_checks_its_manifest_for_an_ssh_server_before_uploading(self):
         # #401: a published image has no SSH server. The check reads the
         # built image's manifest, so it must run after the build and before
@@ -1802,6 +1942,33 @@ class ApplianceTests(unittest.TestCase):
         self.assertIn("disk_from_image", boot)
 
 
+class ReleaseSmokeTests(unittest.TestCase):
+    """The Linux release `bun` runs a workload before it can be promoted.
+
+    Until #2486 the build ran only `bun --version`, and no gate ran the x86-64
+    release pair: Apple silicon runs the aarch64 bun in its VMs, and CI tests
+    debug builds made on another Ubuntu."""
+
+    def setUp(self):
+        self.build = jobs((WORKFLOWS / "build.yml").read_text())["build-binaries"]
+
+    def test_the_release_build_starts_the_linux_bun_it_built(self):
+        step = self.build.split("- name: Start the release bun and run one app")[1].split("\n      - ")[0]
+        self.assertIn("if: runner.os == 'Linux'", step)
+        self.assertIn("scripts/release/smoke-release-bun.sh", step)
+        self.assertIn("target/${{ matrix.target }}/release/bun", step)
+        self.assertIn("target/${{ matrix.target }}/release/relish", step)
+        # Before the artefacts upload, so a bun that can't run never becomes one.
+        self.assertLess(self.build.index("smoke-release-bun.sh"), self.build.index("Upload binary artifacts"))
+
+    def test_the_smoke_script_applies_an_app_and_waits_for_it_to_run(self):
+        script = (REPO / "scripts" / "release" / "smoke-release-bun.sh").read_text()
+        self.assertIn('. "${DEMO_DIR}/lib.sh"', script)
+        self.assertIn("demo_start", script)
+        self.assertIn('"${RELISH}" apply', script)
+        self.assertIn("running", script)
+
+
 class ReleaseKeyEnvironmentTests(unittest.TestCase):
     """RELIABURGER_RELEASE_KEY is a secret of the `release` environment and
     nowhere else, so a job that reads it without naming that environment
@@ -1839,6 +2006,82 @@ class DeadTriggerTests(unittest.TestCase):
         for path in sorted(WORKFLOWS.glob("*.yml")):
             with self.subTest(workflow=path.name):
                 self.assertNotIn("feat/appliance-", path.read_text())
+
+
+class ManualGateTests(unittest.TestCase):
+    """Every make target that runs ignored tests has someone who runs it (#2489).
+
+    The ignored-test owner check accepts any existing make target, so a
+    target no workflow runs and no document assigns looks owned while
+    nothing executes it.
+    """
+
+    # The union of test-upgrade-node and test-upgrade-cluster, which CI runs.
+    UNION_TARGETS = {"test-upgrade"}
+
+    def manual_table(self):
+        text = (REPO / "docs" / "testing.md").read_text()
+        start = text.index("Gates CI can't run are manual")
+        table = text[start:text.index("\n\n###", start)]
+        return {match.group(1): match.group(2) for match in
+                re.finditer(r"(?m)^\| `make ([a-z0-9-]+)`[^|]*\|[^|]*\| ([^|]+) \|$", table)}
+
+    def test_the_hollow_node_checks_have_an_owner_and_a_cadence(self):
+        row = self.manual_table().get("test-hollow")
+        self.assertIsNotNone(row, "docs/testing.md's manual gates list make test-hollow")
+        self.assertIn("maintainer", row)
+        self.assertIn("before any release", row)
+
+    def test_every_ignored_test_gate_is_run_by_a_workflow_or_a_named_person(self):
+        import ignored_owners
+        workflows = "\n".join(path.read_text() for path in sorted(WORKFLOWS.glob("*.yml")))
+        manual = self.manual_table()
+        # The evidence owners ci.yml runs through workflow_adapter.py.
+        owned, _ = ignored_owners.ci_owners(REPO)
+        for gate in sorted(ignored_owners.make_gates(REPO) - self.UNION_TARGETS):
+            with self.subTest(gate=gate):
+                in_a_workflow = gate in owned or re.search(rf"\bmake {re.escape(gate)}(?![\w-])", workflows)
+                self.assertTrue(in_a_workflow or gate in manual,
+                                f"make {gate} runs ignored tests, but no workflow runs it and "
+                                "docs/testing.md's manual gates don't say who does")
+
+class ActionPinTests(unittest.TestCase):
+    """A third-party action runs the commit we reviewed, not whatever its tag points at now (#2405).
+
+    The release build runs actions before it compiles what the candidate job
+    signs, so a moved tag would be signed and attested truthfully.
+    """
+
+    THIRD_PARTY = re.compile(r"uses:\s*([^\s#]+)")
+
+    def uses(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for line in path.read_text().splitlines():
+                match = self.THIRD_PARTY.search(line)
+                if match and not match.group(1).startswith(("actions/", "./")):
+                    yield path, line, match.group(1)
+
+    def test_every_third_party_action_is_pinned_to_a_commit(self):
+        for path, _, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_every_pin_names_its_version_for_dependabot(self):
+        # Dependabot rewrites a SHA pin and its trailing comment together.
+        for path, line, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(line, r"@[0-9a-f]{40} # \S+$")
+
+    def test_the_toolchain_action_states_its_compiler(self):
+        # Pinned to a commit, the action no longer carries the compiler in
+        # its ref, so each step names the toolchain it installs.
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for name, job in jobs(path.read_text()).items():
+                for step in steps(job):
+                    if "uses: dtolnay/rust-toolchain@" not in step:
+                        continue
+                    with self.subTest(workflow=path.name, job=name):
+                        self.assertRegex(step, r"(?m)^\s+toolchain: .+$")
 
 
 if __name__ == "__main__":

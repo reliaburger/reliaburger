@@ -1,5 +1,9 @@
 # Relish: CLI & TUI Design Document
 
+**Status:** Partly shipped. Every `relish` command here exists unless it's marked *(planned)*, and a test checks that.
+**Reconciled against:** not reconciled (§4 and §10 checked against 0.3.4, #2513)
+**Sketches:** the §4 listings marked as sketches, the planned plan and diff types in §5, the commands marked *(planned)*, §13
+
 ## 1. Overview
 
 Relish is the CLI and interactive terminal UI for Reliaburger. It's a single Rust binary that replaces five separate tools from the Kubernetes ecosystem: `kubectl` (cluster management), `k9s` (interactive TUI), `stern` (multi-instance log streaming), `kubectl-debug` (debug containers), and `terraform plan` (change previewing). Every debugging, diagnostic, configuration, and operational capability is compiled into the binary. There's nothing to install, no plugins to manage, no separate monitoring stack to query, and no shell scripts to maintain.
@@ -219,6 +223,9 @@ Connection settings come from these flags, each with an environment fallback:
 
 ### TUI State
 
+Original sketch; these types are not in the tree. The TUI's state is `TuiApp`, with the `View` enum and the fetched `ClusterData`, in `src/relish/tui/state.rs`.
+
+<!-- sketch -->
 ```rust
 /// Top-level TUI application state.
 #[derive(Debug, Clone)]
@@ -268,6 +275,9 @@ pub enum ViewKind {
 
 ### App View
 
+Original sketch; these types are not in the tree. `relish apps` builds `AppRow` and `Instances` in `src/relish/apps_cmd.rs`, and the TUI reads apps from `ClusterData` in `src/relish/tui/state.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppView {
@@ -317,6 +327,9 @@ pub struct InstanceView {
 
 ### Node View
 
+Original sketch; these types are not in the tree. `relish nodes` builds `NodeRow` in `src/relish/nodes_cmd.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {
@@ -357,6 +370,9 @@ pub enum NodeRole {
 
 ### Event Stream
 
+Original sketch; these types are not in the tree. `relish events` filters with `EventsFilter` in `src/relish/events_cmd.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -416,92 +432,11 @@ pub enum ActorSource {
 }
 ```
 
-### Plan and Diff Results
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanResult {
-    pub changes: Vec<PlanChange>,
-    pub summary: PlanSummary,
-    pub validation_errors: Vec<ValidationError>,
-    pub scheduling_preview: Vec<SchedulingDecision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanChange {
-    pub resource: String,           // e.g., "app.web", "job.cleanup"
-    pub action: PlanAction,
-    pub fields: Vec<FieldChange>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PlanAction {
-    Create,
-    Update,
-    Destroy,
-    NoChange,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldChange {
-    pub path: String,               // e.g., "image", "replicas", "env.FEATURE_FLAG"
-    pub old_value: Option<String>,
-    pub new_value: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanSummary {
-    pub to_create: u32,
-    pub to_update: u32,
-    /// Running on the cluster but absent from this config. Informational:
-    /// apply is additive and never removes; `relish stop` does.
-    pub not_in_config: u32,
-    pub unchanged: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulingDecision {
-    pub instance: String,           // e.g., "web-4"
-    pub target_node: String,        // e.g., "node-02"
-    pub constraints_satisfied: Vec<ConstraintCheck>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConstraintCheck {
-    pub constraint: String,         // e.g., "storage=ssd"
-    pub satisfied: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffResult {
-    pub drifted: Vec<DriftEntry>,
-    pub in_sync: Vec<String>,
-    pub summary: DiffSummary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftEntry {
-    pub resource: String,
-    pub fields: Vec<DriftField>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftField {
-    pub path: String,
-    pub config_value: String,
-    pub cluster_value: String,
-    pub cause: Option<String>,      // e.g., "autoscaler adjusted", "manual override"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffSummary {
-    pub drifted_count: u32,
-    pub in_sync_count: u32,
-}
-```
-
 ### Inspect Output
 
+Original sketch; these types are not in the tree. `relish inspect` takes an app name and returns an `Inspection` of its instances, one `NodeReport` per node (`src/relish/inspect.rs`).
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InspectOutput {
@@ -689,7 +624,7 @@ relish council [status]             # Every node's council view: role, epoch, te
 relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
 relish council backups --from <url>                # List sealed backups, newest first by epoch, term and index
 relish council re-enrol --data-dir <dir> [--force]  # Drop a fenced voter's Raft state to rejoin
-relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
+relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
 # Secrets
@@ -850,7 +785,7 @@ shipped CLI. **Status: planned — not yet implemented.**
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
 - `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish path`.
 - `relish identity <app>` — no workload-identity command.
-- `relish ca status | revoke`: `relish ca` has `backup`, `verify` and `rotate` only (#362).
+- `relish ca status | revoke` *(planned, #362)*: `relish ca` has `backup`, `verify` and `rotate` only.
 - `relish pickle gc` — no registry garbage-collection command.
 - `relish volume snapshot | snapshots | restore` — the real surface is `relish snapshot create | list | restore | delete`.
 - `relish completions <shell>` — no shell-completion generator (no `clap_complete`).
@@ -1080,6 +1015,91 @@ There is no `plan` subcommand. Use `relish apply <path> --dry-run` (or
 scheduling-preview and capacity-validation described in earlier drafts are not
 built — the plan diffs desired config against known state by resource and image
 only.
+
+**The original plan and diff types.** Original sketch; these types are not in the tree. `relish apply --dry-run` prints an `ApplyPlan` of `PlanEntry` rows (`src/relish/plan.rs`), and `relish diff` builds a `ConfigDiff` (`src/relish/diff.rs`).
+
+<!-- sketch -->
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub changes: Vec<PlanChange>,
+    pub summary: PlanSummary,
+    pub validation_errors: Vec<ValidationError>,
+    pub scheduling_preview: Vec<SchedulingDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanChange {
+    pub resource: String,           // e.g., "app.web", "job.cleanup"
+    pub action: PlanAction,
+    pub fields: Vec<FieldChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlanAction {
+    Create,
+    Update,
+    Destroy,
+    NoChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldChange {
+    pub path: String,               // e.g., "image", "replicas", "env.FEATURE_FLAG"
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub to_create: u32,
+    pub to_update: u32,
+    /// Running on the cluster but absent from this config. Informational:
+    /// apply is additive and never removes; `relish stop` does.
+    pub not_in_config: u32,
+    pub unchanged: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingDecision {
+    pub instance: String,           // e.g., "web-4"
+    pub target_node: String,        // e.g., "node-02"
+    pub constraints_satisfied: Vec<ConstraintCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintCheck {
+    pub constraint: String,         // e.g., "storage=ssd"
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResult {
+    pub drifted: Vec<DriftEntry>,
+    pub in_sync: Vec<String>,
+    pub summary: DiffSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftEntry {
+    pub resource: String,
+    pub fields: Vec<DriftField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftField {
+    pub path: String,
+    pub config_value: String,
+    pub cluster_value: String,
+    pub cause: Option<String>,      // e.g., "autoscaler adjusted", "manual override"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffSummary {
+    pub drifted_count: u32,
+    pub in_sync_count: u32,
+}
+```
 
 **`relish diff <path-a> [<path-b>]`**
 
@@ -1418,12 +1438,16 @@ config without an identity makes `bun --cluster` refuse and name `relish init`.
 `--development-plaintext` is the only generator of a plaintext config; such a
 cluster has no cluster registry and can't pull Docker Hub short names.
 
-**`relish join --token <token> --node-id <id> <api-address>`**
+**`relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-address>`**
 
 Contacts the current leader's agent API (normally HTTPS on port 9117), sends a
 CSR, validates and consumes the join token, and writes the returned certificate
-bundle to `--identity-dir` (default `identity`). `--ca-fingerprint sha256:...`
-pins the first exchange. The command doesn't add `[cluster].join`, copy the
+bundle, and the council's voters as `council.json`, to `--identity-dir`
+(default `identity`). `--ca-fingerprint sha256:...` pins the first exchange,
+and is required (#2410): without it the command would trust whatever root CA
+the member offered and send the token over a connection that CA vouches for.
+`--insecure-trust-first-ca` opts out by name, and prints the offered
+fingerprint as a warning before the token is sent. The command doesn't add `[cluster].join`, copy the
 cluster master key, start Bun or claim that gossip membership has converged;
 those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
 not a valid API address for this command.
@@ -1628,10 +1652,10 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 |---|---|---|
 | Deployment | `[app.*]` | `replicas`, pod template (below), rolling-update strategy |
 | DaemonSet | `[app.*]` with `replicas = "*"` | Direct equivalent |
-| StatefulSet | `[app.*]` | **Warning**: ordering guarantees and stable network IDs lost |
+| StatefulSet | `[app.*]` | **Warning**: ordering guarantees and stable network IDs lost; `volumeClaimTemplates` and each `volumeMounts[].mountPath` **warned** with the `[[app.*.volumes]]` to declare |
 | Service | Merged into the selected `[app.*]` `port` | Onion handles discovery; see the correlation rules above |
 | Ingress | `[app.*.ingress]` | First rule's host + first path only (Reliaburger is one host/path per app); extra rules/paths, non-Prefix `pathType`, `defaultBackend`, `ingressClassName` and TLS Secrets are **warned** |
-| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target`; correlated by `scaleTargetRef` |
+| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target`; correlated by `scaleTargetRef`. A first metric that isn't a resource metric (or none) becomes `cpu` at `70%` and is **warned**; later metrics and `behavior` are **warned** |
 | ConfigMap (envFrom) | `[app.*.env]` / `[job.*.env]` | Flattened, `prefix` applied, explicit `env` wins; **warned** as approximate (later ConfigMap changes don't reach it). A ConfigMap no workload reads is **warned** |
 | Secret | **Warning** | `envFrom.secretRef` and every Secret are named; re-encrypt values with `relish secret encrypt` |
 | Job | `[job.*]` | `command`+`args`, `image`, `env`, resources, namespace; `backoffLimit` → `max_attempts` (+1, capped at 10 with a warning); the pod's `activeDeadlineSeconds` → `task_timeout_secs`; the Job's own `activeDeadlineSeconds` → `task_timeout_secs` with a warning (it becomes per attempt); `completions`, `parallelism`, `completionMode`, `podFailurePolicy` **warned** |
@@ -1659,11 +1683,15 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 | `nodeSelector` | `[app.*.placement] required` (**warned** on a job) |
 | `tolerations`, `affinity`, `topologySpreadConstraints` | **Warning** (no equivalent) |
 | `volumes`, `fsGroup` | **Warning**; a `hostPath` volume gets its own |
-| `strategy.rollingUpdate.maxSurge` | `[app.*.deploy] max_surge` |
-| `strategy.rollingUpdate.maxUnavailable` | `[app.*.deploy] max_unavailable` |
+| `strategy.rollingUpdate.maxSurge` | `[app.*.deploy] max_surge` (a percentage is **warned**) |
+| `strategy.rollingUpdate.maxUnavailable` | `[app.*.deploy] max_unavailable` (a percentage is **warned**) |
+| `strategy.type: Recreate` | **Warning**: Reliaburger always rolls |
+| `startupProbe` | **Warning**, giving the `[health] initial_delay` that allows the same start-up time |
 | `terminationGracePeriodSeconds` | `[app.*] stop_grace`, clamped to 1 s to 1 h (**warned** when clamped) |
 | `lifecycle.stopSignal` | `[app.*] stop_signal` (**warned** when it isn't one Reliaburger accepts) |
 | `lifecycle.preStop.exec.command` | `[app.*] pre_stop` (**warned**: it gets its own bound, `pre_stop_timeout`, instead of sharing the grace); any other preStop handler and `postStart` are **warned** |
+
+**Every other field is reported (#2461).** The rows above are what the conversion reads. After converting a Deployment, DaemonSet, StatefulSet, Job or CronJob, and each Service, Ingress and HPA that attached to one, the importer serialises the object back to JSON and walks every field against a per-kind table of rules (`deployment_rules`, `service_rules` and so on in `src/relish/k8s_import.rs`). A rule names a field path, with `[*]`, `[0]` or `[+]` for array elements, and says the field is *read* (mapped, or reported in its own words), *ignored* (metadata, `status`, selectors, history limits: nothing to lose), or *dropped*: reported, unless its value is the Kubernetes default, with a sentence on what to do instead. The longest matching rule wins, and a field no rule covers is reported as `PATH = VALUE is not imported`, so a field Kubernetes adds later warns by default instead of vanishing. Dropped with advice: `imagePullSecrets`, `hostNetwork`/`hostPID`/`hostIPC`, a port's `hostPort`, the hardening fields of `securityContext` (`readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `runAsNonRoot`, `seccompProfile`), `imagePullPolicy` other than `IfNotPresent`, `serviceAccountName`, a Service's `type`, `nodePort`, `sessionAffinity` and headless `clusterIP: None`, and `progressDeadlineSeconds`. A container is named in a path by its name (`containers[proxy].readinessProbe`), so a sidecar's dropped probe or `securityContext` is easy to find. `every_field_of_a_full_pod_spec_is_consumed_or_reported` sets every `PodSpec` and `Container` field and checks each is read or reported.
 
 **Migration report** (printed to stderr):
 
@@ -1879,38 +1907,11 @@ All API requests use HTTP/2 with connection reuse. The mTLS handshake occurs onc
 
 ### CLI Integration Tests
 
-This is the original per-command layout. Today the CLI's integration tests live in `tests/suite/relish_cli.rs` (plus the doc snippet tests in `tests/suite/doc_snippets.rs`), and the planned files below remain a target:
+There is no `tests/cli/` directory. The CLI's tests live in three places (see `docs/testing.md`):
 
-```
-tests/
-  cli/
-    test_status.rs          # relish status output and exit codes
-    test_apply.rs           # relish apply with various configs
-    test_plan.rs            # relish plan output format, scheduling preview
-    test_diff.rs            # relish diff drift detection
-    test_compile.rs         # relish compile merge logic
-    test_lint.rs            # relish lint error detection
-    test_fmt.rs             # relish fmt idempotency
-    test_logs.rs            # relish logs streaming, filtering
-    test_events.rs          # relish events filtering, time ranges
-    test_path.rs            # relish path step-by-step output
-    test_inspect.rs         # relish inspect resource types
-    test_wtf.rs             # relish wtf correlation logic
-    test_exec.rs            # relish exec, debug containers
-    test_top.rs             # relish top output format
-    test_history.rs         # relish history audit trail
-    test_firewall.rs        # relish firewall rule display, test
-    test_resolve.rs         # relish resolve service map query
-    test_route.rs           # relish route ingress display
-    test_secret.rs          # relish secret encrypt/rotate
-    test_token.rs           # relish token create/list/rotate/revoke
-    test_snapshot.rs        # relish snapshot create/list/restore/delete
-    test_upgrade.rs         # relish upgrade check/plan/start/status
-    test_fault.rs           # relish fault injection commands
-    test_test.rs            # relish test (meta-test)
-    test_bench.rs           # relish bench output format
-    test_global_flags.rs    # --output, --namespace, --cluster, --no-colour
-```
+- **Unit tests** beside each command in `src/relish/` (for example `src/relish/apps_cmd.rs`, `src/relish/plan.rs`, `src/relish/inspect.rs`), in a `#[cfg(test)] mod tests` at the bottom of the file.
+- **Snapshot tests** with `insta` for rendered output, such as tables and TUI frames; the snapshots sit in `src/relish/snapshots/` and `src/relish/tui/snapshots/`.
+- **Integration tests** in the portable `tests/suite/` binary: `tests/suite/relish_cli.rs` runs the real `relish`, and `tests/suite/doc_snippets.rs` checks that every `relish` command in the manual and this document parses.
 
 **Local-only command tests** (`compile`, `lint`, `fmt`) run without a cluster. They use fixture TOML files in `tests/fixtures/` and verify output against expected snapshots.
 

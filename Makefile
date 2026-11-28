@@ -3,7 +3,7 @@
 CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
-COVERAGE_MIN_LINES ?= 78.65
+COVERAGE_MIN_LINES ?= 87.60
 # Crash-recovery tests SIGKILL instrumented Bun, owner and workload processes
 # on purpose; one killed while it writes its profile at exit leaves a
 # truncated .profraw. Skip unreadable profiles with a warning instead of
@@ -91,8 +91,8 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E '(binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos))'
 
-test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
-	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
+test-hollow: ## Run the 20-node hollow-node harness check (#1401), the 100-node, 1,000-app summary budget and the 500-worker report storm (#1411); measured fleets run through scripts/release/qualify-hollow-nodes.sh
+	$(NEXTEST) --run-ignored=only -E '(binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))) | (binary(reporting_tcp) & test(five_hundred_workers))'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -134,8 +134,8 @@ test-gym-user: ## Test `relish gym run` on a throwaway local cluster (#1683): th
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
-test-s3: ## Export logs and round-trip a council backup through a throwaway local S3 server, or a real bucket with RELIABURGER_TEST_S3_URL=s3://bucket/prefix and AWS credentials
-	scripts/test-s3.sh $(NEXTEST) --lib --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3)'
+test-s3: ## Export logs, round-trip a council backup and interrupt a volume-snapshot upload through a throwaway local S3 server, or a real bucket with RELIABURGER_TEST_S3_URL=s3://bucket/prefix and AWS credentials
+	scripts/test-s3.sh $(NEXTEST) --lib --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3) | test(=bun::snapshot_worker::tests::an_interrupted_s3_upload_restarts_cleanly)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check
@@ -177,10 +177,11 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 outdated: ## Report crates that cargo update would move and those a major version behind (never fails)
 	-$(CARGO) update --dry-run --verbose
 
-bench: ## Run reproducible transport and 5-250 node gossip benchmarks, the 1k and 10k node scheduling pass, and policy evaluation for 10-1,000 policies
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks, the 1k and 10k node scheduling pass, policy evaluation for 10-1,000 policies and the ingress drain tracker
 	$(CARGO) bench --bench gossip
 	$(CARGO) bench --bench scheduler
 	$(CARGO) bench --bench policy
+	$(CARGO) bench --bench wrapper_drains
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
@@ -229,12 +230,13 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, and the website's agent recordings
+test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, the website's agent recordings and the appliance image's scripts
 	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 	python3 -m unittest discover -s scripts/gym -p 'test_*.py'
 	python3 -m unittest discover -s scripts/record -p 'test_*.py'
+	python3 -m unittest discover -s image/tests -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons

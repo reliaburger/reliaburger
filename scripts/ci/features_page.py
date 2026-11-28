@@ -9,7 +9,13 @@ page and checks that the two stay honest:
     features_page.py check          the TOML's schema, its docs links, and a
                                     page that matches it
     features_page.py check-issues   ask GitHub that every linked issue is
-                                    still open (needs gh, and GH_TOKEN in CI)
+                                    still open, and that every open issue a
+                                    row's restrictions cite is linked (needs
+                                    gh, and GH_TOKEN in CI)
+    features_page.py check-closing N...
+                                    fail if a row links one of these issues,
+                                    the ones a pull request into main will
+                                    close (features.yml passes them)
 
 `make features-page` runs `write`. The page's Markdown copy,
 docs/website/features.md, comes from `make agent-docs` like every other
@@ -20,6 +26,7 @@ scripts/ci/test_features_page.py.
 """
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 import html
 from pathlib import Path
 import re
@@ -56,6 +63,8 @@ FEATURE_REQUIRED = {"name", "status", "summary", "docs", "evidence", "issues", "
 FEATURE_OPTIONAL = {"since", "milestone", "needs_maintainer"}
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 CODE_SPAN = re.compile(r"`([^`]+)`")
+ISSUE_REFERENCE = re.compile(r"#(\d+)\b")
+DATE_FORMAT = "%d %B %Y"
 
 
 class SchemaError(Exception):
@@ -120,6 +129,8 @@ def load(text):
     _expect(VERSION.fullmatch(release), f"release {release!r} isn't a version like 0.2.7")
     released = _string(data, "released", "top level")
     reviewed = _string(data, "reviewed", "top level")
+    for key, value in (("released", released), ("reviewed", reviewed)):
+        _expect(_date(value) is not None, f"{key} {value!r} isn't a date like 7 November 2026")
     milestones = data.get("milestones")
     _expect(isinstance(milestones, dict) and milestones, "`[milestones]` is missing")
     for title, number in milestones.items():
@@ -200,13 +211,27 @@ def _feature(group_id, row, milestones):
     )
 
 
+def _date(text):
+    try:
+        return datetime.strptime(text, DATE_FORMAT).date()
+    except ValueError:
+        return None
+
+
 def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
 def check_versions(catalogue):
-    """A built feature can't have shipped after the release the page describes."""
+    """A built feature can't have shipped after the release the page describes,
+    and the rows can't have been reviewed before that release came out: the
+    page says every row is revisited after each release."""
     problems = []
+    if _date(catalogue.reviewed) < _date(catalogue.released):
+        problems.append(
+            f"reviewed {catalogue.reviewed!r} is before {catalogue.release} was released "
+            f"({catalogue.released}); re-read the rows and move `reviewed`"
+        )
     for feature in catalogue.features():
         if feature.since and version_key(feature.since) > version_key(catalogue.release):
             problems.append(
@@ -438,18 +463,56 @@ def issue_state(number):
 
 def check_issues(catalogue, state=issue_state):
     """Every issue a row links is still open: a known issue that closed has
-    been fixed, and a planned row whose issue closed is either built or gone."""
+    been fixed, and a planned row whose issue closed is either built or gone.
+    An open issue a row's restrictions cite must be linked too, or the page
+    says "None open" beside it and nothing notices when it closes. A closed
+    one cited as history is fine."""
     problems = []
     states = {}
+
+    def known(number):
+        if number not in states:
+            states[number] = state(number)
+        return states[number]
+
     for feature in catalogue.features():
         for number in feature.issues:
-            if number not in states:
-                states[number] = state(number)
-            if states[number] != "OPEN":
+            if known(number) != "OPEN":
                 problems.append(
                     f"{feature.group}: {feature.name!r} links #{number}, which is {states[number].lower()}"
                 )
+        cited = sorted({int(n) for n in ISSUE_REFERENCE.findall(feature.restrictions)} - set(feature.issues))
+        for number in cited:
+            if known(number) == "OPEN":
+                problems.append(
+                    f"{feature.group}: {feature.name!r} cites open #{number} in its restrictions; "
+                    "add it to `issues`"
+                )
     return problems
+
+
+def closing(catalogue, fixes):
+    """Rows that link an issue in `fixes`, the issues a pull request into main
+    will close. Merged as it is, the nightly check-issues on main would fail
+    the next day (#2492), so the row has to change on the branch first."""
+    return [
+        f"{feature.group}: {feature.name!r} links #{number}, which this pull request closes; "
+        "update the row before it merges"
+        for feature in catalogue.features()
+        for number in feature.issues
+        if number in fixes
+    ]
+
+
+def parse_issue_numbers(words):
+    """Issue numbers from the command line, written `405` or `#405`."""
+    numbers = set()
+    for word in words:
+        digits = word.removeprefix("#")
+        if not digits.isdigit():
+            raise ValueError(f"{word!r} isn't an issue number")
+        numbers.add(int(digits))
+    return numbers
 
 
 # --- Command line -------------------------------------------------------------
@@ -472,7 +535,8 @@ def check(repo=REPO):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=["write", "check", "check-issues"])
+    parser.add_argument("command", choices=["write", "check", "check-issues", "check-closing"])
+    parser.add_argument("issues", nargs="*", help="check-closing: the issues a pull request closes")
     args = parser.parse_args(argv)
     if args.command == "write":
         catalogue = load((REPO / SOURCE).read_text(encoding="utf-8"))
@@ -485,6 +549,12 @@ def main(argv=None):
         return 0
     if args.command == "check":
         problems = check()
+    elif args.command == "check-closing":
+        try:
+            fixes = parse_issue_numbers(args.issues)
+        except ValueError as error:
+            parser.error(str(error))
+        problems = closing(load((REPO / SOURCE).read_text(encoding="utf-8")), fixes)
     else:
         problems = check_issues(load((REPO / SOURCE).read_text(encoding="utf-8")))
     if problems:

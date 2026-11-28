@@ -370,8 +370,19 @@ pub struct IngressSection {
     pub tls_cert: Option<PathBuf>,
     /// TLS private key PEM path.
     pub tls_key: Option<PathBuf>,
-    /// Maximum concurrent proxied connections.
+    /// Maximum requests in flight at once; a request past it gets 503.
+    /// This counts requests, not open connections.
     pub max_connections: usize,
+    /// Largest request body the ingress forwards; a larger one gets 413.
+    pub max_request_body_bytes: usize,
+    /// Bytes every request body being buffered may hold between them; a
+    /// request whose body won't fit in what is left gets 503.
+    pub request_body_budget_bytes: usize,
+    /// Connections the HTTP and HTTPS listeners hold open between them; a
+    /// connection past it is closed at once.
+    pub max_open_connections: usize,
+    /// TLS handshakes one client address may have in progress at once.
+    pub max_tls_handshakes_per_source: usize,
 }
 
 impl Default for IngressSection {
@@ -383,6 +394,10 @@ impl Default for IngressSection {
             tls_cert: None,
             tls_key: None,
             max_connections: 10_000,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            request_body_budget_bytes: 256 * 1024 * 1024,
+            max_open_connections: 32_768,
+            max_tls_handshakes_per_source: 16,
         }
     }
 }
@@ -410,6 +425,10 @@ impl IngressSection {
             http_port: self.http_port,
             https_port: self.https_port,
             max_connections: self.max_connections,
+            max_request_body_bytes: self.max_request_body_bytes,
+            request_body_budget_bytes: self.request_body_budget_bytes,
+            max_open_connections: self.max_open_connections,
+            max_tls_handshakes_per_source: self.max_tls_handshakes_per_source,
             tls_cert_path: self.tls_cert.clone(),
             tls_key_path: self.tls_key.clone(),
             ..crate::wrapper::types::WrapperConfig::default()
@@ -726,6 +745,39 @@ impl Default for ClusterSection {
     }
 }
 
+/// Longest node name: one DNS label. Gossip's sync datagrams, SPIFFE ids
+/// and file paths all carry the name, and the UDP budget assumes this much.
+pub const MAX_NODE_NAME_BYTES: usize = 63;
+
+/// Whether `name` is a valid node name: one DNS label of 1 to 63 bytes,
+/// lowercase ASCII letters, digits and `-`, not starting or ending with
+/// `-` (#2394).
+pub fn is_valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NODE_NAME_BYTES
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+impl NodeSection {
+    /// Refuse a `name` that isn't one DNS label. An unset name is fine:
+    /// Bun uses `node-<gossip_port>`.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        match &self.name {
+            Some(name) if !is_valid_node_name(name) => {
+                Err(super::error::ConfigError::InvalidValue {
+                    field: "node.name".to_string(),
+                    value: name.clone(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl ClusterSection {
     /// Validate the cluster name used as the SPIFFE trust domain.
     pub fn validate(&self) -> Result<(), super::error::ConfigError> {
@@ -886,8 +938,8 @@ pub const MAX_STALE_REPORT_TIMEOUT_SECS: u64 = 86_400;
 
 /// Reporting tree configuration.
 ///
-/// Controls how often worker nodes send state reports to their assigned
-/// council member, and when reports are considered stale.
+/// Controls how often nodes send state reports to the leader, and when
+/// reports are considered stale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReportingTreeSection {
@@ -990,6 +1042,11 @@ impl ReconstructionSection {
 pub struct ImagesSection {
     /// Maximum storage for image blobs (e.g. "50Gi"). 0 means unlimited.
     pub max_storage: String,
+    /// Maximum number of files the image store holds: blobs, their upload
+    /// receipts (two files per pushed blob) and uploads in progress. It
+    /// applies with or without `max_storage`, because a byte ceiling can't
+    /// bound empty uploads or tiny receipts.
+    pub max_files: usize,
     /// Number of replicas for each layer (including the original pusher).
     pub redundancy: u32,
     /// Days an untagged image is kept before it expires: a manifest whose
@@ -1181,6 +1238,7 @@ impl Default for ImagesSection {
     fn default() -> Self {
         Self {
             max_storage: "0".to_string(),
+            max_files: 65_536,
             redundancy: 2,
             gc_retain_days: 7,
             gc_interval_hours: 1,
@@ -1460,6 +1518,13 @@ mod tests {
     }
 
     #[test]
+    fn images_max_files_defaults_to_65536_and_can_be_raised() {
+        assert_eq!(NodeConfig::parse("").unwrap().images.max_files, 65_536);
+        let raised = NodeConfig::parse("[images]\nmax_files = 1000000\n").unwrap();
+        assert_eq!(raised.images.max_files, 1_000_000);
+    }
+
+    #[test]
     fn logs_and_metrics_have_a_default_storage_cap() {
         let config = NodeConfig::parse("").unwrap();
         assert_eq!(config.logs.max_storage_mb, DEFAULT_LOG_STORAGE_MB);
@@ -1709,6 +1774,39 @@ mod tests {
         assert!(wc.tls_cert_path.is_none());
     }
 
+    /// #2381: an operator can lower the body cap and the shared body budget.
+    #[test]
+    fn ingress_section_sets_the_request_body_limits() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ingress]
+            max_request_body_bytes = 65536
+            request_body_budget_bytes = 1048576
+        "#,
+        )
+        .unwrap();
+        let wc = nc.ingress.to_wrapper_config();
+        assert_eq!(wc.max_request_body_bytes, 65_536);
+        assert_eq!(wc.request_body_budget_bytes, 1_048_576);
+    }
+
+    /// #2383: the connection cap and the per-source handshake share are
+    /// node settings.
+    #[test]
+    fn ingress_section_sets_the_connection_limits() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ingress]
+            max_open_connections = 2048
+            max_tls_handshakes_per_source = 4
+        "#,
+        )
+        .unwrap();
+        let wc = nc.ingress.to_wrapper_config();
+        assert_eq!(wc.max_open_connections, 2048);
+        assert_eq!(wc.max_tls_handshakes_per_source, 4);
+    }
+
     #[test]
     fn ingress_rejects_incomplete_explicit_certificate_pair() {
         for toml in [
@@ -1878,6 +1976,46 @@ mod tests {
             let mut invalid = NodeConfig::default();
             invalid.cluster.name = name.to_string();
             assert!(invalid.cluster.validate().is_err(), "accepted {name:?}");
+        }
+    }
+
+    fn node_name_error(name: &str) -> Option<super::super::error::ConfigError> {
+        let quoted = toml::Value::String(name.to_string()).to_string();
+        let config = NodeConfig::parse(&format!("[node]\nname = {quoted}")).unwrap();
+        config.validate().err()
+    }
+
+    #[test]
+    fn a_node_name_longer_than_a_dns_label_is_refused() {
+        // Gossip sync datagrams and SPIFFE ids assume a name of at most 63
+        // bytes (#2394).
+        let error = node_name_error(&"a".repeat(64)).expect("64 bytes accepted");
+        assert!(
+            matches!(&error, super::super::error::ConfigError::InvalidValue { field, .. }
+                if field == "node.name"),
+            "{error:?}"
+        );
+        assert!(node_name_error(&"a".repeat(63)).is_none());
+    }
+
+    #[test]
+    fn a_node_name_with_a_control_character_is_refused() {
+        for name in [
+            "node\n1",
+            "node\u{7f}",
+            "",
+            "Node-1",
+            "node_1",
+            "-node",
+            "node-",
+            "node.example",
+            "node 1",
+        ] {
+            let error = node_name_error(name).unwrap_or_else(|| panic!("accepted {name:?}"));
+            assert!(error.to_string().contains("node.name"), "{name:?}: {error}");
+        }
+        for name in ["node-1", "home-2", "w1", "0"] {
+            assert!(node_name_error(name).is_none(), "refused {name:?}");
         }
     }
 

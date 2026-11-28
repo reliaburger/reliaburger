@@ -5,7 +5,7 @@
 //! a different schema that includes node identity and aggregate columns
 //! (min, max, sum, count) instead of a single value.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -15,11 +15,14 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 
-use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
+use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow, RollupReporter};
 use super::scan::{
-    ParquetSource, ParquetTable, list_local, list_local_off_runtime, streaming_session,
+    ParquetSource, ParquetTable, SourceIndex, batch_time_range, list_local, list_local_off_runtime,
+    streaming_session,
 };
-use super::store::{dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet};
+use super::store::{
+    ALL_QUERY_ROW_LIMIT, dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet,
+};
 use super::types::MayoError;
 
 /// Cap on un-flushed buffered rollup rows. A council member receives rollups
@@ -89,8 +92,9 @@ struct BufferedRollup {
 /// Cluster-wide queries are evaluated against this store rather than
 /// fanning out to every worker node.
 pub struct RollupStore {
-    /// In-memory buffer of un-flushed rollup entries.
-    buffer: Vec<BufferedRollup>,
+    /// In-memory buffer of un-flushed rollup entries, oldest first. A ring
+    /// buffer, so shedding the oldest moves nothing (#2450).
+    buffer: VecDeque<BufferedRollup>,
     /// Directory for Parquet files.
     data_dir: PathBuf,
     /// Counter for unique Parquet file names. Seeded past any existing files so
@@ -100,10 +104,73 @@ pub struct RollupStore {
     /// worker re-sends the same window after reassignment (extended backfill),
     /// so the aggregator must ingest each `(node, window)` exactly once or the
     /// cluster sum double-counts (OBS2). Pruned to stay bounded.
-    seen_windows: HashSet<(String, u64)>,
+    seen_windows: HashSet<(String, u64, u16)>,
+    /// `(node_id, window)` keys found flushed on disk at startup. The files
+    /// don't record which part a row came from, so any part of such a
+    /// window is taken as already ingested: a part straddling a restart is
+    /// lost rather than counted twice.
+    hydrated_windows: HashSet<(String, u64)>,
     /// Newest window timestamp seen, used as the anchor for pruning
     /// `seen_windows` (kept off the wall clock for determinism).
     newest_window: u64,
+    /// The newest window each node has sent, duplicates included: a cluster
+    /// query names a node that stopped reporting (#2536). One entry per
+    /// node that ever reported.
+    last_windows: HashMap<String, u64>,
+    /// Each Parquet file's time range, so a query skips the files outside
+    /// its window without reading their footers (#2425).
+    index: SourceIndex,
+    /// The most unflushed rows kept: [`MAX_BUFFER_ROWS`], smaller in tests.
+    max_buffer_rows: usize,
+    /// Rows frozen for a flush being written outside the store lock, kept
+    /// until their file is written (#2443).
+    pending: Option<RollupPendingFlush>,
+    /// Parks each query of a snapshot this store hands out, so a test can
+    /// check what a caller holds while its query runs (#2530).
+    #[cfg(test)]
+    query_gate: Option<Arc<super::store::QueryGate>>,
+}
+
+/// A batch of rollups frozen for one flush, written with
+/// [`write_rollup_pending`] while the store goes on taking rollups.
+#[derive(Clone)]
+pub struct RollupPendingFlush {
+    data_dir: PathBuf,
+    path: PathBuf,
+    batch: RecordBatch,
+}
+
+/// Write `pending`'s Parquet file. Needs no store lock: the store keeps the
+/// rows until [`RollupStore::complete_flush`], and a failed write leaves
+/// them to be retried.
+pub async fn write_rollup_pending(pending: &RollupPendingFlush) -> Result<(), MayoError> {
+    tokio::fs::create_dir_all(&pending.data_dir)
+        .await
+        .map_err(MayoError::Io)?;
+    let path = pending.path.clone();
+    let batch = pending.batch.clone();
+    // Move the write off the async runtime. `spawn_blocking` runs the
+    // closure on tokio's blocking pool and hands back its result; the outer
+    // `?` on `.await` surfaces a join error, the inner one the write error.
+    tokio::task::spawn_blocking(move || write_batch_parquet(&path, &batch))
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+}
+
+/// Flush a shared store without holding its lock during the write: the
+/// lock is taken only to freeze the batch and to drop it once written, so
+/// the aggregator's ingest and every query go on meanwhile (#2443). At
+/// most two batches: a retried one, then the current buffer.
+pub async fn flush_off_lock(store: &tokio::sync::RwLock<RollupStore>) -> Result<(), MayoError> {
+    for _ in 0..2 {
+        let pending = store.write().await.take_flush_batch()?;
+        let Some(pending) = pending else {
+            break;
+        };
+        write_rollup_pending(&pending).await?;
+        store.write().await.complete_flush(&pending);
+    }
+    Ok(())
 }
 
 impl RollupStore {
@@ -115,12 +182,25 @@ impl RollupStore {
     pub fn new(data_dir: PathBuf) -> Self {
         let flush_counter = next_flush_counter(&data_dir, "rollup");
         Self {
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             data_dir,
             flush_counter,
             seen_windows: HashSet::new(),
+            hydrated_windows: HashSet::new(),
             newest_window: 0,
+            last_windows: HashMap::new(),
+            index: SourceIndex::default(),
+            max_buffer_rows: MAX_BUFFER_ROWS,
+            pending: None,
+            #[cfg(test)]
+            query_gate: None,
         }
+    }
+
+    /// Park every query of this store's later snapshots at `gate`.
+    #[cfg(test)]
+    pub(crate) fn set_query_gate(&mut self, gate: Arc<super::store::QueryGate>) {
+        self.query_gate = Some(gate);
     }
 
     /// Seed the idempotency tracker from Parquet already on disk (M17).
@@ -145,13 +225,13 @@ impl RollupStore {
             .flatten()
             .map_or(0, |newest| newest.saturating_sub(IDEMPOTENCY_HORIZON_SECS));
         let ctx = self.session().await?;
-        let df = ctx
+        // Startup work, not a caller's query: no deadline.
+        let batches = ctx
             .sql(&format!(
                 "SELECT DISTINCT node_id, timestamp FROM rollups WHERE timestamp >= {cutoff}"
             ))
             .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-        let batches = df
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?
             .collect()
             .await
             .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
@@ -172,25 +252,35 @@ impl RollupStore {
             for i in 0..batch.num_rows() {
                 let window = windows.value(i);
                 self.newest_window = self.newest_window.max(window);
-                self.seen_windows
+                self.note_window(nodes.value(i), window);
+                self.hydrated_windows
                     .insert((nodes.value(i).to_string(), window));
             }
         }
         // Keep the seeded set bounded to the idempotency horizon.
         let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
-        self.seen_windows.retain(|(_, window)| *window >= cutoff);
+        self.hydrated_windows
+            .retain(|(_, window)| *window >= cutoff);
         Ok(())
     }
 
     /// Ingest a `NodeRollup` into the buffer.
     ///
-    /// Idempotent per `(node_id, window)`: a window already ingested this
+    /// Idempotent per `(node_id, window, part)`: a part already ingested this
     /// lifetime is dropped, so a re-sent rollup (worker reassignment backfill)
     /// never double-counts. Returns `true` if the rollup was ingested, `false`
     /// if it was a duplicate.
     pub fn ingest(&mut self, rollup: &NodeRollup) -> bool {
         let node_id = rollup.node_id.0.clone();
-        let key = (node_id.clone(), rollup.timestamp);
+        // A re-sent window still shows the node is reporting.
+        self.note_window(&node_id, rollup.timestamp);
+        if self
+            .hydrated_windows
+            .contains(&(node_id.clone(), rollup.timestamp))
+        {
+            return false;
+        }
+        let key = (node_id.clone(), rollup.timestamp, rollup.part);
         if !self.seen_windows.insert(key) {
             return false;
         }
@@ -203,13 +293,15 @@ impl RollupStore {
         self.newest_window = self.newest_window.max(rollup.timestamp);
         if self.seen_windows.len() > MAX_SEEN_WINDOWS {
             let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
-            self.seen_windows.retain(|(_, window)| *window >= cutoff);
+            self.seen_windows.retain(|(_, window, _)| *window >= cutoff);
+            self.hydrated_windows
+                .retain(|(_, window)| *window >= cutoff);
         }
 
         for entry in &rollup.entries {
             let labels_json =
                 serde_json::to_string(&entry.labels).unwrap_or_else(|_| "{}".to_string());
-            self.buffer.push(BufferedRollup {
+            self.buffer.push_back(BufferedRollup {
                 timestamp: rollup.timestamp,
                 node_id: node_id.clone(),
                 metric_name: entry.metric_name.clone(),
@@ -223,16 +315,44 @@ impl RollupStore {
 
         // Bound the buffer: drop the oldest rows if a stuck flush let it grow
         // past the cap.
-        if self.buffer.len() > MAX_BUFFER_ROWS {
-            let overflow = self.buffer.len() - MAX_BUFFER_ROWS;
-            self.buffer.drain(0..overflow);
-        }
+        let reserved = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.batch.num_rows());
+        let available = self.max_buffer_rows.saturating_sub(reserved);
+        while self.buffer.len() > available && self.buffer.pop_front().is_some() {}
         true
+    }
+
+    /// The newest window this aggregator holds from each node that has
+    /// reported to it, flushed or not (#2536).
+    pub fn reporters(&self) -> Vec<RollupReporter> {
+        self.last_windows
+            .iter()
+            .map(|(node_id, last_window)| RollupReporter {
+                node_id: node_id.clone(),
+                last_window: *last_window,
+            })
+            .collect()
+    }
+
+    /// Record that `node_id` sent the window starting at `window`.
+    fn note_window(&mut self, node_id: &str, window: u64) {
+        match self.last_windows.get_mut(node_id) {
+            Some(last) => *last = (*last).max(window),
+            None => {
+                self.last_windows.insert(node_id.to_string(), window);
+            }
+        }
     }
 
     /// Number of un-flushed entries in the buffer.
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
+            + self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.batch.num_rows())
     }
 
     /// Convert the buffer to an Arrow RecordBatch.
@@ -268,50 +388,242 @@ impl RollupStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer: convert to a RecordBatch and persist it to Parquet.
-    ///
-    /// The batch is written on a blocking thread (`spawn_blocking`) so the
-    /// synchronous Arrow/Parquet encode never stalls the async runtime (OBS5).
-    /// Once on disk the rows are dropped from memory; queries read them back
-    /// from the Parquet directory, so a restart recovers all history and
-    /// memory stays bounded to the buffer.
+    /// Flush the buffer to Parquet, holding the store throughout: at most
+    /// a retried pending batch, then the current buffer. Callers that share
+    /// the store behind a lock use [`flush_off_lock`] instead, so queries and
+    /// ingest go on during the write (#2443).
     pub async fn flush(&mut self) -> Result<(), MayoError> {
-        let batch = self.buffer_to_batch()?;
-        let Some(batch) = batch else {
-            return Ok(());
-        };
-
-        let filename = format!("rollup_{:06}.parquet", self.flush_counter);
-        let path = self.data_dir.join(filename);
-        tokio::fs::create_dir_all(&self.data_dir)
-            .await
-            .map_err(MayoError::Io)?;
-
-        // Move the write off the async runtime. `spawn_blocking` runs the
-        // closure on tokio's blocking pool and hands back its result; the
-        // outer `?` on `.await` surfaces a join error, the inner one the
-        // write error.
-        tokio::task::spawn_blocking(move || write_batch_parquet(&path, &batch))
-            .await
-            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
-
-        self.buffer.clear();
-        self.flush_counter += 1;
+        for _ in 0..2 {
+            let Some(pending) = self.take_flush_batch()? else {
+                break;
+            };
+            write_rollup_pending(&pending).await?;
+            self.complete_flush(&pending);
+        }
         Ok(())
     }
 
-    /// Build a DataFusion session exposing a `rollups` table over all data: the
-    /// Parquet files unioned with the unflushed buffer, streamed per query and
-    /// pruned by each query's time and metric-name predicates (#377), so a
-    /// cluster query reads the files its window touches, not every one.
+    /// Freeze the buffer into a batch for a flush written outside the store
+    /// lock, or hand back the batch an earlier flush failed to write, so it
+    /// is retried before newer rows. The rows stay queryable, from memory,
+    /// until [`complete_flush`](Self::complete_flush). `None` when there is
+    /// nothing to write.
+    pub fn take_flush_batch(&mut self) -> Result<Option<RollupPendingFlush>, MayoError> {
+        if let Some(pending) = &self.pending {
+            return Ok(Some(pending.clone()));
+        }
+        let Some(batch) = self.buffer_to_batch()? else {
+            return Ok(None);
+        };
+        let filename = format!("rollup_{:06}.parquet", self.flush_counter);
+        let path = self.data_dir.join(filename);
+        if let Some(range) = batch_time_range(&batch) {
+            self.index.record(path.display().to_string(), range);
+        }
+        self.flush_counter += 1;
+        self.buffer.clear();
+        let pending = RollupPendingFlush {
+            data_dir: self.data_dir.clone(),
+            path,
+            batch,
+        };
+        self.pending = Some(pending.clone());
+        Ok(Some(pending))
+    }
+
+    /// Forget `flushed` once its file is written: queries read it from disk
+    /// from now on.
+    pub fn complete_flush(&mut self, flushed: &RollupPendingFlush) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.path == flushed.path)
+        {
+            self.pending = None;
+        }
+    }
+
+    /// What one query reads, captured now: the Parquet files and the
+    /// unflushed rollups. Query it after releasing the store's lock, so a
+    /// slow query never holds up the aggregator's ingest or a flush (#2443,
+    /// #2449):
+    ///
+    /// ```ignore
+    /// let snapshot = rollups.read().await.snapshot().await?;
+    /// let rows = snapshot.query_cluster_metric("cpu", start, end).await?;
+    /// ```
+    ///
+    /// The rollups table is streamed per query and pruned by each query's
+    /// time and metric-name predicates (#377), so a cluster query reads the
+    /// files its window touches, not every one.
+    pub async fn snapshot(&self) -> Result<RollupSnapshot, MayoError> {
+        let mut sources = list_local_off_runtime(&self.data_dir).await?;
+        let mut memory: Vec<RecordBatch> = self.buffer_to_batch()?.into_iter().collect();
+        if let Some(pending) = &self.pending {
+            // A pending batch is read from memory until its flush completes,
+            // even if its file has just appeared, so no row is read twice.
+            sources.retain(
+                |source| !matches!(source, ParquetSource::Local(path) if *path == pending.path),
+            );
+            memory.push(pending.batch.clone());
+        }
+        let memory = match memory.len() {
+            0 => None,
+            1 => memory.pop(),
+            _ => Some(
+                datafusion::arrow::compute::concat_batches(&Arc::new(rollup_schema()), &memory)
+                    .map_err(|error| MayoError::Arrow(error.to_string()))?,
+            ),
+        };
+        Ok(RollupSnapshot {
+            sources: Arc::new(sources),
+            memory,
+            index: self.index.clone(),
+            #[cfg(test)]
+            query_gate: self.query_gate.clone(),
+        })
+    }
+
     async fn session(&self) -> Result<SessionContext, MayoError> {
+        self.snapshot().await?.session()
+    }
+
+    /// See [`RollupSnapshot::query_sql`].
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot().await?.query_sql(sql).await
+    }
+
+    /// See [`RollupSnapshot::query_owned_rows`].
+    pub async fn query_owned_rows(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<OwnedRollupRow>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_owned_rows(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::query_owned_page`].
+    pub async fn query_owned_page(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<OwnedRowsPage, MayoError> {
+        self.snapshot()
+            .await?
+            .query_owned_page(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::query_cluster_metric`].
+    pub async fn query_cluster_metric(
+        &self,
+        metric_name: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_cluster_metric(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::query_all`].
+    pub async fn query_all(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        self.snapshot().await?.query_all(start, end).await
+    }
+
+    /// See [`RollupSnapshot::query_cluster_aggregates`].
+    pub async fn query_cluster_aggregates(
+        &self,
+        metric_name: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ClusterAggregate>, MayoError> {
+        self.snapshot()
+            .await?
+            .query_cluster_aggregates(metric_name, start, end)
+            .await
+    }
+
+    /// See [`RollupSnapshot::metric_names`].
+    pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
+        self.snapshot().await?.metric_names().await
+    }
+
+    /// Prune Parquet files whose newest datapoint is older than `before`.
+    ///
+    /// Keyed on the data's own newest timestamp (O12), read from row-group
+    /// statistics, not the file's mtime — the rollup schema shares the
+    /// leading `timestamp` column, so `store::file_max_timestamp` applies.
+    ///
+    /// Opening every file's footer is slow on a slow disk, so the scan runs
+    /// on a blocking thread (#1417).
+    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
+        let data_dir = self.data_dir.clone();
+        let index = self.index.clone();
+        tokio::task::spawn_blocking(move || {
+            super::store::prune_directory(&data_dir, before, None, &index)
+        })
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Prune rollups older than `retention`, measured back from `now`.
+    ///
+    /// A thin convenience over [`prune`](Self::prune) for the periodic
+    /// maintenance tick: it turns the operator-facing `[metrics]
+    /// rollup_retention_hours` (a `Duration`) into the absolute cutoff
+    /// timestamp `prune` expects. A zero `retention` keeps everything —
+    /// matching the "0 means unlimited" convention the other storage limits
+    /// use — so an unconfigured council never deletes rollups by surprise.
+    pub async fn prune_expired(
+        &self,
+        now: SystemTime,
+        retention: Duration,
+    ) -> Result<usize, MayoError> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let before = now_secs.saturating_sub(retention.as_secs());
+        self.prune(before).await
+    }
+}
+
+/// What [`RollupStore::snapshot`] captured: the files and rollups a query
+/// reads, independent of the store's lock.
+pub struct RollupSnapshot {
+    sources: Arc<Vec<ParquetSource>>,
+    memory: Option<RecordBatch>,
+    index: SourceIndex,
+    #[cfg(test)]
+    query_gate: Option<Arc<super::store::QueryGate>>,
+}
+
+impl RollupSnapshot {
+    /// A session exposing the snapshot as the `rollups` table. Cheap: no
+    /// I/O until a query runs.
+    fn session(&self) -> Result<SessionContext, MayoError> {
         let ctx = streaming_session();
         let table = ParquetTable::new(
             Arc::new(rollup_schema()),
-            list_local_off_runtime(&self.data_dir).await?,
-            self.buffer_to_batch()?,
+            Arc::clone(&self.sources),
+            self.memory.clone(),
             None,
             "rollup",
+            self.index.clone(),
         );
         ctx.register_table("rollups", Arc::new(table))
             .map_err(|e| MayoError::DataFusion(e.to_string()))?;
@@ -323,16 +635,8 @@ impl RollupStore {
     /// Returns (timestamp, metric_name, labels, value) tuples where
     /// value is the sum across nodes for each (timestamp, metric_name, labels).
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let ctx = self.session()?;
+        let batches = super::store::collect_sql(&ctx, sql).await?;
 
         let mut results = Vec::new();
         for batch in &batches {
@@ -373,14 +677,42 @@ impl RollupStore {
         Ok(results)
     }
 
-    /// Read worker contributions without losing the identity needed for reassignment deduplication.
-    /// Refuse oversized results rather than silently returning a truncated cluster sum.
+    /// Worker contributions in `[start, end]`, every page of them, without
+    /// losing the identity needed for reassignment deduplication. Refuses a
+    /// range of more than [`MAX_OWNED_ROWS`] rather than return a truncated
+    /// cluster sum.
     pub async fn query_owned_rows(
         &self,
         metric_name: Option<&str>,
         start: u64,
         end: u64,
     ) -> Result<Vec<OwnedRollupRow>, MayoError> {
+        let mut rows = Vec::new();
+        let mut cursor = start;
+        loop {
+            let page = self.query_owned_page(metric_name, cursor, end).await?;
+            rows.extend(page.rows);
+            if rows.len() > MAX_OWNED_ROWS {
+                return Err(too_many_contributions());
+            }
+            match page.next_start {
+                Some(next) if next > cursor => cursor = next,
+                _ => return Ok(rows),
+            }
+        }
+    }
+
+    /// One page of worker contributions from `start`, oldest first: at most
+    /// [`OWNED_ROWS_PAGE`] rows, ending on a whole minute, and the `start`
+    /// of the next page if there is more (#2451). A single minute holding
+    /// more than a page is refused: it can't be paged, and filtering by
+    /// metric name narrows it.
+    pub async fn query_owned_page(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<OwnedRowsPage, MayoError> {
         let name_filter = metric_name
             .map(|name| {
                 format!(
@@ -391,17 +723,10 @@ impl RollupStore {
             .unwrap_or_default();
         let end = end.min(i64::MAX as u64);
         let sql = format!(
-            "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT 10001"
+            "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT {}",
+            OWNED_ROWS_PAGE + 1
         );
-        let batches = self
-            .session()
-            .await?
-            .sql(&sql)
-            .await
-            .map_err(|error| MayoError::QueryFailed(error.to_string()))?
-            .collect()
-            .await
-            .map_err(|error| MayoError::QueryFailed(error.to_string()))?;
+        let batches = super::store::collect_sql(&self.session()?, &sql).await?;
         let mut rows = Vec::new();
         for batch in batches {
             let timestamps = batch
@@ -441,19 +766,31 @@ impl RollupStore {
                 });
             }
         }
-        if rows.len() > 10000 {
-            return Err(MayoError::QueryFailed(
-                "rollup query exceeds 10000 contributions; narrow the time range or metric filter"
-                    .into(),
-            ));
+        if rows.len() <= OWNED_ROWS_PAGE {
+            return Ok(OwnedRowsPage {
+                rows,
+                next_start: None,
+            });
         }
-        Ok(rows)
+        // The page ends before the first minute it couldn't hold whole.
+        let next = rows[OWNED_ROWS_PAGE].row.timestamp;
+        rows.retain(|owned| owned.row.timestamp < next);
+        if rows.is_empty() {
+            return Err(MayoError::QueryRejected(format!(
+                "one minute holds more than {OWNED_ROWS_PAGE} rollup contributions; filter by metric name"
+            )));
+        }
+        Ok(OwnedRowsPage {
+            rows,
+            next_start: Some(next),
+        })
     }
 
     /// Query cluster-wide aggregated metrics by name and time range.
     ///
     /// Returns (timestamp, metric_name, labels, sum) tuples aggregated
-    /// across all nodes. For averages, callers can also retrieve count
+    /// across all nodes, oldest first, at most [`ALL_QUERY_ROW_LIMIT`] of
+    /// them, the newest. For averages, callers can also retrieve count
     /// via `query_sql`.
     pub async fn query_cluster_metric(
         &self,
@@ -471,9 +808,13 @@ impl RollupStore {
              WHERE metric_name = '{metric_name}' \
              AND timestamp >= {start} AND timestamp <= {end} \
              GROUP BY timestamp, metric_name, labels \
-             ORDER BY timestamp"
+             ORDER BY timestamp DESC LIMIT {ALL_QUERY_ROW_LIMIT}"
         );
-        self.query_sql(&sql).await
+        // Newest first under the limit, then back to oldest first: without
+        // a limit one request returned the whole rollup retention (#2382).
+        let mut rows = self.query_sql(&sql).await?;
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Every series' cluster sums in `[start, end]`, oldest first, at most
@@ -516,16 +857,10 @@ impl RollupStore {
              ORDER BY timestamp"
         );
 
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let ctx = self.session()?;
+        #[cfg(test)]
+        super::store::QueryGate::pass(&self.query_gate).await;
+        let batches = super::store::collect_sql(&ctx, &sql).await?;
 
         let mut results = Vec::new();
         for batch in &batches {
@@ -584,16 +919,12 @@ impl RollupStore {
 
     /// List all distinct metric names in the rollup store.
     pub async fn metric_names(&self) -> Result<Vec<String>, MayoError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql("SELECT DISTINCT metric_name FROM rollups ORDER BY metric_name")
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let ctx = self.session()?;
+        let batches = super::store::collect_sql(
+            &ctx,
+            "SELECT DISTINCT metric_name FROM rollups ORDER BY metric_name",
+        )
+        .await?;
 
         let mut names = Vec::new();
         for batch in &batches {
@@ -609,98 +940,28 @@ impl RollupStore {
 
         Ok(names)
     }
-
-    /// Prune Parquet files whose newest datapoint is older than `before`.
-    ///
-    /// Keyed on the data's own newest timestamp (O12), read from row-group
-    /// statistics, not the file's mtime — the rollup schema shares the
-    /// leading `timestamp` column, so `store::file_max_timestamp` applies.
-    ///
-    /// Opening every file's footer is slow on a slow disk, so the scan runs
-    /// on a blocking thread (#1417).
-    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
-        let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || prune_directory(&data_dir, before))
-            .await
-            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
-    }
-
-    /// Prune rollups older than `retention`, measured back from `now`.
-    ///
-    /// A thin convenience over [`prune`](Self::prune) for the periodic
-    /// maintenance tick: it turns the operator-facing `[metrics]
-    /// rollup_retention_hours` (a `Duration`) into the absolute cutoff
-    /// timestamp `prune` expects. A zero `retention` keeps everything —
-    /// matching the "0 means unlimited" convention the other storage limits
-    /// use — so an unconfigured council never deletes rollups by surprise.
-    pub async fn prune_expired(
-        &self,
-        now: SystemTime,
-        retention: Duration,
-    ) -> Result<usize, MayoError> {
-        if retention.is_zero() {
-            return Ok(0);
-        }
-        let now_secs = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let before = now_secs.saturating_sub(retention.as_secs());
-        self.prune(before).await
-    }
 }
 
-/// Delete the Parquet files under `data_dir` whose newest datapoint is older
-/// than `before`: how many went.
-fn prune_directory(data_dir: &std::path::Path, before: u64) -> Result<usize, MayoError> {
-    let mut deleted = 0;
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(entries) => entries,
-        // A new store has no directory until its first flush.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => {
-            return Err(MayoError::Io(std::io::Error::new(
-                error.kind(),
-                format!("list metrics {}: {error}", data_dir.display()),
-            )));
-        }
-    };
-    for entry in entries {
-        let path = entry
-            .map_err(|error| {
-                MayoError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!("read metrics directory {}: {error}", data_dir.display()),
-                ))
-            })?
-            .path();
-        if !path.extension().is_some_and(|e| e == "parquet") {
-            continue;
-        }
-        let newest = super::store::file_max_timestamp(&path).unwrap_or_else(|| {
-            std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map(|t| {
-                    t.duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                })
-                .unwrap_or(u64::MAX)
-        });
-        if newest < before {
-            match std::fs::remove_file(&path) {
-                Ok(()) => deleted += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(MayoError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("prune {}: {error}", path.display()),
-                    )));
-                }
-            }
-        }
-    }
-    Ok(deleted)
+/// The most worker contributions one page of `/v1/metrics/rollup/owned`
+/// holds (#2451).
+pub const OWNED_ROWS_PAGE: usize = 10_000;
+
+/// The most worker contributions one cluster query reads from one member,
+/// over all its pages (#2451).
+pub const MAX_OWNED_ROWS: usize = 200_000;
+
+/// The refusal for a range with more than [`MAX_OWNED_ROWS`] contributions.
+pub(crate) fn too_many_contributions() -> MayoError {
+    MayoError::QueryRejected(format!(
+        "the range holds more than {MAX_OWNED_ROWS} rollup contributions; narrow the time range or filter by metric name"
+    ))
+}
+
+/// One page of worker contributions, and where the next page starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedRowsPage {
+    pub rows: Vec<OwnedRollupRow>,
+    pub next_start: Option<u64>,
 }
 
 /// A cluster-wide aggregate row with full statistics.
@@ -795,6 +1056,7 @@ mod tests {
                     store.ingest(&NodeRollup {
                         node_id: NodeId::new(*node),
                         timestamp,
+                        part: 0,
                         entries,
                     });
                 }
@@ -884,7 +1146,7 @@ mod tests {
         store.flush().await.unwrap();
         let mut restarted = RollupStore::new(directory.path().to_path_buf());
         restarted.hydrate_seen_windows().await.unwrap();
-        let mut seen: Vec<_> = restarted.seen_windows.iter().cloned().collect();
+        let mut seen: Vec<_> = restarted.hydrated_windows.iter().cloned().collect();
         seen.sort();
         report.push(format!(
             "## hydrated windows (newest {})\n{seen:?}",
@@ -893,10 +1155,38 @@ mod tests {
         insta::assert_snapshot!("rollup_golden_reads", report.join("\n\n"));
     }
 
+    /// #2536: the store names the newest window each node sent, whatever the
+    /// metric, a re-sent window included, and a restart reads it back from
+    /// the flushed files.
+    #[tokio::test]
+    async fn reporters_name_each_nodes_newest_window_across_a_restart() {
+        let (mut store, directory) = test_store();
+        store.ingest(&make_rollup("w1", 120, "cpu", 1.0));
+        store.ingest(&make_rollup("w1", 180, "mem", 1.0));
+        store.ingest(&make_rollup("w2", 60, "cpu", 1.0));
+        // A duplicate is dropped, but still tells us w2 is talking.
+        assert!(!store.ingest(&make_rollup("w2", 60, "cpu", 1.0)));
+        let sorted = |mut reporters: Vec<RollupReporter>| {
+            reporters.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            reporters
+                .into_iter()
+                .map(|reporter| (reporter.node_id, reporter.last_window))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![("w1".to_string(), 180), ("w2".to_string(), 60)];
+        assert_eq!(sorted(store.reporters()), expected);
+
+        store.flush().await.unwrap();
+        let mut restarted = RollupStore::new(directory.path().to_path_buf());
+        restarted.hydrate_seen_windows().await.unwrap();
+        assert_eq!(sorted(restarted.reporters()), expected);
+    }
+
     fn make_rollup(node: &str, timestamp: u64, metric: &str, value: f64) -> NodeRollup {
         NodeRollup {
             node_id: NodeId::new(node),
             timestamp,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: metric.to_string(),
                 labels: BTreeMap::new(),
@@ -924,6 +1214,7 @@ mod tests {
         NodeRollup {
             node_id: NodeId::new(node),
             timestamp,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: metric.to_string(),
                 labels,
@@ -939,19 +1230,22 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_owned_queries_refuse_instead_of_truncating_the_sum() {
+        // Paged since #2451: the refusal is at MAX_OWNED_ROWS, not one page.
         let (mut store, _dir) = test_store();
-        for window in 0..=10000 {
+        let most = MAX_OWNED_ROWS as u64;
+        for window in 0..=most {
             store.ingest(&make_rollup("worker-a", window, "cpu", 1.0));
         }
-        let error = store.query_owned_rows(None, 0, 10000).await.unwrap_err();
+        let error = store.query_owned_rows(None, 0, most).await.unwrap_err();
+        assert!(matches!(error, MayoError::QueryRejected(_)), "{error}");
         assert!(error.to_string().contains("narrow the time range"));
         assert_eq!(
             store
-                .query_owned_rows(Some("cpu"), 0, 9999)
+                .query_owned_rows(Some("cpu"), 0, most - 1)
                 .await
                 .unwrap()
                 .len(),
-            10000
+            MAX_OWNED_ROWS
         );
     }
 
@@ -1318,6 +1612,164 @@ mod tests {
             "buffer grew past the cap: {}",
             store.buffer_len()
         );
+    }
+
+    /// #2382: `/v1/metrics/rollup?name=X` over all time had no row bound.
+    /// It keeps the newest `ALL_QUERY_ROW_LIMIT` sums, oldest first.
+    #[tokio::test]
+    async fn a_named_rollup_query_returns_at_most_the_row_limit() {
+        let (mut store, _dir) = test_store();
+        let total = crate::mayo::store::ALL_QUERY_ROW_LIMIT as u64 + 50;
+        for minute in 1..=total {
+            store.ingest(&make_rollup("n1", minute * 60, "cpu", 1.0));
+        }
+        let rows = store
+            .query_cluster_metric("cpu", 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
+        assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
+        assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// #2451: a member refused any cluster query over 10,000 contributions,
+    /// and one series on ten nodes is 14,400 a day. The query now reads in
+    /// pages and succeeds.
+    #[tokio::test]
+    async fn a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds() {
+        let (mut store, _dir) = test_store();
+        for node in 0..10 {
+            for minute in 1..=1_440 {
+                store.ingest(&make_rollup(
+                    &format!("node-{node}"),
+                    minute * 60,
+                    "node_cpu_usage_percent",
+                    1.0,
+                ));
+            }
+        }
+        let rows = store
+            .query_owned_rows(Some("node_cpu_usage_percent"), 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        let merged = crate::mayo::query_fanout::merge_owned_rollups(vec![rows]);
+        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+        assert_eq!(merged.data.len(), 1_440);
+        assert!(merged.data.iter().all(|row| row.value == 10.0));
+    }
+
+    /// #2451: a page holds whole minutes only, so the next page starts
+    /// where it stopped and no minute is split between two.
+    #[tokio::test]
+    async fn an_owned_rows_page_ends_on_a_whole_minute() {
+        let (mut store, _dir) = test_store();
+        for node in 0..3 {
+            for minute in 1..=5_000 {
+                store.ingest(&make_rollup(&format!("n{node}"), minute * 60, "cpu", 1.0));
+            }
+        }
+        let page = store
+            .snapshot()
+            .await
+            .unwrap()
+            .query_owned_page(Some("cpu"), 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        let next = page.next_start.expect("15,000 rows take two pages");
+        assert!(page.rows.len() <= OWNED_ROWS_PAGE);
+        assert_eq!(page.rows.len() % 3, 0, "a minute was split");
+        assert!(page.rows.iter().all(|row| row.row.timestamp < next));
+    }
+
+    /// #2451: one minute with more contributions than a page can't be
+    /// paged; it's refused as the caller's to narrow, not as a failure.
+    #[tokio::test]
+    async fn a_minute_larger_than_a_page_is_refused() {
+        let (mut store, _dir) = test_store();
+        for node in 0..=OWNED_ROWS_PAGE {
+            store.ingest(&make_rollup(&format!("n{node}"), 60, "cpu", 1.0));
+        }
+        let error = store
+            .query_owned_rows(Some("cpu"), 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MayoError::QueryRejected(_)), "{error}");
+    }
+
+    /// #2426: a minute too large for one frame arrives in parts. Each part
+    /// is ingested once; a re-sent part is a duplicate.
+    #[tokio::test]
+    async fn each_part_of_a_minute_is_ingested_once() {
+        let (mut store, _dir) = test_store();
+        let part = |part: u16, metric: &str| NodeRollup {
+            part,
+            ..make_rollup("n1", 60, metric, 1.0)
+        };
+        assert!(store.ingest(&part(0, "cpu")));
+        assert!(store.ingest(&part(1, "mem")));
+        assert!(!store.ingest(&part(1, "mem")), "a re-sent part");
+        assert_eq!(store.buffer_len(), 2);
+    }
+
+    /// #2443: a flush written outside the store lock keeps its rows
+    /// queryable while it runs, and once it completes they are read from
+    /// the file, never twice.
+    #[tokio::test]
+    async fn a_rollup_flush_outside_the_lock_reads_each_row_once() {
+        let (mut store, _dir) = test_store();
+        store.ingest(&make_rollup("n1", 60, "cpu", 1.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        store.ingest(&make_rollup("n1", 120, "cpu", 2.0));
+        assert_eq!(store.buffer_len(), 2);
+        let sums = |rows: Vec<(u64, String, String, f64)>| -> Vec<(u64, f64)> {
+            rows.into_iter().map(|row| (row.0, row.3)).collect()
+        };
+        let before = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(before), [(60, 1.0), (120, 2.0)]);
+
+        write_rollup_pending(&pending).await.unwrap();
+        // Written but not yet completed: still read once, from memory.
+        let during = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(during), [(60, 1.0), (120, 2.0)]);
+        store.complete_flush(&pending);
+        let after = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(after), [(60, 1.0), (120, 2.0)]);
+        assert_eq!(store.buffer_len(), 1);
+    }
+
+    /// #2443: the flush task no longer holds the write lock through the
+    /// Parquet write, so ingest goes on.
+    #[tokio::test]
+    async fn flushing_off_the_lock_persists_and_empties_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(RollupStore::new(dir.path().to_path_buf()));
+        store
+            .write()
+            .await
+            .ingest(&make_rollup("n1", 60, "cpu", 1.0));
+        flush_off_lock(&store).await.unwrap();
+        assert_eq!(store.read().await.buffer_len(), 0);
+        let reopened = RollupStore::new(dir.path().to_path_buf());
+        let rows = reopened
+            .query_cluster_metric("cpu", 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// #2450: shedding from a full buffer moves no buffered row, and keeps
+    /// the newest windows.
+    #[tokio::test]
+    async fn shedding_rollups_moves_nothing_and_keeps_the_newest() {
+        let (mut store, _dir) = test_store();
+        store.max_buffer_rows = 100;
+        for minute in 1..=250 {
+            store.ingest(&make_rollup("n1", minute * 60, "cpu", 1.0));
+        }
+        assert_eq!(store.buffer_len(), 100);
+        let rows = store.query_cluster_metric("cpu", 0, 100_000).await.unwrap();
+        assert_eq!(rows.first().unwrap().0, 151 * 60);
+        assert_eq!(rows.last().unwrap().0, 250 * 60);
     }
 
     #[tokio::test]

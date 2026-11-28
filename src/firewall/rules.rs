@@ -1,12 +1,17 @@
 /// Perimeter firewall rules via nftables.
 ///
-/// Protects Reliaburger's own ports from external access. We only
-/// block our ports (container host ports, cluster ports, management
-/// port) — everything else (SSH, operator services) is untouched.
+/// Protects Reliaburger's ports from external access: the cluster ports,
+/// the management port and the whole container host-port range (`[network]
+/// port_range`). The range is closed to non-members as a block, including
+/// any port in it that Bun never allocated, so another service listening
+/// there stops answering outsiders once Bun starts (#2479). Bun warns about
+/// such a listener at start-up; the remedy is to move the range or the
+/// service. Everything outside these ports (SSH, operator services) is
+/// untouched.
 ///
 /// The chain policy is `accept`. We add explicit `drop` rules for
-/// our port ranges from non-cluster, non-operator sources. This way
-/// we never lock operators out of their own machines.
+/// our ports from non-cluster, non-operator sources. This way we never
+/// lock operators out of their own machines.
 ///
 /// Rules are rendered for both the `ip` and `ip6` families (NET8): an
 /// IPv4-only perimeter left every drop rule void over IPv6. All
@@ -446,6 +451,55 @@ pub fn generate_ruleset(
     Ok(rules)
 }
 
+/// The ruleset that removes the perimeter: both families' `reliaburger_fw`
+/// tables, each created empty first so the delete succeeds when it's
+/// already gone. Only the perimeter goes; the `reliaburger` table's port map
+/// and masquerade, and `reliaburger_isolation`, stay for the containers
+/// that use them (#2479).
+pub fn removal_ruleset() -> String {
+    ["ip", "ip6"]
+        .iter()
+        .map(|family| {
+            format!("table {family} reliaburger_fw {{}}\ndelete table {family} reliaburger_fw\n")
+        })
+        .collect()
+}
+
+/// TCP ports in `range` that something listens on, per the kernel's socket
+/// tables (`/proc/net/tcp` and `tcp6`, concatenated in `tables`), apart from
+/// the ones in `own`. The perimeter closes the whole range to outsiders, so
+/// each of these is a service that stops answering them (#2479).
+pub fn foreign_listeners(tables: &str, range: (u16, u16), own: &BTreeSet<u16>) -> BTreeSet<u16> {
+    // Each socket line reads `sl local_address rem_address st ...`, with
+    // the local address as `HEXADDRESS:HEXPORT` and state `0A` for LISTEN.
+    tables
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let local = fields.nth(1)?;
+            let state = fields.nth(1)?;
+            if state != "0A" {
+                return None;
+            }
+            let (_, port) = local.rsplit_once(':')?;
+            u16::from_str_radix(port, 16).ok()
+        })
+        .filter(|port| (range.0..=range.1).contains(port) && !own.contains(port))
+        .collect()
+}
+
+/// Read the node's TCP socket tables and name every foreign listener in
+/// the host-port range, for a start-up warning. Empty where there's no
+/// procfs.
+pub fn foreign_listeners_on_this_node(range: (u16, u16), own: &BTreeSet<u16>) -> BTreeSet<u16> {
+    let tables: String = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        // BLOCKING-OK: procfs, generated from kernel memory with no disk behind it
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
+    foreign_listeners(&tables, range, own)
+}
+
 /// Parse CIDRs (or bare addresses), split into IPv4 and IPv6.
 type CidrsByFamily = (Vec<(IpAddr, u8)>, Vec<(IpAddr, u8)>);
 fn parse_cidrs_by_family(values: &[String]) -> Result<CidrsByFamily, FirewallError> {
@@ -769,6 +823,56 @@ mod tests {
 
         assert!(rules.contains("policy accept"));
         assert!(!rules.contains("policy drop"));
+    }
+
+    /// #2479: with the perimeter off, Bun removes its tables rather than
+    /// leaving the drops loaded until a reboot. Each delete is preceded by
+    /// the empty `table` line that makes it succeed when the table is gone.
+    #[test]
+    fn a_disabled_perimeter_renders_the_removal_of_its_tables() {
+        let removal = removal_ruleset();
+        for family in ["ip", "ip6"] {
+            let create = format!("table {family} reliaburger_fw {{}}\n");
+            let delete = format!("delete table {family} reliaburger_fw\n");
+            let created = removal.find(&create).expect("no table line");
+            let deleted = removal.find(&delete).expect("no delete line");
+            assert!(created < deleted, "{removal}");
+        }
+        // Only the perimeter goes: the port map and isolation stay for the
+        // containers still running.
+        assert!(!removal.contains("table ip reliaburger "), "{removal}");
+        assert!(!removal.contains("reliaburger_isolation"), "{removal}");
+        assert!(!removal.contains("drop"), "{removal}");
+    }
+
+    #[test]
+    fn an_enabled_perimeter_still_renders_its_drops() {
+        let rules = generate(&default_config(), &ClusterNodes::new());
+        assert!(rules.contains("tcp dport 10000-32767 drop"), "{rules}");
+        assert!(rules.contains("tcp dport 9117 drop"), "{rules}");
+    }
+
+    /// The perimeter closes the whole range, so a listener there that
+    /// isn't Bun's is named at start-up.
+    #[test]
+    fn a_listener_in_the_range_that_is_not_buns_is_named() {
+        // Zabbix on 10050 (0x2742) and memcached on 11211 (0x2BCB) over
+        // IPv4, an established connection on 12000 (0x2EE0), SSH on 22,
+        // Bun's ingress on 10080 (0x2760), and memcached again over IPv6.
+        let tables = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:2742 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0 100 0 0 10 0
+   1: 00000000:2BCB 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2 1 0 100 0 0 10 0
+   2: 0100007F:2EE0 0100007F:9C40 01 00000000:00000000 00:00000000 00000000     0        0 3 1 0 100 0 0 10 0
+   3: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4 1 0 100 0 0 10 0
+   4: 00000000:2760 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 5 1 0 100 0 0 10 0
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:2BCB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 6 1 0 100 0 0 10 0
+";
+        let own = BTreeSet::from([10080]);
+        assert_eq!(
+            foreign_listeners(tables, (10000, 32767), &own),
+            BTreeSet::from([10050, 11211])
+        );
     }
 
     #[test]

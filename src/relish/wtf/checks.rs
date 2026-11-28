@@ -85,6 +85,7 @@ pub const CHECKS: &[CheckKind] = &[
             "council-fenced",
             "council-epoch-split",
             "council-voter-lagging",
+            "council-retired-identities-nearly-full",
             "council-multiple-leaders",
             "no-leader",
             "quorum-loss",
@@ -94,8 +95,9 @@ pub const CHECKS: &[CheckKind] = &[
         tests: "Reads the council membership and every node's own view of it. No leader, \
                 fewer members answering than a majority (members / 2 + 1), two leaders, \
                 two recovery epochs or a fenced node is critical; a missing member while \
-                quorum holds, or a voter applying the log more slowly than the others, is \
-                a warning. A standalone node needs no council and is OK.",
+                quorum holds, a voter applying the log more slowly than the others, or a \
+                retired-identity list 90% full, is a warning. A standalone node needs no \
+                council and is OK.",
         docs: "12_operations.md#a-walk-through-a-recovery",
         manual: "operations",
     },
@@ -127,6 +129,17 @@ pub const CHECKS: &[CheckKind] = &[
                 failing there's no row.",
         docs: "04_observability.md#logs",
         manual: "observability",
+    },
+    CheckKind {
+        id: "images",
+        findings: &["image-collection-failing"],
+        sources: &["image_collection"],
+        tests: "Asks every node whether its last image collection pass failed or was \
+                refused. A node that can't collect never removes an unpacked image, so each \
+                one is a warning. With every pass working there's no row; how full the \
+                images filesystem is, the disks check says.",
+        docs: "11_images-and-volumes.md#unpacked-images",
+        manual: "images-and-volumes",
     },
     CheckKind {
         id: "certificates",

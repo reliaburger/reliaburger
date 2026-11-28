@@ -60,6 +60,12 @@ pub struct SnapshotUploader {
     /// quota. Production reads the host with `statvfs`; tests pass a fixed
     /// reading so their outcome never depends on the developer's disk.
     spool_space: fn(&Path) -> Result<DiskSpace, String>,
+    /// Hash an archive already at its key before trusting it. A `file://`
+    /// destination can hold an object of the right size whose data a power
+    /// cut or a careless mount lost; S3 and GCS store an object whole or not
+    /// at all, and reading it back would cost a download every sweep for
+    /// every idle volume, whose archive doesn't change.
+    verify_existing: bool,
 }
 
 impl SnapshotUploader {
@@ -77,6 +83,7 @@ impl SnapshotUploader {
             part_bytes: DEFAULT_PART_BYTES,
             stage_timeout,
             spool_space: host_disk_space,
+            verify_existing: parsed.scheme() == "file",
         })
     }
 
@@ -558,8 +565,9 @@ impl<W: std::io::Write> std::io::Write for SpoolWriter<'_, W> {
 
 /// Upload a spooled archive part by part, within the stage deadline.
 /// Content addressing makes a repeat harmless: an archive already at its
-/// key with the same size is left alone, and one with a different size is
-/// a collision that's refused rather than overwritten.
+/// key with these exact bytes is left alone. Anything else at the key is
+/// damage, not another archive, because the key is the content's hash under
+/// this node's own prefix, so it is replaced.
 async fn upload_archive(
     uploader: &SnapshotUploader,
     key: &object_store::path::Path,
@@ -568,22 +576,23 @@ async fn upload_archive(
 ) -> Result<UploadStats, String> {
     let deadline = tokio::time::Instant::now() + uploader.stage_timeout;
     let timed_out = || "upload timed out".to_string();
-    match tokio::time::timeout_at(deadline, uploader.store.head(key)).await {
-        Err(_) => return Err(timed_out()),
-        Ok(Ok(existing)) if existing.size == spooled.bytes => {
+    let existing = tokio::select! {
+        result = tokio::time::timeout_at(deadline, existing_archive(uploader, key, spooled)) => {
+            result.map_err(|_| timed_out())??
+        }
+        _ = cancel.cancelled() => return Err("cancelled".to_string()),
+    };
+    match existing {
+        ExistingArchive::Whole => {
             return Ok(UploadStats {
                 parts: 0,
                 largest_part: 0,
             });
         }
-        Ok(Ok(existing)) => {
-            return Err(format!(
-                "{key} already holds {} bytes, not this archive's {}",
-                existing.size, spooled.bytes
-            ));
+        ExistingArchive::Damaged(why) => {
+            eprintln!("bun: snapshot sweep: replacing {key}: {why}");
         }
-        Ok(Err(object_store::Error::NotFound { .. })) => {}
-        Ok(Err(e)) => return Err(format!("head: {e}")),
+        ExistingArchive::Absent => {}
     }
 
     let mut upload = tokio::time::timeout_at(deadline, uploader.store.put_multipart(key))
@@ -618,6 +627,58 @@ async fn upload_archive(
         let _ = tokio::time::timeout(ABORT_TIMEOUT, upload.abort()).await;
     }
     completed
+}
+
+/// What the destination already holds at an archive's key.
+#[derive(Debug)]
+enum ExistingArchive {
+    /// Nothing: the archive has never landed.
+    Absent,
+    /// This archive, byte for byte (or, on a store that writes whole
+    /// objects, at least its size).
+    Whole,
+    /// Something else, and why it doesn't match.
+    Damaged(String),
+}
+
+/// Check the object at `key` against the spooled archive.
+async fn existing_archive(
+    uploader: &SnapshotUploader,
+    key: &object_store::path::Path,
+    spooled: &SpooledArchive,
+) -> Result<ExistingArchive, String> {
+    let existing = match uploader.store.head(key).await {
+        Ok(existing) => existing,
+        Err(object_store::Error::NotFound { .. }) => return Ok(ExistingArchive::Absent),
+        Err(e) => return Err(format!("head: {e}")),
+    };
+    if existing.size != spooled.bytes {
+        return Ok(ExistingArchive::Damaged(format!(
+            "it holds {} bytes, not the archive's {}",
+            existing.size, spooled.bytes
+        )));
+    }
+    if !uploader.verify_existing {
+        return Ok(ExistingArchive::Whole);
+    }
+    use futures_util::StreamExt;
+    let mut stream = uploader
+        .store
+        .get(key)
+        .await
+        .map_err(|e| format!("get: {e}"))?
+        .into_stream();
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        hasher.update(chunk.map_err(|e| format!("get: {e}"))?);
+    }
+    if hex::encode(hasher.finalize()) == spooled.sha256 {
+        Ok(ExistingArchive::Whole)
+    } else {
+        Ok(ExistingArchive::Damaged(
+            "its bytes don't hash to its name".to_string(),
+        ))
+    }
 }
 
 /// Read the spool in `part_bytes` pieces and upload each before reading the
@@ -867,6 +928,7 @@ mod tests {
             part_bytes: DEFAULT_PART_BYTES,
             stage_timeout: Duration::from_secs(60),
             spool_space: roomy_disk,
+            verify_existing: false,
         }
     }
 
@@ -1374,6 +1436,230 @@ mod tests {
                 .exports
                 .is_empty()
         );
+    }
+
+    // -- power cuts between upload and receipt (#287) ------------------------
+
+    /// What a power cut between an archive landing and its receipt leaves
+    /// behind: the snapshot's metadata as it was before the export.
+    fn forget_receipts(volumes_dir: &Path, snapshot: &SnapshotMeta) {
+        let snapshots = SnapshotManager::new(volumes_dir);
+        let mut forgotten = snapshots.list("default", &snapshot.app).unwrap()[0].clone();
+        forgotten.exports.clear();
+        snapshots
+            .write_meta(&snapshots.snapshot_path(&forgotten), &forgotten)
+            .unwrap();
+    }
+
+    /// The SHA-256 an archive key names: `.../sha256-<hex>.tar.gz`.
+    fn named_sha256(key: &str) -> &str {
+        key.rsplit_once("sha256-")
+            .and_then(|(_, rest)| rest.strip_suffix(".tar.gz"))
+            .unwrap()
+    }
+
+    /// A `file://` destination whose disk lost the archive's data but kept
+    /// its size (a delayed-allocation filesystem after a power cut, or a
+    /// network mount that ignored the flush) must not count as a backup:
+    /// the next sweep sees the bytes don't match the key and ships the
+    /// archive again.
+    #[tokio::test]
+    async fn a_zeroed_archive_of_the_right_size_is_replaced_not_counted() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let snapshot = meta("db", "/data", "1000", 1000);
+        fake_snapshot(volumes_dir.path(), &snapshot, b"snapshot-content");
+        let uploader = file_uploader(dest.path(), "node-a");
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let snapshots = SnapshotManager::new(volumes_dir.path());
+        let receipt = snapshots.list("default", "db").unwrap()[0].exports[0].clone();
+        let archive = Path::new("/").join(&receipt.archive);
+        let size = std::fs::metadata(&archive).unwrap().len() as usize;
+        std::fs::write(&archive, vec![0u8; size]).unwrap();
+        forget_receipts(volumes_dir.path(), &snapshot);
+
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let bytes = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&bytes)),
+            named_sha256(&receipt.archive),
+            "the receipt must name an archive whose bytes match its key"
+        );
+        assert_eq!(state_in(&bytes), b"snapshot-content");
+        let exports = &snapshots.list("default", "db").unwrap()[0].exports;
+        assert_eq!(exports.len(), 1);
+    }
+
+    /// An archive cut short at its own key (a destination that isn't atomic,
+    /// or damage at rest) used to wedge the snapshot: every sweep refused
+    /// the "collision", so the snapshot never shipped and was held past
+    /// retention for ever. The key is the content's hash under this node's
+    /// own prefix, so a mismatch is damage, and the sweep replaces it.
+    #[tokio::test]
+    async fn a_truncated_archive_at_its_key_is_replaced_not_refused() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let snapshot = meta("db", "/data", "1000", 1000);
+        fake_snapshot(volumes_dir.path(), &snapshot, b"snapshot-content");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let uploader = store_uploader(store.clone(), "memory:///shared", "n");
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let snapshots = SnapshotManager::new(volumes_dir.path());
+        let receipt = snapshots.list("default", "db").unwrap()[0].exports[0].clone();
+        let key = object_store::path::Path::from(receipt.archive.as_str());
+        let whole = store.get(&key).await.unwrap().bytes().await.unwrap();
+        store
+            .put(&key, PutPayload::from(whole[..whole.len() / 2].to_vec()))
+            .await
+            .unwrap();
+        forget_receipts(volumes_dir.path(), &snapshot);
+
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.uploaded, 1);
+        let bytes = store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, whole);
+        assert_eq!(snapshots.list("default", "db").unwrap()[0].exports.len(), 1);
+    }
+
+    /// The case runs 1 and 6 of the 23 November power-cut record hit: the
+    /// archive landed whole, the receipt didn't. The next sweep checks the
+    /// archive, keeps it, and writes the receipt without a second upload.
+    #[tokio::test]
+    async fn a_whole_archive_without_its_receipt_is_kept_and_receipted() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let snapshot = meta("db", "/data", "1000", 1000);
+        fake_snapshot(volumes_dir.path(), &snapshot, b"snapshot-content");
+        let uploader = file_uploader(dest.path(), "node-a");
+        tick(volumes_dir.path(), 7, Some(&uploader)).await;
+        let snapshots = SnapshotManager::new(volumes_dir.path());
+        let receipt = snapshots.list("default", "db").unwrap()[0].exports[0].clone();
+        let archive = Path::new("/").join(&receipt.archive);
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&archive).unwrap());
+        forget_receipts(volumes_dir.path(), &snapshot);
+
+        let report = tick(volumes_dir.path(), 7, Some(&uploader)).await;
+
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let after = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&archive).unwrap());
+        assert_eq!(inode, after, "a whole archive must not be uploaded again");
+        assert_eq!(
+            snapshots.list("default", "db").unwrap()[0].exports[0].archive,
+            receipt.archive
+        );
+    }
+
+    /// A real S3 multipart upload cut off part way (here by its deadline,
+    /// as a power cut cuts it off) leaves no archive at its key and no
+    /// receipt, and the next sweep starts it again and ships it whole. The
+    /// bucket is a throwaway local SeaweedFS one unless
+    /// `RELIABURGER_TEST_S3_URL` names a real one.
+    #[tokio::test]
+    #[ignore = "needs an S3 server, which make test-s3 starts (or a real bucket in RELIABURGER_TEST_S3_URL); run with make test-s3"]
+    async fn an_interrupted_s3_upload_restarts_cleanly() {
+        let Ok(base) = std::env::var("RELIABURGER_TEST_S3_URL") else {
+            panic!("run this suite with make test-s3, which sets RELIABURGER_TEST_S3_URL");
+        };
+        let run = format!(
+            "{}/snapshot-upload-{:032x}",
+            base.trim_end_matches('/'),
+            rand::random::<u128>()
+        );
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let snapshot = meta("db", "/data", "1000", 1000);
+        let content = incompressible(12 * 1024 * 1024);
+        fake_snapshot(volumes_dir.path(), &snapshot, &content);
+        let mut healthy = SnapshotUploader::from_url(&run, "n", Duration::from_secs(120)).unwrap();
+        healthy.spool_space = roomy_disk;
+        // S3 takes parts of at least 5 MiB, all but the last.
+        healthy.part_bytes = 5 * 1024 * 1024;
+        let mut cut = SnapshotUploader::from_url(&run, "n", Duration::from_secs(3)).unwrap();
+        cut.spool_space = roomy_disk;
+        cut.part_bytes = healthy.part_bytes;
+        cut.store = Arc::new(object_store::throttle::ThrottledStore::new(
+            healthy.store.clone(),
+            object_store::throttle::ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(2),
+                ..Default::default()
+            },
+        ));
+
+        let report = tick(volumes_dir.path(), 7, Some(&cut)).await;
+        assert_eq!(report.uploaded, 0, "the cut upload must not count");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("timed out")),
+            "{:?}",
+            report.errors
+        );
+        let snapshots = SnapshotManager::new(volumes_dir.path());
+        assert!(
+            snapshots.list("default", "db").unwrap()[0]
+                .exports
+                .is_empty()
+        );
+        let listed: Vec<_> = healthy
+            .store
+            .list(Some(&healthy.prefix))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "a cut upload left {listed:?}");
+
+        let report = tick(volumes_dir.path(), 7, Some(&healthy)).await;
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let receipt = snapshots.list("default", "db").unwrap()[0].exports[0].clone();
+        let key = object_store::path::Path::from(receipt.archive.as_str());
+        let bytes = healthy
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&bytes)),
+            named_sha256(&receipt.archive)
+        );
+        assert_eq!(state_in(&bytes), content);
+
+        // Something else at the key (a half object from a tool that isn't
+        // atomic) is replaced rather than refused, and only then receipted.
+        healthy
+            .store
+            .put(&key, PutPayload::from(bytes[..1024].to_vec()))
+            .await
+            .unwrap();
+        forget_receipts(volumes_dir.path(), &snapshot);
+        let report = tick(volumes_dir.path(), 7, Some(&healthy)).await;
+        assert_eq!(report.uploaded, 1, "{:?}", report.errors);
+        let replaced = healthy
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(replaced, bytes);
+
+        let listed: Vec<_> = healthy
+            .store
+            .list(Some(&healthy.prefix))
+            .try_collect()
+            .await
+            .unwrap();
+        for object in listed {
+            healthy.store.delete(&object.location).await.unwrap();
+        }
     }
 
     /// A spool that runs out of room fails the export cleanly: an error,

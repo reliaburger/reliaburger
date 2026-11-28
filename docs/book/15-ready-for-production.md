@@ -312,6 +312,18 @@ task owns a UDP socket. A report worker owns the receiving end of a channel. Sta
 second copy may fail to bind, steal messages or leave two authorities alive. Those owners
 never auto-restart. Bun records their death and fences scheduling.
 
+One of them is too important to merely record. The agent loop is what probes, restarts,
+retires and deploys every workload on the node. When it panicked, `spawn_owned` caught it
+and marked `agent` degraded, and Bun carried on: the API answered from its last snapshot,
+nothing supervised the apps any more, and `systemctl status bun` said active, so nothing
+restarted it either (#2379). A fresh Bun, though, adopts the running workloads in seconds.
+So the loop is spawned with `spawn_fatal_owned`, which records the degradation the same way,
+then writes the reason into an `OwnerFailure` and cancels the shutdown token. `main` winds
+down as for a signal and returns that reason as an error, so Bun exits non-zero and the
+service manager starts it again, the way the council's Raft core watchdog already did.
+`OwnerFailure` is an `Arc<std::sync::OnceLock<String>>`: a cell that can be written once and
+read by anyone, so the first owner to fail names the cause and a second can't overwrite it.
+
 The security-state refresher is different. Its factory owns only cloneable handles and can
 recreate its timer from scratch, so Bun may reconstruct it. Even then the policy names a
 maximum retry count, a delay, a recovery window and a shutdown deadline. The factory takes
@@ -675,7 +687,7 @@ real world it touched.
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
 Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
 report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
-79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
+79.65% of lines, so CI started at 78.65%, one percentage point lower, and can ratchet upwards. It took until November for anyone to turn the ratchet. By then the suite covered 88.60% of lines, so the floor sat ten points under it, and a new subsystem with a fifth of its lines tested would have passed. The floor is now 87.60%, and every minor release reads its last `portable Linux` run and raises the floor again if coverage has risen (#2487). A floor that only goes up is only useful if somebody pushes it.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
@@ -1084,6 +1096,14 @@ links a successor. Re-running those loops for the register paid for itself strai
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
 
+The check had a blind spot of its own: it only read rows marked "Open". By November the
+register had 281 rows and not one of them said "Open", so the nightly job checked nothing
+and passed in seconds. A row saying "Not reproduced; recheck if it recurs" needed no issue,
+and so had no owner. Now four words close a row out: Fixed, Not a defect, Infrastructure
+and Superseded. Any other status leaves the flake unresolved, and the row needs an issue
+(#2491). The first run found nine rows that didn't fit, and every one of them was done; they
+had just said so in their own words.
+
 Some flakes are tests that quietly share the machine. The port allocator skips any port
 something on the host already listens on, so a published port never shadows a host daemon.
 Its bookkeeping tests built the allocator the same way, over the fixed range 10000 to 10003,
@@ -1191,6 +1211,19 @@ either side of the change, so deleting macOS code counts too. `select-jobs.sh` r
 with `git show` into a variable and matches it with `case`, not `git show | grep -q`: under
 `set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
 writing the rest, and the pipeline then reports failure for a file that matched.
+
+"The maintainer labels it at code freeze" is a habit, though, and a habit is what the audit
+of November 2026 found doing the work of a lock
+([#2483](https://github.com/reliaburger/reliaburger/issues/2483)). `main`'s ruleset forbade
+deleting the branch and rewriting its history, and nothing else: no required check, no required
+pull request. An unlabelled gate PR ran the light set, went green, and its merge button worked.
+There are two halves to fixing that. The code half is ours: the evidence gate now refuses a
+`release-*` pull request into `main` that's out of draft and has no `release-gate` label, with
+a message saying to add it, and `open_train.py` opens the gate PR as a draft. The other half is
+a repository setting, a ruleset that makes `ignored-test evidence` a required check on `main`,
+and changing who may merge what is the maintainer's call, not an agent's. So the runbook now
+says which ruleset enforces each sentence, and gives the one `gh api` command that shows whether
+it does.
 
 Three weeks later we undid the split. By November the macOS queue was worse, not better:
 over three days, 147 macOS jobs queued a median of 6.9 minutes, but 90 at p90. The job logs
@@ -1375,6 +1408,28 @@ now, which runs on every change anyway, so a train PR asks for 9 runners instead
 queue group for 18 instead of 20. A queue group that changes only documentation now skips the
 code jobs as a pull request does, since its code is the code of the group in front of it.
 Two of the window's 32 groups would have.
+
+"Only documentation" turned out to be the risky phrase. `is_docs_only` named a few files
+under `docs/` that tests read, then called the rest documentation. But the suite reads the
+release log, the book chapters and the qualification records, relish's concept-budget test
+reads `docs/testing/concept-budget.json`, and relish packs the book, the design docs and
+`testing.md` into its source bundle. A pull request that edited one of those ran no Rust test,
+nor did its queue group, and the first run to notice was the push after it landed, with the
+train already red for every group behind it
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)). So the rule is inverted:
+under `docs/`, only the plans, talks, research notes and the PDF configuration are
+documentation, and everything else is code until shown otherwise. A list of exceptions
+rots the day a new test reads a new file; a list of things nothing reads rots much more
+slowly. A test also greps `src/` and `tests/` for `"docs/...` literals and asserts that none
+of them names a file the selector would skip.
+
+The benchmark output had a smaller version of the same mistake. Its name is `gossip`, because
+`make bench` once ran only the gossip benchmarks, and it was set by gossip paths alone. Then
+the scheduler's planning pass and policy evaluation joined the same target, and a pull request
+that changed either, or broke their benchmark's build, didn't run them until the merge queue
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)). The output keeps its name,
+since renaming it touches the workflow and two test files for no change in behaviour, and now also
+fires for `benches/scheduler.rs`, `benches/policy.rs` and the modules they import.
 
 Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
 longer compete with the PRs an author is waiting for. What we didn't do matters as much.
@@ -1689,6 +1744,18 @@ The candidate build rests only on a push or nightly run in which `portable macOS
 runs `ci.yml` itself. What we gave up is a day: a macOS break can now sit on a train until the
 nightly finds it, instead of being refused at the door.
 
+Except the nightly didn't run. Not once. We'd reasoned our way to a separate workflow precisely
+because GitHub schedules from the default branch, and then merged that workflow into the train,
+not `main`. A scheduled workflow GitHub can't see on `main` doesn't exist as far as GitHub is
+concerned: `gh run list --workflow macos-nightly.yml` answered "workflow not found on the
+default branch", and it couldn't be started by hand either. The train got macOS runs only by
+accident, on the two pushes that followed a docs-only merge group
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). The fix is a rule and a check.
+The rule: a schedule-only workflow (one that only `schedule` or `workflow_dispatch` starts) goes
+to `main` in its own small PR. The check: `open_train.py` lists `main`'s workflows before it
+writes anything, and refuses to open a train while the local tree has a schedule-only one that
+`main` lacks.
+
 What didn't we do? We didn't make the macOS job `continue-on-error` in the queue: it would
 still take a runner for an hour and still set each group's length, only without counting. We
 didn't shard it again: three shards each compiled the whole crate, which is why it became one
@@ -1704,6 +1771,90 @@ whatever its labels say. A new `lint` output carries "there's code to lint" on i
 the expensive run still going. `appliance.yml` and `build.yml` follow the same rule. And the
 cargo-fuzz job no longer runs on pull requests. Its 14 to 33 minutes now run only nightly and
 by hand, while the portable suite still feeds every target its checked-in corpus on each PR.
+
+That nightly had the macOS nightly's blind spot twice over
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). A scheduled run checks out
+`main`, and `fuzz.yml` had no step to move it anywhere else, so a decoder changed on a train got
+no fuzzing until the gate PR merged, which is the day the release is built. It now has the same
+"newest train, else `main`" step as the other two nightlies, with `fetch-depth: 0` so the train's
+branch is there to pick. `mutants.yml` already had the step, but only the train's copy did: the
+copy on `main`, the one GitHub schedules, was still the old weekly run of `main`. All three files
+go to `main` in their own pull request, and a test holds each of them to the same rule: nightly,
+never on pull requests, and on the newest train.
+
+### What the queue waits for
+
+By the 0.3.4 train, the question had moved. Batches reach the train through integration
+pull requests, which run only the cheap checks, so the run an author really waits for is the
+merge queue's: every job but portable macOS, on the merged result. Over the 29 green code
+groups from 25 to 27 November it took a median of 36.9 minutes, with no queueing at all. The
+fast-train settings had fixed the wait for a runner. What was left was the run itself.
+
+Which job sets it? Not the one you'd guess. `benchmarks` finished last in 18 of the 29
+groups, at a median of 33.2 minutes, and its numbers gate nothing: Criterion's output is
+uploaded and nobody compares it. Its log says where the time went. `cargo bench --bench
+gossip` printed `Finished` after 20 minutes 2 seconds, with every dependency restored from
+the cache; the benchmarks themselves then ran for about six minutes, and `bench-large` for
+seven. Twenty minutes to compile one crate is the release profile doing what we asked. Back
+in [The Full Package](09-the-full-package.md) we set `codegen-units = 1` to halve the
+binaries. A Cargo *profile* is a named set of compiler settings (`dev`, `release`, `test`
+and `bench` are built in), and `bench` inherits `release`'s, so every benchmark build hands
+LLVM the whole crate as one unit, on one of the runner's four cores.
+
+Smaller binaries don't matter to a merge group. Code that builds and runs does. So on pull
+requests and merge groups the job runs
+
+```sh
+make bench CARGO="cargo --config profile.bench.package.reliaburger.codegen-units=16"
+```
+
+`--config` overrides one setting for one invocation, as if it were in `.cargo/config.toml`,
+and `profile.bench.package.reliaburger` narrows it to our own crate. That narrowing matters
+more than it looks. Cargo fingerprints every crate with its profile settings, so the obvious
+`CARGO_PROFILE_BENCH_CODEGEN_UNITS=16` would have rebuilt every dependency,
+which the cache had restored with one unit, and set for the whole job the variable would
+also have changed `rust-cache`'s key, since the action hashes every `CARGO_` variable it
+can see. The package override changes neither. On the Mac Studio, with four build jobs to
+stand in for the runner's four cores, rebuilding the crate for `cargo bench --bench gossip`
+took 10 minutes 25 seconds at one unit and 4 minutes 22 at sixteen, and Cargo recompiled
+nothing but `reliaburger`. Scaled to the runner's 20 minutes, that's about 8, which takes
+the job from a median of 33.2 minutes to about 21.5, well inside the others. The nightly and pushes still build the release
+profile, so the numbers kept from them stay comparable with the old ones, and the task-array
+job, whose gate compares against `main`'s baseline, doesn't change at all.
+
+With the benchmarks out of the way, the two privileged Linux jobs set the pace, and one of
+them had a bug of its own. The Ubuntu 26.04 job's cache step said "No cache found" in every
+run, the nightly on `main` included, and the nightly's last lines said why:
+
+```text
+/usr/bin/tar: ../../../.cargo/registry/src/.../fnv-1.0.7/lib.rs: Cannot open: Permission denied
+##[warning]Failed to save: "/usr/bin/tar" failed with error: The process '/usr/bin/tar' failed with exit code 2
+```
+
+That job runs `make test-linux` as root, so the crates Cargo unpacked under `$CARGO_HOME`
+were root's, and `rust-cache` saves as the runner, from a post step after the job's last
+one. A warning, not a failure, so nothing went red; the job just built every dependency
+cold, about four minutes of each run, for as long as it had existed. The fix is a last step
+that runs whatever happened and hands `$CARGO_HOME` and `target/` back to the runner, and
+the 24.04 job, which builds as root too, got the same step before it could hit the same
+thing. A test checks that every job using `scripts/ci/as-root` and `rust-cache` ends with
+it. Only `main` saves that cache, so the four minutes come back once this reaches `main`.
+
+Replaying the 29 groups with those two changes moves the median from 36.6 minutes to 33.4,
+and to 32.0 once `main` saves the 26.04 cache. The next floor is plain to see: the 24.04
+privileged job at 30.4 minutes and the cluster suites, which end at 29.7. Both are real work,
+the rootless proof, the OCI interruptions and the provisioned tests in one, and twenty
+minutes of multi-node clusters in the other, and splitting either costs another runner and a
+second cold build for a minute or two. That's where we stopped.
+
+The light path didn't move. Portable Linux sets every light pull request, a median of 22.4
+minutes over the 13 green ones since 24 November, and its resource log splits that into
+about 1.5 of setup, 4 building the instrumented lib tests, 3.5 building the rest, 6.4
+running the suite at eight threads, and 4.4 writing the coverage report. The suite ran at
+a load of 5 to 10 on four cores, so more threads won't help. The report merges about 70 GB
+of `.profraw` files, one per test process. Fewer, bigger profiles would shrink that, but the
+coverage owner pins the recipe, and changing it is a change to the evidence contract, not a
+CI tweak.
 
 ### A release gate that fits in a week
 
@@ -1849,9 +2000,37 @@ itself with the same `candidate.py` and the operator's own login, and says so in
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.
 
+**Run the binary you ship, not just its version.** The gate's staged installs and soaks
+all run on Apple silicon. They exercise the macOS `relish` and, inside the quickstart's VMs,
+the aarch64 `bun`. Nothing ran the x86-64 pair before it was published except `bun
+--version`, which never starts a cluster. CI's tests don't count either: they build debug
+binaries on a newer Ubuntu, and the release is a `--release` build with eBPF on 22.04. A
+glibc symbol 22.04 lacks, or a panic on the start-up path, would have reached the first
+person to run `bun` on an x86-64 server. So the build job now starts each Linux release `bun`
+it has just built, with its own `relish`, on the process runtime, applies one app that
+sleeps, waits for it to run, and deletes it, all before it uploads the artefacts
+([#2486](https://github.com/reliaburger/reliaburger/issues/2486)). It reuses the feature
+demos' one-node cluster, so it's a real `relish init`, mTLS and an admin token, in a few
+seconds. It doesn't load the eBPF object or start runc; those need root,
+and the privileged Linux job tests them from source. The Linux cold installs still run after
+promotion, once per minor release, and the closure record says so.
+
 What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
 fast and it's ours, but a release build is the one place where "who could have touched this
 machine?" must have a boring answer. Hosted runners give that.
+
+The runner isn't the only thing in that answer, though. The build job runs two
+third-party actions, the Rust toolchain installer and the build cache, before
+it runs `cargo build`, and both were referenced by tags like `@v2`. A tag is a
+pointer its owner can move. Someone who moved `rust-cache`'s `v2` to a commit
+that tampers with the restored `target/` directory would get a release that is
+signed with our key and attested as "built by `build.yml` on `main`", and
+both statements would be true. So every third-party action is now pinned to a
+commit, with its tag in a comment for Dependabot to update
+([#2405](https://github.com/reliaburger/reliaburger/issues/2405)), and a test
+refuses a `uses:` line that isn't. The toolchain action used to carry the
+compiler version in its tag (`@1.98.0`); pinned to a commit, it takes the
+version as a `toolchain:` input instead.
 
 ### A key nobody else trusts
 
@@ -4598,6 +4777,23 @@ check sits right beside that catalogue's thresholds. `--explain` doesn't
 repeat the numbers in prose. It prints them from the constants the checks
 compare against, so the words can't say 15 minutes while the code says 10.
 
+The `next:` steps needed the same treatment, and the November 2026 audit
+showed why (#2468). Three of them named commands that couldn't run. The
+disk-pressure finding said `relish pickle gc`, which has never existed. The
+unreachable-node finding said `relish dev shell <node>`, which only works on a
+developer Lima cluster, and `journalctl -u bun`, though the systemd unit is
+`reliaburger`. The dead-node finding said "drain it", and there's no drain
+command yet. `relish agent diagnose` hands the same strings to AI agents,
+which will try to run them. The text is fixed, and a test now keeps it fixed:
+`every_command_a_wtf_suggestion_names_exists`, in `src/bin/relish.rs` because
+that's where the real clap tree is, reads the source of the wtf and diagnose
+modules with `include_str!`, takes every backtick-quoted span that starts
+with `relish `, and walks the words through `Command::find_subcommand` until
+the first placeholder or flag. A suggestion naming a subcommand clap doesn't
+know fails the build's tests. `include_str!` embeds a file's text into the
+binary at compile time, so the test reads exactly the source it was built
+from, with no path to get wrong at run time.
+
 The renderer groups the report's four lists into rows, and the row type
 borrows from the report rather than copying it:
 
@@ -5280,8 +5476,8 @@ as unfair then, and the case passes whenever the coin tosses go its way.
 
 A 0.3.0 soak pulse failed `deploy_from_cluster_registry` with nothing but
 "case exceeded its deadline" after 300 s ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
-The app had been committed, the status polls were bounded at 5 s each, and
-the reason carried no note from a wait that was still polling. What was left
+The app had been committed, Bun answered status reads within 5 s, and the
+reason carried no note from a wait that was still polling. What was left
 was the step after them: a `busybox wget` run inside the container through
 `exec_in_workload`. Forty attempts to reproduce it passed, so we still don't
 know that the exec hung. We do know that if it had, nobody could have said
@@ -5448,7 +5644,78 @@ records the way `Execution::launch` does, around a real `sleep`, and checks
 the line names the phase, the command and, on Linux, `(sleep) S`; a second
 Linux test checks it follows a shell's child as well, since `runc exec` runs
 its command as a grandchild. We still can't make an exec wedge on purpose,
-so #2128 stays open until the next one tells us where.
+so the exec reading stays a reading until the next one tells us where.
+
+### The first round of a wait
+
+For 0.3.4 we went over #2128 once more, this time asking whether the image
+work had fixed it by accident. That release streams layers to disk, locks
+each image generation on its own instead of the whole node, and queues
+registry writers. A slow-fsync fault is exactly what makes a node-wide unpack
+lock and its `syncfs` hurt, so it was worth asking. The answer is no, and
+the reason is the same note we leaned on above. An instance stuck pulling or
+unpacking shows up in `/v1/status` as `pending` or `preparing`, and Bun
+answers that read within 5 s however busy its agent is. The wait would have
+polled again and again and left a note saying so. There was no note, so the
+case was past the pull, or stuck before the first poll came back.
+
+That second half is where the earlier write-up was too generous. "The status
+polls were bounded at 5 s each" was true of the server's own reads, not of
+the test kit's requests. `nodes()` and `status()` used the `relish` client's
+300 s request timeout, the same length as the case. A wait writes its note
+after a round of reads finishes, so a first round that never finished left no
+note either. The forwarder's one held request fits that reading as well as
+it fits the exec. It's still a bug either way: one request that never answers,
+on one pooled connection, could spend the whole case on a question that the
+next request would have answered in milliseconds.
+
+So each round of a wait's reads now gets a bound of its own:
+
+```rust
+async fn poll_round<T, F>(&self, round: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let bound = POLL_ROUND_BOUND.min(self.deadline.remaining() / 4);
+    tokio::time::timeout(bound, round)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "a status read did not answer within {} ms",
+                bound.as_millis()
+            ))
+        })
+}
+```
+
+`POLL_ROUND_BOUND` is 10 s, or a quarter of what the case has left, so a
+round that hangs always leaves time for more. `Duration` divides by an
+integer with plain `/`. `tokio::time::timeout` gives back `Err(Elapsed)` when
+the bound runs out, and `unwrap_or_else` turns that into the same kind of
+error a failed read returns, so the wait's loop treats a hung round like any
+other failed one: it records the note and asks again. Running out drops the
+request's future, and with it the request's connection, so the next round
+asks on a fresh one. A hang that was the connection's ends there. A hang that
+was Bun's doesn't, but now the case's error reads "waiting for registry-web to
+reach 1 running replica(s) cluster-wide; … a status read did not answer within
+10000 ms" instead of "case exceeded its deadline". The wait also stops once
+its sleep has used up what's left, instead of starting one more round: a
+round with no time at all can only report the deadline, and that would
+replace the note saying what the last real round saw. `wait_for`, the
+single-node wait, takes the same bound.
+
+`a_status_read_that_never_answers_is_retried_within_the_case` serves a node
+whose first `/v1/status` never answers and whose second says `running`, and
+checks the wait passes inside the case's 8 s. Before the change it ran into
+the case deadline. `a_wait_whose_reads_never_answer_says_so` serves a node
+list that never answers and checks the wait's own error, with the hung read
+in it, comes back before the deadline does.
+
+That leaves no step in `deploy_from_cluster_registry` that can stall without
+naming itself: staging, the apply, every round of the wait and the exec each
+have a bound shorter than the case and a message of their own. We still
+haven't seen why the 0.3.0 pulse stalled, and we've stopped pretending a
+fourth reading of the same logs will tell us. A repeat will.
 
 ### Busy isn't dead
 
@@ -5876,6 +6143,19 @@ end: two requests for one instance share one signing, and both get answered
 when it fails. The last test hands the loop two finished signatures, one for
 a live instance and one for a retired one, and checks that only the live one
 gets files.
+
+The rotation tick had a hole of its own ([#2533](https://github.com/reliaburger/reliaburger/issues/2533)).
+It renewed an identity past its rotation time, and every failed signing was
+tried again on the next tick, until the certificate's hour ran out. From then
+on the tick saw `Expired`, logged a warning and asked for nothing. A council
+outage longer than the certificate's remaining life left the workload's mTLS
+broken until the instance restarted, even after the council came back. The
+`match` on the rotation state now has one arm that skips, `Valid`; every other
+state, expired included, falls through to the same renewal request, and the
+expired one still logs its warning. The test lets a certificate expire while
+the "leader" hangs up on every CSR, checks that each tick tries again, then
+hands the loop a signature and checks the identity is valid again, with no
+restart.
 
 The third was status itself. Every `Status` command asks the runtime for each
 instance's pid and exit code, and runc answers both under the instance's
@@ -6521,6 +6801,40 @@ asked once. The flaky test also polls at 250 ms instead of 50, and it treats
 says it can't answer yet) as "look again" rather than a failure, which was
 the other way it failed.
 
+That left the limit of eight leaking at the deadline (#2457). `buffered(8)`
+caps how many of the mapped futures are pending, not how many tasks they
+spawned. Once the deadline had passed, each new future spawned its read,
+timed out on its first poll and finished, and `buffered` started the next
+one at once: on a slow node with 200 instances, about 176 `runc state`
+processes began together, just when the node could least afford them. A
+future now checks the clock before it spawns anything:
+
+```rust
+let mut task = match earlier {
+    Some(task) => task,
+    None if tokio::time::Instant::now() >= deadline => {
+        return (read, Observed::Unknown, Pending::NotStarted);
+    }
+    None => {
+        let id = read.id.clone();
+        tokio::spawn(async move { observe(&grill, &id).await })
+    }
+};
+```
+
+A `match` arm can carry a guard (`if ...`) like the ones we saw in Chapter 5;
+the arm with the guard is tried first, and an unguarded `None` catches the
+rest. The third value of the tuple, which used to be an `Option` of the
+leftover task, is now a small enum, `Pending`, with a variant for each way a
+read can end: `Done`, `Running(task)` for the next sweep to wait on, and
+`NotStarted`. Those not started would always be the plan's tail, so the next
+sweep sorts them to the front, after the reads still running.
+`UnfinishedReads` carries both sets, and `sort_by_key` is stable, so within
+each group the plan's order stays. `a_state_sweep_starts_no_more_than_its_limit_after_the_deadline`
+gives the mock runtime forty instances and 30-second reads: it saw 40 reads
+start before the change and 8 after. `every_instance_is_read_within_a_few_slow_sweeps`
+checks that no instance is left out for good.
+
 #### A restart, one step at a time
 
 The restart was the longest turn of them all. It killed whatever was left of
@@ -6673,6 +6987,19 @@ what a Go programmer finds out from a data race.
 reading held every caller on the node the moment the channel filled. Now the
 task sends the tail and then starts the per-instance follows, in that order,
 so the tail still comes first.
+
+The plain read had a quieter bug that moving it into a task kept (#2472). It
+joined every instance's capture into one string, each under a `==> id <==`
+header, and only then took the last `N` lines. With three replicas on a node,
+`GET /v1/logs/web/default?tail=20` answered with the last twenty lines of
+whichever replica came last, without its header, and nothing from the other
+two, while the follow path and the manual both meant "the last 20 of each".
+`read_captures` now takes the tail and cuts each capture before it writes the
+header, and it sorts the ids first, because they come out of a `HashMap` and
+the sections used to change order between calls. A single instance still
+gets no header, so its answer is unchanged. `a_logs_tail_takes_the_last_lines_of_each_instance`
+sends both commands the route uses with `tail: Some(1)` and expects `a3` and
+`b3`, each under its own header.
 
 A join and an image signature are the same shape with a council write in the
 middle. Without quorum, openraft's `client_write` waits until the leader steps
@@ -10584,7 +10911,17 @@ lost an acknowledged write. Every one was the checker or the environment:
   forwards never went in, and the agent wrote 9 GB of logs in five minutes.
   The harness now spots that line in the start log within seconds, forces
   the VM off and starts it again. It also records that forced stop as an
-  extra power cut, because the guest had booted, and caps both logs.
+  extra power cut, because the guest had booted, and caps both logs. At
+  first it kept timing I6 from the first power-on, so the spin, the forced
+  stop and the second boot all counted against Bun, and two runs stopped on
+  a 314 s "slow recovery". The clock now starts again with the start that
+  booted ([#2542](https://github.com/reliaburger/reliaburger/issues/2542)).
+- **A writer nobody could read.** Twice Bun never answered after a cut, so
+  the harness couldn't read `/data/seq` at all. I6 failed, rightly, but I1
+  failed too, as if acknowledged writes had gone. Nothing had been read, so
+  nothing was known. I1 now says "undecided" (`"pass": null`), the cut lists
+  it apart from its violations, and the summary leaves an undecided cut out
+  of the bound: it proved nothing either way.
 
 One more: `--resume` carried a run on past a violation, powering the kept VM
 on and overwriting what we'd have diagnosed. It refuses now. And because
@@ -10594,6 +10931,65 @@ the last cut of a run whose late start nobody ever recorded, it says
 "undecided" rather than "pass". A checker that cries wolf is less dangerous
 than one that can't fail, but only just: after the third false alarm you
 stop reading the alarms.
+
+### And then a real one
+
+With the checker trusted, the runs started finding Reliaburger's own bugs.
+In run 37, cut 108, Bun came back after the power-on, began re-adopting the
+containers that had survived, and exited: `cannot restore workload
+ownership: runtime adoption timed out for default__hello-0`. systemd started
+it again two seconds later and it recovered, with no data lost, which is why
+I1, I2 and I7 passed and only I4 ("Bun started once") caught it. The journal
+showed a loaded box: the report worker's snapshots had been timing out for
+fifteen seconds before it. Adoption gives each instance 10 s to prove it's
+still the launch its record names, and the timeout was written with `??`, so
+a slow answer became an error and the error ended startup
+([#2541](https://github.com/reliaburger/reliaburger/issues/2541)).
+
+Startup refuses on uncertainty for a reason: an instance Bun can't account
+for might still be running, and starting a second copy beside it is worse
+than not starting. But a slow adoption is a different kind of uncertainty
+from a corrupt record, because Bun can settle it: kill the instance and wait
+for the runtime to confirm it has exited. Then the instance is known to be
+stopped, and it can be retired like one the runtime refused, to start again
+through ordinary reconciliation. So the timeout now gets a `match` of its
+own instead of the `??`:
+
+```rust
+let adopted = match tokio::time::timeout(
+    ADOPTION_TIMEOUT,
+    self.supervisor.grill().adopt(&runtime_id, &record),
+)
+.await
+{
+    Ok(answer) => answer?,
+    Err(_) => {
+        self.fence_unanswered_adoption(&runtime_id).await?;
+        false
+    }
+};
+```
+
+`tokio::time::timeout` wraps the future's own `Result` in a second one: the
+outer `Err` means time ran out, the inner one is the runtime's own error.
+`??` unwraps both and returns either error, which treats "slow" and "wrong"
+the same. The `match` keeps the runtime's errors as fatal as they were, and
+gives the timeout its own answer. If the kill isn't confirmed, startup still
+refuses, as it always did.
+
+What about the half-finished adoption? The run left a runc helper process
+behind when Bun exited, so it mattered. When a timeout fires, Rust drops the
+future it was waiting on, and dropping an async future cancels it at its
+last `.await`. That would be a problem if the adoption's runc commands lived
+inside that future. They don't: runc's Grill runs every operation on an
+instance in a `tokio::spawn`ed task holding that instance's lifecycle lock,
+and dropping a task's `JoinHandle` only stops waiting for it. The task runs
+on and reaps the commands it started. The fence's kill takes the same lock,
+so it queues behind the adoption, which is why the kill gets the adoption's
+10 s on top of its usual bound. The test is a mock runtime whose adoption of
+one instance takes a minute, under Tokio's paused clock so it doesn't: Bun
+must adopt the other instance, kill the slow one after its adoption began,
+and remove its record (`an_adoption_past_its_timeout_is_fenced_and_retired_and_bun_starts`).
 
 ## A thousand nodes that aren't there
 
@@ -10703,7 +11099,16 @@ with someone else's build measures that build.
 
 ### What we found
 
-Twenty nodes is a check (`make test-hollow`). The measured runs went through
+Twenty nodes is a check (`make test-hollow`), and so, later, was a hundred nodes holding a
+thousand apps, against the cluster summary's 1 s budget. For a while nobody ran either. The
+ignored-test owner check was satisfied, because the reason names a `make` target that exists,
+and the design doc said "Manual", but no document said whose hand and when
+([#2489](https://github.com/reliaburger/reliaburger/issues/2489)). "Manual" without a name is
+"never". The target now has a row in `testing.md`'s table of manual gates, with the maintainer
+as owner and the changes that call for a run, and a test fails when a `make` target that runs
+ignored tests is in neither a workflow nor that table. Putting it in CI is the better answer,
+but the hundred-node budget has never been timed on a hosted runner, and a 1 s budget measured
+on a Mac Studio is a guess about a two-core VM. The measured runs went through
 `scripts/release/qualify-hollow-nodes.sh` on an M1 Max with 64 GB, one size at
 a time ([record](../qualification/2026-10-28-hollow-nodes.md)):
 
@@ -10727,6 +11132,7 @@ grew was everything that meets the fleet one node at a time:
   about 600 a second, against the 200 a second a thousand nodes send on a
   five-second interval (a refused worker tries again). The planned reporting tree ([#364](https://github.com/reliaburger/reliaburger/issues/364))
   is meant for exactly this; now we know it's needed well before 10,000.
+  The refusals themselves are fixed; the next section shows how.
 - **The API.** Twenty small applies took 32 ms each at the median at 100
   nodes and 2.6 s at 1,000, while the Raft commits underneath stayed at 25 ms.
   A thousand placement reconcilers polling the leader every two seconds is
@@ -10742,6 +11148,151 @@ record treats the gossip and failure times as upper bounds for real hardware,
 not predictions. But a fixed limit of 16 report connections doesn't come from
 a slow laptop, and it would have stayed hidden
 behind "10,000 (target)" until somebody built that fleet.
+
+### Sixteen connections
+
+The report refusals turned out to be three limits stacked on top of each
+other, and only the first was the one the record named
+([#1411](https://github.com/reliaburger/reliaburger/issues/1411)).
+
+A worker opens a fresh TCP connection for every message, and every tick sends
+two or three: the state report, the capability report and, when the agent has
+evidence, readiness. Five hundred nodes on a five-second interval is about 250
+connections a second, and nodes that started together tick together, so they
+arrive in bursts. The listener read 16 of them at a time and closed the rest
+on the spot. That was the first limit.
+
+A connection it did read put its report on a queue for the aggregator, also 16
+deep, with `try_send`: a full queue meant no acknowledgement, which the worker
+counts as refused. That was the second.
+
+The third was why the queue was full. After every message the aggregator
+published its whole view on a `watch` channel, and building the view clones
+every node's latest report. That's O(N) work per message and O(N) messages per
+interval, so the leader's reporting work grew with the square of the fleet.
+Worse, each report also refreshed the freshness table against gossip's member
+list with `members.iter().any(...)` inside a `retain`: another N × N, twice per
+message. At 500 nodes that's a quarter of a million string comparisons per
+report.
+
+A test reproduces it without the rest of the harness.
+`five_hundred_workers_report_to_one_leader_without_a_refusal`, in
+`tests/reporting_tcp.rs`, starts one aggregator on a real socket, fed a
+500-member gossip list, and 500 real `ReportWorker`s with fake agents, all at
+once, so their ticks line up the way they do after a leader change, when
+every worker re-points and reports at the same moment. Each worker's
+transport is wrapped in a `CountingSender` that counts the sends the leader
+didn't admit. Wrapping works because `ReportWorker` is generic over the
+`ReportingTransport` trait: the test supplies its own implementation and the
+worker can't tell. Before the fix, 4,684 of 6,000 sends in 32 seconds were
+refused, and 49 nodes never made it into the leader's view at all.
+
+We had four candidate fixes: a cap sized from the membership, backpressure
+instead of refusal, long-lived multiplexed connections, or jittered report
+ticks. Multiplexing would also save a TLS handshake per message, but it's a
+new protocol, and the reporting tree
+([#364](https://github.com/reliaburger/reliaburger/issues/364)) will change
+who connects to whom anyway. Jitter spreads the steady state but does nothing
+for the burst after a leader change. A bigger cap only moves the cliff. So:
+backpressure, and stop doing quadratic work.
+
+**Wait, don't refuse.** The accept loop now takes a slot from a
+`tokio::sync::Semaphore` *before* it calls `accept()`:
+
+```rust
+let permit = tokio::select! {
+    _ = shutdown.cancelled() => break,
+    permit = Arc::clone(&capacity).acquire_owned() => match permit {
+        Ok(permit) => permit,
+        Err(_) => break,
+    },
+};
+```
+
+The permit moves into the connection's task and goes back to the semaphore
+when the task ends, because dropping an `OwnedSemaphorePermit` releases it
+(chapter 5 has the details). With every slot taken, the loop simply stops
+accepting. New connections wait in the kernel's listen backlog, and their
+senders wait with them, inside the deadlines they already had: five seconds
+to connect, ten for the whole send. The limit went from 16 to 64 because
+there's no longer anything to gain from keeping it tiny; it bounds memory
+(each slot may hold a frame of up to 1 MiB), not admissions. A stalled peer
+still can't make the listener spawn a task, which is what the old cap was
+for: the unit test that used to check a refusal now holds every slot with
+half-written frames, checks that one more report isn't read, frees a slot,
+and checks the waiting report goes through.
+
+There was a hole in that. The November 2026 audit
+([#2364](https://github.com/reliaburger/reliaburger/issues/2364)) found it in
+the 16-slot listener, and the change above kept it: the slot is taken at
+accept, before the TLS handshake, so 64 sockets that never send a byte still
+hold every slot, and an honest node's report waits behind them
+until it times out. Waiting instead of refusing doesn't help when the thing
+you wait for never comes. Chapter 11 splits the budget in two: connections
+that haven't delivered a whole frame get slots of their own, and the oldest of
+them makes room for a newcomer once it has stalled for a second
+([#2380](https://github.com/reliaburger/reliaburger/issues/2380)).
+
+The queue works the same way: `tx.send(...).await` instead of `try_send`, so
+a report that finds the queue full waits for room. That wait sits inside the
+connection's ten-second accept deadline, and only a report that made it onto
+the queue is acknowledged. A queue that never drains still can't produce a
+false acknowledgement, and
+`a_report_that_never_finds_room_is_not_acknowledged` checks exactly that, on
+a paused clock so the ten seconds cost nothing.
+
+**Publish once per burst.** The aggregator's `select!` now starts with
+`biased;` (chapter 17 explains it: arms are polled in order rather than at
+random). The timers and watches come first so a busy queue can't starve
+them, then the report queue, then one last arm:
+
+```rust
+_ = std::future::ready(()), if unpublished > 0 => {
+    self.publish();
+    unpublished = 0;
+}
+```
+
+`std::future::ready(())` is a future that's finished the moment it's polled,
+and the `if` guard switches the arm off when there's nothing to publish.
+Because it's polled last, it only wins when the report queue had nothing
+ready: the aggregator stores everything that's queued, then publishes once. A
+long burst still publishes every 256 reports, so nobody waits for the end of
+it. Consumers lose nothing, because a `watch` channel only ever holds the
+latest value anyway. The membership check builds a `HashSet` once per call
+instead of scanning the list once per entry.
+
+That still left the membership check running once per report, a walk over
+the whole member list each time: O(N) per message, O(N²) per interval again,
+just with a smaller constant. The audit caught it too
+([#2440](https://github.com/reliaburger/reliaburger/issues/2440)). The
+freshness table only depends on the member list and the leadership epoch, so
+now it's reconciled when one of them changes: at construction, in the
+membership watch's arm of the `select!`, and when the epoch moves (a cheap
+integer comparison on every report notices that). The test that pins it,
+`a_report_does_not_rebuild_the_state_once_per_message`, counts work instead
+of timing it. A `#[cfg(test)]` field on the aggregator counts publishes and
+reconciliations (the attribute compiles the field, and every line touching
+it, only into test builds, so production carries none of it). With 200
+members and a queued burst of 200 reports it sees no reconciliation at all
+and at most two publishes. Two, not one, because tokio makes a task yield
+after about 128 channel operations, its *cooperative budget*, so one burst
+reaches the last `select!` arm twice.
+
+After the fix the same test admits all 6,000 sends with every node in the
+view, and 1,000 workers admit all 12,000. The full harness agrees: on the Mac
+Studio, 500 hollow nodes went from 17,223 refused admissions to none
+([record](../qualification/2026-11-24-hollow-nodes-report-admission.md)).
+
+A thousand hollow nodes still logged resets, and they taught us where the
+next limit is. The leader's process sat at 8% CPU with its listen backlog
+full. The slots weren't waiting on the leader; they were waiting on the
+clients. A fleet process too starved to keep its own agent loops on time
+connects, then writes its frame late, and the slot waits for it. Real nodes
+aren't a thousand tasks sharing ten threads, so that's mostly the harness
+measuring itself, and splitting the fleet across machines
+([#1413](https://github.com/reliaburger/reliaburger/issues/1413)) is how
+we'll find out how much.
 
 ## Files nobody could read
 
@@ -11151,6 +11702,25 @@ recover` refuses a state that doesn't sit where its name says. None of the three
 derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
 each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
 than the structs.
+
+The task-array target was only half the story, though. It decodes the JSON that
+`POST /v1/batch/manifest` reads, but `relish batch submit` starts from a TOML file, and a
+TOML parse is a different decoder with its own corner cases: dotted keys, inline tables,
+integers too big for the field. Three more targets close the gap. `task_manifest_file`
+parses the TOML as relish does, encodes it as the JSON relish sends, and checks the API
+decodes the same manifest. It then runs the trial registration `--dry-run` runs and, when
+that succeeds, registers the manifest a second time under the same request id from the
+re-decoded copy. A retry is a fresh HTTP request, decoded afresh, and it must land on the
+batch the first attempt created, not a new one or a refusal. `task_array_submit` and
+`batch_submit` cover the other two batch bodies, `POST /v1/batch/array` from `relish run
+--batch` and `POST /v1/batch` from `relish batch`. Both check what their handlers promise
+once they've settled the namespace: the request and the job it carries name the same one.
+
+`task_manifest_file` passes its allocator as `&mut allocate` rather than `allocate`.
+`TaskArrays::apply` takes `impl FnMut() -> u64` by value, which would move the closure into
+the first call and leave nothing for the retry. The standard library implements `FnMut` for
+`&mut F` whenever `F` is `FnMut`, so lending the closure works, and both calls draw ids from
+the one counter.
 
 ### Ranking what's left
 

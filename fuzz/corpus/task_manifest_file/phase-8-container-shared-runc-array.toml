@@ -1,0 +1,39 @@
+# Real containers: a task array on reusable containers (shared-runc).
+#
+# 1,000 short commands, one template. With runtime = "shared-runc" a worker
+# keeps up to 32 compatible containers warm and runs each task as its own
+# process inside one, in its own task cgroup, with fresh /tmp and /dev/shm,
+# instead of creating a container per task. The default runtime, runc,
+# starts a fresh container for every task. Every task still has its own
+# identity, retries and result; {index} becomes the task's number.
+#
+# Requires rootful runc on Linux 5.8 or later (on macOS, the managed Linux VM
+# from `relish setup --quickstart`). Host execution, rootless runc and GPU
+# requests can't select shared-runc.
+#
+# Submit, watch and inspect:
+#   relish batch submit examples/phase-8/container-shared-runc-array.toml --dry-run
+#   relish --output json batch submit examples/phase-8/container-shared-runc-array.toml
+#   relish batch watch <ID>
+#   relish batch results <ID> --failed --limit 20
+#
+# The same array from the command line, without a manifest:
+#   relish run --batch checksums --count 1000 --runtime shared-runc \
+#     --image public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028 \
+#     --cpu 100m-250m --memory 16Mi-32Mi -- /bin/sh -c 'echo {index} | md5sum'
+
+name = "checksums"
+namespace = "default"
+
+[[cohort]]
+name = "md5"
+count = 1000
+chunk_size = 128
+max_attempts = 3
+task_timeout_secs = 30
+[cohort.template]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+runtime = "shared-runc"
+command = ["/bin/sh", "-c", "echo {index} | md5sum"]
+cpu = "100m-250m"
+memory = "16Mi-32Mi"

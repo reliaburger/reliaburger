@@ -10,6 +10,8 @@ Every workload in Reliaburger gets its own cryptographic identity. Not a shared 
 
 The design is zero-configuration. Deploy an app, it gets an identity. No annotations, no sidecar injectors, no admission webhooks.
 
+That's the design. Today only app instances (and image builds) are issued one, and only on a cluster: a standalone node has no council to sign it. Job tasks don't get an identity yet, though the URI below already has room for them.
+
 ### SPIFFE URIs
 
 SPIFFE (Secure Production Identity Framework for Everyone) gives us a standard way to name workloads. A SPIFFE URI looks like this:
@@ -151,7 +153,7 @@ pub enum RotationState {
 }
 ```
 
-If the council is unreachable when rotation is due, the worker extends the certificate's local validity by up to 4 hours. That gives 5 hours total (1-hour cert + 4-hour grace) before things break. Long enough to survive most outages. The grace period is tracked locally and logged as a security event.
+If the council is unreachable when rotation is due, the worker keeps the certificate it has and tries again on each check. Nothing extends it, though. The design sketched a 4-hour local grace period, five hours in all, and `GracePeriod` above is the state it would use, but nothing in Bun's renewal loop ever enters it. It couldn't help much anyway: a certificate's `notAfter` is signed, and the peer checks it, not the worker. So a council outage breaks workload mTLS between 30 and 60 minutes in, one hour after each instance's last good rotation. The design doc said otherwise in the present tense until the November 2026 audit caught it (#2498); an operator who planned a three-hour council window around "five hours" would have found out the hard way.
 
 ### OIDC JWTs
 
@@ -695,7 +697,7 @@ let tokens = council.api_tokens().await;
 replace_tokens_unless_changed(store, &seen, tokens).await;
 ```
 
-`replace_tokens_unless_changed` takes the write lock, and only writes if the store still equals `seen`. If a handler got in between, that tick does nothing and the next one, five seconds later, catches up. `ApiToken` derives `PartialEq`, and comparing a slice compares its elements one by one, so `current.as_slice() == seen` is all the comparison takes. `api_tokens()` is new too. It clones only the token list under the read lock, where `security_state()` clones the whole desired state to throw most of it away, and this runs on every tick on every node.
+`replace_tokens_unless_changed` takes the write lock, and only writes if the store still equals `seen`. If a handler got in between, that tick does nothing and the next one, five seconds later, catches up. `ApiToken` derives `PartialEq`, and comparing a slice compares its elements one by one, so `current.as_slice() == seen` is all the comparison takes. `api_tokens()` is new too. It clones only the token list under the read lock, where `security_state()` then cloned the whole desired state to throw most of it away (it no longer does; see [How fresh is "the current state"?](#how-fresh-is-the-current-state)), and this runs on every tick on every node.
 
 What if the replica is more than two seconds behind? We can't wait for ever, and the write has committed, so the node drops the token from its store anyway and answers. A refresh from that lagging replica can bring it back until the replica catches up, though, and a silent "revoked" would be a lie. So the answer says so: `token ci revoked, but this node's replica is behind: it may accept the token again until it catches up`. Only a revoke gets that warning. A rotated secret on a lagging node just gets a `401` until it catches up, and the caller still has the secret. The one gap we left is a zero-grace rotation through a node that far behind: the old secret works there until the replica catches up, and the answer doesn't say so.
 
@@ -704,6 +706,62 @@ The other timeout is the leader not answering at all, and here each route loses 
 Writing the join-token test turned up one more. `join_token_create_handler` matched `Ok(_)` and answered `200` with a plaintext, even when the state machine had refused the entry because the node is retired. The caller got a credential that existed nowhere. Now a refusal is a `409`, like everywhere else. `Ok` from `council.write` means "the entry applied", not "the state machine agreed", and `CouncilResponse::Refused` is the second question. The compiler can't ask it for you past a wildcard arm.
 
 `join-token list` and `join-token revoke` came later (#1893), and at first they repeated the old pattern: read the node's own replica, then write. On a follower, revoke then called `council.write`, which answers `503` there. On a follower that hadn't yet applied a token the leader had just committed, the replica held nothing for that node id, so there was nothing to write, and the answer was `200` with `"revoked": 0`. Both now start the way create does, with `council_to_forward_to`, and the leader does the reading and the writing. The list is a `GET`, so it goes through `forward_get_to_leader`, and both are wrapped in the same timeout, 20 seconds today. The proxy passes on the leader's body but not its headers, so a small helper, `with_json_content_type`, labels a successful answer as JSON again, which is what create already did inline. Every join-token route now asks who leads before it touches the replica.
+
+### Streams that outlive their token
+
+All of that stops the *next* request. A followed log, the event stream and their WebSocket twins aren't a next request: the middleware authenticates them once, when they open, and then they run for as long as the client stays connected. Revoking a token, or its expiry passing, left them delivering until the TLS connection's one-hour lifetime cut them off, and on a plaintext loopback listener, never ([#2399](https://github.com/reliaburger/reliaburger/issues/2399)). Revoke is what you run when a token has leaked, so this was the one place where "stops at once" mattered most and held least.
+
+The fix is a small handle the middleware leaves beside the `AuthContext`, a `CredentialWatch`. It holds the token store and the principal id (or, for a browser session, the session store and its id; for a workload JWT, its `exp`), and it has one method, `is_live`, which applies exactly the rules the middleware applies to a new request, grace periods included. The service principal and the bootstrap window get no watch, so the node-to-node fan-out streams carry on as before. A stream then waits on this:
+
+```rust
+pub async fn credential_ended(watch: Option<CredentialWatch>) {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(CREDENTIAL_RECHECK_INTERVAL).await;
+        if !watch.is_live().await {
+            return;
+        }
+    }
+}
+```
+
+`std::future::pending()` is a future that never completes: with nothing to watch, the stream never ends for this reason. We poll every 15 seconds, the SSE keep-alive period, instead of pushing revocations to each stream. The store is a plain `RwLock<Vec<ApiToken>>` refreshed from Raft every five seconds, so a channel per principal would be more machinery for a few seconds' gain.
+
+For the SSE responses, one helper wraps the body after the handler has built it. `end_with_credential` leaves anything that isn't `text/event-stream` alone, so a refusal or an ordinary answer passes through, and otherwise ends the body once `credential_ended` resolves, sending one farewell event first. For a log or event stream that's a `warning` event, which `relish logs -f` already prints to stderr; for `relish apply --wait`, `relish rollback` and `relish scale` it's an `ApplyEvent::Error` saying the deploy itself carries on. The stream combinator inside is `futures_util::stream::unfold`, which builds a stream from a state and an async closure that returns the next item and the next state, or `None` to stop:
+
+```rust
+futures_util::stream::unfold(state, |(mut stream, mut ended, farewell)| async move {
+    let farewell = farewell?;
+    tokio::select! {
+        item = stream.next() => item.map(|item| (item, (stream, ended, Some(farewell)))),
+        () = &mut ended => Some((farewell, (stream, ended, None))),
+    }
+})
+```
+
+The farewell rides in the state as an `Option`. Once it has been sent the state holds `None`, and `farewell?` ends the stream on the next poll. (`?` works on `Option` as well as `Result`: on `None` it returns `None` from the closure's future.) Wrapping the whole response, rather than each handler's stream, is what let the deploy and job progress streams pick the check up without threading a watch through every function between the handler and the job runner. It also means a handler has to remember to wrap it. `relish scale`, added later (#2176), streams the same apply progress and was missed: a scale started by a token revoked meanwhile kept streaming until it finished ([#2526](https://github.com/reliaburger/reliaburger/issues/2526)). Its two streaming returns, the leader's own apply and a follower's forward to the leader, now go through `end_with_credential` too. `a_scale_progress_stream_ends_once_its_token_expires` points a follower at a fake leader whose stream never ends, so only the credential check can end the answer.
+
+The WebSocket sessions are loops around `tokio::select!`, so they take the future as one more branch:
+
+```rust
+let credential_ended = crate::sesame::auth::credential_ended(watch);
+tokio::pin!(credential_ended);
+loop {
+    tokio::select! {
+        () = &mut credential_ended => {
+            let _ = socket.send(credential_ended_close()).await;
+            return;
+        }
+        // ... frames and the client's messages
+    }
+}
+```
+
+`select!` would build a fresh future from `credential_ended(watch)` on every turn of the loop if we wrote the call in the branch, restarting its timer each time a log line arrived. So we make it once and poll it by `&mut` reference. Polling through a reference needs the future pinned (it may hold references into itself across `.await`s, so it mustn't move), and `tokio::pin!` pins it on the stack. The Close frame carries code 1008, policy violation, and the same reason the SSE warning gives.
+
+The tests drive real sockets, because an in-process `oneshot` request can't hold a stream open. `an_open_event_stream_ends_once_its_token_is_revoked` opens `/v1/events?follow=true` with a read-only token, revokes it, records an event, and checks the body ends with the warning and without the event. `an_open_log_websocket_closes_once_its_token_expires` gives a token two seconds to live and waits for the 1008 Close. `an_open_event_stream_outlives_its_recheck_while_the_token_is_valid` is the twin that keeps us honest the other way. Under `cfg!(test)` the re-check runs every 200 ms, so none of them waits 15 seconds.
 
 ### Every node at once
 
@@ -919,6 +977,8 @@ Reads got the same rule, for the same reason `/v1/status` did: a token scoped to
 
 One case has no scope to apply. On the loopback listener reads are open to anyone, and a scoped token that gets refused could just be left off the request. We check it only where reads need a principal in the first place.
 
+Scopes weren't the only thing the registry forgot. A `[permission]` block narrows one token to named actions on named apps, and `/v1/build` already treated pushing an image as a `deploy` of its app. The registry port didn't read the blocks at all, so a Deployer token whose block allowed only `logs` could still `docker push` over any repository its scope reached (#2398). Chapter 5 has the fix: the write gate now holds a push to the same `deploy` rule, so `relish build` and `docker push` agree again. The fix read the blocks from the node's replica, and that turned up one more hole: a node with no Raft seat has an empty replica, so neither its API nor its registry saw any block at all (#2538). Chapter 4's "Tokens for a node with no seat" has how the leader's security view now carries the blocks.
+
 ### Fail closed, not open
 
 A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine: you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
@@ -1055,6 +1115,8 @@ Every forward that carries a caller's value now goes through it: the lease reads
 Second, the relay checks its allowlist against the path it built, not the one it was given. `relay_peer_path` splits the decoded path on `/`, runs the segments through `peer_path`, and passes only a path that came back unchanged: one that needed no encoding at all. App names, namespaces and the allowlisted routes are plain text, so nothing the relay serves needs a `%`, and a path that would need one is refused rather than rewritten. `Option::then_some` keeps the end tidy: `allowed.then_some(peer_path)` is `Some(peer_path)` when `allowed` is true and `None` otherwise.
 
 The tests come in three layers. `peer_path`'s own unit tests feed it backslashes, slashes, percent signs, tabs, newlines, NUL and a C1 control character, and one parses the result again with the scheme and authority to show the segment count survives. `relay_refuses_backslashes_in_a_segment` and its neighbours hold the allowlist to the built path. And `the_relay_refuses_encoded_backslashes_tabs_and_newlines` sends the encoded forms through a real entry node to a real peer, and checks the ordinary `v1/status` relay still answers beside them.
+
+The relay also had to learn to stop waiting (#2393). It reads the peer's whole answer before replying, so it can cap it at 8 MiB, but only `send()` had a deadline, and `send()` returns as soon as the headers arrive. `v1/events` is on the allowlist and the caller's query string goes along with it, so `?follow=true` asked the peer for an event stream that never ends, and the relay sat collecting keep-alives until the caller gave up. A peer that sent its headers and then stalled did the same to any route. Now the send and the body loop run inside one `tokio::time::timeout`, so a relayed request ends within its 30 seconds whatever the peer does, and a followed `v1/events` is refused with a 400 before anything is sent: `/v1/events?follow=true` on any node already follows the whole cluster. `the_relay_gives_up_on_a_peer_that_stalls_mid_answer` stands up a peer from a bare `TcpListener` that writes the headers and one chunk and then goes quiet, and checks the relay answers 504.
 
 ### Node-only routes stay node-only
 
@@ -1529,7 +1591,7 @@ Decryption is only half the story. Where does the plaintext go next? The agent d
 
 Two things made that a real leak rather than a theoretical one. `tokio::fs::write` creates files with the process umask, which on most hosts means 0644, so any local user could `cat` the file. And nothing ever deleted it. Stop the instance, `relish delete` the app, and the spec stayed in `bundles/<instance>/` indefinitely. Only the rootless path happened to rewrite it 0600, and only because it adds a hook to the spec after the first write.
 
-The fix lives in a small `grill::bundle` module with three functions. `create_private_directory` makes the bundle directory 0711 (and tightens one an older release left at 0755): searchable but not listable, because a container with a user namespace remounts its rootfs from inside that namespace and needs to pass through, which 0700 refused with `remount-private …: permission denied` the first time CI ran it. `write_spec` goes through the same `atomic_write_mode` helper the identity code uses: the temporary file gets mode 0600 *before* a single byte lands in it, then a rename swaps it into place, so there is never a moment when a readable copy exists. `remove_spec` deletes `config.json` once runc has deleted the container, along with any temporary a killed writer left behind (it holds the same plaintext).
+The fix lives in a small `grill::bundle` module with three functions. `create_private_directory` made the bundle directory 0711 (and tightened one an older release left at 0755): searchable but not listable, because a container with a user namespace remounts its rootfs from inside that namespace and needs to pass through, which 0700 refused with `remount-private …: permission denied` the first time CI ran it. It's 0710 now; we'll see why in a moment. `write_spec` goes through the same `atomic_write_mode` helper the identity code uses: the temporary file gets mode 0600 *before* a single byte lands in it, then a rename swaps it into place, so there is never a moment when a readable copy exists. `remove_spec` deletes `config.json` once runc has deleted the container, along with any temporary a killed writer left behind (it holds the same plaintext).
 
 ```rust
 tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
@@ -1538,6 +1600,25 @@ tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
 ```
 
 The helpers are ordinary blocking `std::fs` code, so the async cleanup hands them to `spawn_blocking`. That returns a `Result` wrapped in another `Result`: the outer one says whether the blocking task itself survived (it could panic), the inner one is our I/O result. Hence the double `??`, which unwraps one layer each.
+
+That 0711 had a hole of its own, which the November 2026 audit found (#2412). "Searchable but not listable" protects a secret file whose name nobody can guess. It doesn't protect a path everybody knows: the private overlay's upper directory is `bundles/<instance>/rootfs-upper`, and instance ids aren't secret. A container running as root writes `cp /bin/busybox /pwn && chmod 4755 /pwn`, and on the host that's a set-uid binary owned by uid 2,000,000,000 at a path any local user can reach. Run it, and you're container root's host uid: the owner of every container's writable layer and managed volume on the node. The unpacked image store had the same problem without needing an accomplice, since image layers keep their set-uid bits.
+
+The fix is the one Docker uses for its `userns-remap` range: `/var/lib/docker` is 0710, owned by root with the remapped root's group. Container root on our nodes is host uid *and gid* 2,000,000,000, so a directory that's `0710 root:2000000000` lets runc's init (container root) pass through and stops everyone else. `close_to_other_users` in `grill::bundle` does it, and `create_private_directory` now applies it to the bundle and the bundle base above it; the image store's `rootfs` and the volumes directory get the same treatment. A rootless node has no shifted ids, its container root is the directory's owner, so there the mode is just 0700.
+
+```rust
+let mode = match container_group {
+    Some(group) => {
+        std::os::unix::fs::lchown(directory, None, Some(group))?;
+        0o710
+    }
+    None => 0o700,
+};
+std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+```
+
+The group changes first and the mode second, so there's no moment when the directory is open to a group it doesn't belong to yet. `lchown` takes `Option`s for both ids, and `None` leaves that one alone: the C call's `-1`, with the type saying what the magic number meant. Each function runs on every create, so a node upgraded from a release that left 0711 behind is tightened the first time it starts a container.
+
+Loop-mounted volumes also gained `nosuid,nodev`. Together with `noNewPrivileges` (Chapter 1), a set-uid file in a volume does nothing inside the container either.
 
 Why delete only the spec and not the whole bundle directory? Because the bundle also holds the instance's private overlay upper, and we promised in chapter 5 that a restart of `default__web-0` on the same image keeps its files. Removing the spec keeps that promise and still takes the secret off the disk. It also sidesteps a nasty failure mode: a `remove_dir_all` through a rootfs that is still mounted would happily delete files inside the container's view.
 
@@ -1969,6 +2050,10 @@ pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
 
 CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
 
+The CRL carries one more list: retired node identities. `relish decommission-node` adds a permanent tombstone for the node's name, so the name, its Raft id and its old certificates are never accepted again. Permanent means nothing removes one, and the list is capped at 65,536 (`MAX_RETIRED_NODES`) so it can't grow without bound. At the cap every further decommission is refused with "retired identity limit reached". That's the right answer, since forgetting a tombstone silently would let an old disk rejoin as an old node, but for a long time nothing told the operator the wall was coming ([#2375](https://github.com/reliaburger/reliaburger/issues/2375)). A cluster that autoscales workers and decommissions each one on scale-in walks towards it at fifty a day for three and a half years, then stops being able to retire nodes at all.
+
+Now `relish council status` prints `Retired: 3 of 65536 node identities`, from a `retired_identities` field each node's council status carries, and `relish wtf` raises `council-retired-identities-nearly-full` from 90%. We kept the tombstones permanent and didn't add expiry: a retired certificate stops mattering once it expires, but the name-reuse half of the rule never does. If a real cluster gets near the cap, raising it is the simpler answer. The apply paths that check a registry report or a join against the list still scan it; at a few hashes per name that's cheap until there are thousands of retirements, so we left it.
+
 ### Wiring the CRL into TLS handshakes
 
 For a long time `check_crl()` had exactly one caller: its own tests. Making revocation real meant getting it into the TLS handshake path, and that surfaced three problems worth walking through.
@@ -1997,16 +2082,38 @@ Signing a workload certificate is different. That read *is* the decision: it pul
 ```rust
 pub async fn security_state_linearizable(
     &self,
-) -> Result<SecurityState, CouncilError> {
+) -> Result<Arc<SecurityState>, CouncilError> {
     self.raft.ensure_linearizable().await
         .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
-    Ok(self.state_machine.desired_state().await.security_state)
+    Ok(self.local_security_state().await)
+}
+
+async fn local_security_state(&self) -> Arc<SecurityState> {
+    self.state_machine
+        .read_desired(|state| state.security_state.to_arc())
+        .await
 }
 ```
 
 `ensure_linearizable` checks with a quorum that this node is still the leader and has applied everything committed. On a follower it fails, and on a deposed leader it fails, which sounds like a limitation and is actually the entire point. The alternative isn't a fresh answer — followers can't produce one — it's a stale answer presented as authoritative. Returning an error says "I can't prove this is current", and the caller can forward to the leader or refuse.
 
 The general shape is worth keeping: a read whose staleness only costs you a retry can be local, a read that *is* the security decision has to prove it's current, and the two should be different function names so you can't pick the wrong one by accident.
+
+The listing above isn't the one we first wrote. That one ended with `self.state_machine.desired_state().await.security_state`: copy the *whole* desired state, every app spec, the image catalogue and the task arrays, then keep one field and drop the rest ([#2436](https://github.com/reliaburger/reliaburger/issues/2436)). `security_state()`, `security_state_confirmed()` and `manifest_catalog()` all did it, and they sit on busy paths: twice per workload certificate signed, every signed-image launch, every apply, and the council reconciler on every node every two seconds.
+
+`read_desired` was already there for this. It takes a closure and runs it against the state while holding the read lock:
+
+```rust
+pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+    read(&self.inner.read().await.state)
+}
+```
+
+The closure gets a `&DesiredState`, a borrow, and whatever it returns must not borrow from it: `T` has no lifetime tying it to the state, so the compiler won't let a reference escape past the unlock. You decide inside the closure exactly what to copy out. The reconciler, which only wants the retired names, now copies those names and nothing else.
+
+What should the security accessors copy out, then? Nothing, it turned out. Since the state's big collections became copy-on-write ([chapter 2](02-finding-friends.md#all-or-nothing-without-copying-everything)), each sits behind an `Arc`, and `to_arc()` hands out another pointer to the same allocation. So `security_state()` now returns an `Arc<SecurityState>` without copying a byte. Callers barely changed: `security.crl` and `security.trusted_cas(...)` work through the `Arc` by auto-deref. The ones that did change were moving a field *out*, like `council.security_state().await.api_tokens`, which you can't do through a shared pointer; they now say `.api_tokens.clone()`, which makes the copy visible where it happens. A reader that holds its `Arc` while a security write applies makes that write copy the security state once, which is the price of not holding the lock.
+
+A test-only counter in `CouncilStateMachine::desired_state` pins it: `reading_one_field_never_copies_the_whole_desired_state` calls every accessor and a membership change, and checks the counter didn't move. It moved by one per call before.
 
 ## Egress DNS resolution
 

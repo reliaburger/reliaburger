@@ -105,8 +105,9 @@ it.
 Push once and nodes pull layers from each other. It also caches upstream
 registries, and `relish build` builds images from your config straight into it.
 
-**Metrics, logs and alerts, nothing to install.** Each node scrapes its own
-workloads, including anything with `prometheus.io` annotations. Alert rules
+**Metrics, logs and alerts, nothing to install.** Each node scrapes the apps
+that ask for it with `metrics = {}`; an imported Kubernetes manifest gets that
+from its `prometheus.io` annotations. Alert rules
 evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.
@@ -195,7 +196,8 @@ place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
 0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
 moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2;
-0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place
+0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place,
+and 0.3.4 moves both to 62/77, so a 0.3.3 cluster starts afresh on 0.3.4
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
@@ -252,7 +254,12 @@ Neither needs a network.
 | Grafana (for the basics) | TUI and web dashboard |
 
 Config is TOML. The [whitepaper](whitepaper.md) explains the architecture
-and its trade-offs; the [design docs](design/) cover each subsystem.
+and its trade-offs; the [design docs](design/) cover each subsystem. Each
+design doc opens with three lines: `Status` (shipped, partly shipped or
+design only), `Reconciled against` (the release someone last checked the
+whole doc at, or "not reconciled") and `Sketches` (the sections that describe
+design nobody has built yet). A test keeps the header on every doc, and a
+Rust listing whose types aren't in the tree carries a sketch label.
 
 ## Scope and limits
 
@@ -285,8 +292,8 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   [compatibility policy](releasing.md#cluster-compatibility).
 - **Three nodes are what's qualified.** Every release is soaked on three
   nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
-  found the leader refusing report connections from 500 nodes up
-  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  found the leader refusing report connections from 500 nodes up, fixed in
+  0.3.4 ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
   slowing sharply between 500 and 1,000
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes
@@ -308,7 +315,8 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
 - **Kubernetes import covers the kinds listed [above](#whats-in-the-binary).**
   Anything else is reported, not applied.
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
-  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
+  whose outcome is unknown skips its later firings until you settle it with
+  `relish batch replay` ([Jobs and cron](#jobs-and-cron)).
 
 ## Operating notes
 
@@ -2001,8 +2009,11 @@ fetch it; deployments still require their normal permissions.
 configured endpoint, token and CA:
 
 ```sh
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'value'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input,
+so it stays out of your shell history and the process list.
 
 Use the resulting `ENC[AGE:...]` string in an app environment variable. A
 follower may briefly report the previous generation during rotation; fetch

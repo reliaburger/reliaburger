@@ -39,7 +39,6 @@ use super::task_array_node::{
     ArrayAssignment, ArrayProgress, HeldChunk, NodeArrayCounters, NodeSyncRequest,
     NodeSyncResponse, TaskArrayNode,
 };
-use crate::config::types::EnvValue;
 use crate::council::types::{CouncilResponse, RaftRequest};
 use crate::meat::NodeId;
 use crate::meat::task_array::ChunkId;
@@ -570,8 +569,18 @@ pub fn task_reservation(template: &crate::config::job::JobSpec) -> crate::meat::
 /// What one node should be told about one array: its held chunks with
 /// their attempts, and how to run a task.
 pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) -> ArrayAssignment {
+    let mut assignment = bare_assignment(batch_id, record);
+    add_definition(&mut assignment, record);
+    // Admission judges the run as the node will see it.
+    assignment.derive_definition();
+    assignment.held = held_by(record, node);
+    assignment
+}
+
+/// The chunks `node` holds of `record`, with their attempts.
+fn held_by(record: &TaskArrayRecord, node: &NodeId) -> Vec<HeldChunk> {
     let state = &record.state;
-    let held = state
+    state
         .held_by(node)
         .map(|chunks| {
             chunks
@@ -582,44 +591,23 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    let mut template = record.template.clone();
-    template.namespace = Some(record.namespace.clone());
+        .unwrap_or_default()
+}
+
+/// An assignment with no held chunks and no definition: what's left once a
+/// node has the run's template (`template_known`).
+fn bare_assignment(batch_id: u64, record: &TaskArrayRecord) -> ArrayAssignment {
+    let state = &record.state;
     ArrayAssignment {
-        template: Some(Box::new(template)),
+        template: None,
+        template_known: true,
         batch_id,
         resources: task_reservation(&record.template),
         spec: state.spec.clone(),
-        program: record.template.exec.clone().unwrap_or_else(|| {
-            if record.template.script.is_some() {
-                "/bin/sh".into()
-            } else {
-                Default::default()
-            }
-        }),
-        args: record
-            .template
-            .script
-            .as_ref()
-            .map(|script| vec!["-c".into(), script.clone()])
-            .unwrap_or_else(|| record.template.command.clone().unwrap_or_default()),
-        env: record
-            .template
-            .env
-            .iter()
-            .filter_map(|(key, value)| match value {
-                EnvValue::Plain(value) => Some((key.clone(), value.clone())),
-                // The owned runner decrypts the original template at execution.
-                EnvValue::Encrypted(_) => None,
-                // Validation refuses provider values in jobs (#1123).
-                EnvValue::Provider(_) => None,
-            })
-            .chain(std::iter::once((
-                "RELIABURGER_JOB_NAME".into(),
-                record.name.clone(),
-            )))
-            .collect(),
-        held,
+        program: Default::default(),
+        args: Vec::new(),
+        env: Vec::new(),
+        held: Vec::new(),
         stopping: state.stop_reason().is_some(),
         replay_unknown: true,
         labels: crate::mayo::job_metrics::JobLabels {
@@ -630,38 +618,185 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
     }
 }
 
+/// Add the run's template to `assignment`. The program, arguments and
+/// environment derive from it, so the node works them out instead of being
+/// sent them as well (#2532).
+fn add_definition(assignment: &mut ArrayAssignment, record: &TaskArrayRecord) {
+    let mut template = record.template.clone();
+    template.namespace = Some(record.namespace.clone());
+    assignment.template = Some(Box::new(template));
+    assignment.template_known = false;
+}
+
 /// The `profile` label of a run that isn't one profile of a manifest.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// The whole sync call for one node: every running array, plus the ids of
-/// every array the cluster still keeps.
+/// The whole sync call for one node: every running array, with its
+/// template, plus the ids of every array the cluster still keeps.
 pub fn sync_request_for(arrays: &TaskArrays, node: &NodeId) -> NodeSyncRequest {
-    let profiles: HashMap<u64, &str> = arrays
-        .manifests()
-        .flat_map(|(_, manifest)| {
-            manifest
-                .cohorts
-                .iter()
-                .map(|(profile, id)| (*id, profile.as_str()))
-        })
-        .collect();
-    NodeSyncRequest {
-        version: Default::default(),
-        known: arrays.ids(),
-        arrays: arrays
+    let none = TemplatesSent::default();
+    RequestPlan::read(arrays, std::slice::from_ref(node), &none).request_for(node, &none)
+}
+
+/// Which runs' templates each node has been sent (#2444). A template goes
+/// to a node once; later requests carry `template_known` instead. A node
+/// that answers it doesn't know the template (it restarted, say) is sent it
+/// again on the next tick, and a node whose call fails is forgotten whole.
+#[derive(Debug, Default)]
+pub struct TemplatesSent {
+    nodes: HashMap<NodeId, HashSet<u64>>,
+}
+
+impl TemplatesSent {
+    /// Whether `node` has been sent `batch_id`'s template.
+    pub fn has(&self, node: &NodeId, batch_id: u64) -> bool {
+        self.nodes
+            .get(node)
+            .is_some_and(|runs| runs.contains(&batch_id))
+    }
+
+    /// Note every template `request` carries as sent to `node`.
+    pub fn mark(&mut self, node: &NodeId, request: &NodeSyncRequest) {
+        let carried = request
+            .arrays
+            .iter()
+            .filter(|assignment| !assignment.template_known)
+            .map(|assignment| assignment.batch_id);
+        let runs = self.nodes.entry(node.clone()).or_default();
+        runs.extend(carried);
+    }
+
+    /// Forget whatever `response` says `node` doesn't know.
+    pub fn forget_unknown(&mut self, node: &NodeId, response: &NodeSyncResponse) {
+        if let Some(runs) = self.nodes.get_mut(node) {
+            for progress in &response.arrays {
+                if progress.template_unknown {
+                    runs.remove(&progress.batch_id);
+                }
+            }
+        }
+    }
+
+    /// Forget everything sent to `node`.
+    pub fn forget_node(&mut self, node: &NodeId) {
+        self.nodes.remove(node);
+    }
+
+    /// Keep only runs that are still active.
+    pub fn retain_active(&mut self, active: &BTreeSet<u64>) {
+        for runs in self.nodes.values_mut() {
+            runs.retain(|batch_id| active.contains(batch_id));
+        }
+    }
+}
+
+/// One running array, as a round of sync requests needs it.
+struct PlannedRun {
+    /// What every node is told, with no held chunks. It carries the
+    /// definition only if some node lacks it.
+    shared: ArrayAssignment,
+    /// The chunks each holder holds.
+    held: HashMap<NodeId, Vec<HeldChunk>>,
+}
+
+/// What a round of sync requests is built from, copied out of the state
+/// under its lock (#2444). Copying is cheap: a template is copied only
+/// while some node still needs it, and once per run, not once per node.
+/// The requests themselves are built afterwards, with the lock released.
+pub struct RequestPlan {
+    known: Vec<u64>,
+    runs: Vec<PlannedRun>,
+}
+
+impl RequestPlan {
+    /// Read what `targets`' requests need from `arrays`.
+    pub fn read(arrays: &TaskArrays, targets: &[NodeId], sent: &TemplatesSent) -> Self {
+        let profiles: HashMap<u64, &str> = arrays
+            .manifests()
+            .flat_map(|(_, manifest)| {
+                manifest
+                    .cohorts
+                    .iter()
+                    .map(|(profile, id)| (*id, profile.as_str()))
+            })
+            .collect();
+        let runs = arrays
             .active()
             .map(|(batch_id, record)| {
-                let mut assignment = assignment_for(batch_id, record, node);
-                assignment.replay_unknown = arrays
+                let mut shared = bare_assignment(batch_id, record);
+                if targets.iter().any(|node| !sent.has(node, batch_id)) {
+                    add_definition(&mut shared, record);
+                }
+                shared.replay_unknown = arrays
                     .jobs()
                     .run(batch_id)
                     .is_none_or(|run| run.replay_unknown);
                 if let Some(profile) = profiles.get(&batch_id) {
-                    assignment.labels.profile = (*profile).to_string();
+                    shared.labels.profile = (*profile).to_string();
                 }
-                assignment
+                let held = record
+                    .state
+                    .holders()
+                    .map(|node| (node.clone(), held_by(record, node)))
+                    .collect();
+                PlannedRun { shared, held }
             })
-            .collect(),
+            .collect();
+        Self {
+            known: arrays.ids(),
+            runs,
+        }
+    }
+
+    /// The ids of the runs the plan covers.
+    pub fn active(&self) -> BTreeSet<u64> {
+        self.runs.iter().map(|run| run.shared.batch_id).collect()
+    }
+
+    /// `node`'s request. A run whose template `sent` says the node has
+    /// goes without it.
+    pub fn request_for(&self, node: &NodeId, sent: &TemplatesSent) -> NodeSyncRequest {
+        NodeSyncRequest {
+            version: Default::default(),
+            known: self.known.clone(),
+            arrays: self
+                .runs
+                .iter()
+                .map(|run| {
+                    let shared = &run.shared;
+                    let send = !shared.template_known && !sent.has(node, shared.batch_id);
+                    ArrayAssignment {
+                        template: if send { shared.template.clone() } else { None },
+                        template_known: !send,
+                        resources: shared.resources,
+                        batch_id: shared.batch_id,
+                        spec: shared.spec.clone(),
+                        program: Default::default(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        held: run.held.get(node).cloned().unwrap_or_default(),
+                        stopping: shared.stopping,
+                        replay_unknown: shared.replay_unknown,
+                        labels: shared.labels.clone(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Each target's request, with its URL.
+    fn requests(
+        &self,
+        targets: Vec<(NodeId, Option<String>)>,
+        sent: &TemplatesSent,
+    ) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
+        targets
+            .into_iter()
+            .map(|(node, url)| {
+                let request = self.request_for(&node, sent);
+                (node, url, request)
+            })
+            .collect()
     }
 }
 
@@ -691,16 +826,65 @@ pub fn plan_sync_within(
     replay_unknown: bool,
     room: u64,
 ) -> (Option<TaskArrayWrite>, FittedGrants) {
+    plan_sync_reporting(
+        batch_id,
+        record,
+        answers,
+        replay_unknown,
+        room,
+        &mut Vec::new(),
+    )
+}
+
+/// A finished chunk the leader's state refused, reported by the node that
+/// holds it at its current attempt (#2372). The node reports it again on
+/// every sync, so left alone the chunk would stay held for ever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedReport {
+    /// The run.
+    pub batch_id: u64,
+    /// The node that reported it.
+    pub node: NodeId,
+    /// The chunk.
+    pub chunk: ChunkId,
+    /// The attempt it reported.
+    pub attempt: u64,
+    /// Why the state refused it.
+    pub reason: crate::meat::task_array_state::TaskArrayError,
+}
+
+/// [`plan_sync_within`], also adding to `refused` each report the state
+/// refused from a node that holds the chunk at its current attempt. A
+/// stale attempt or a chunk the node no longer holds isn't added: the
+/// leader re-granted it, and the node forgets the result by itself.
+pub fn plan_sync_reporting(
+    batch_id: u64,
+    record: &TaskArrayRecord,
+    answers: &[(NodeId, &ArrayProgress)],
+    replay_unknown: bool,
+    room: u64,
+    refused: &mut Vec<RefusedReport>,
+) -> (Option<TaskArrayWrite>, FittedGrants) {
+    use crate::meat::task_array_state::TaskArrayError;
     // Copy the state only if some chunk finished: most ticks for most
     // arrays only top nodes up, and that plans against the state as it is.
     let mut preview = std::borrow::Cow::Borrowed(&record.state);
     let mut results = Vec::new();
     for (node, progress) in answers {
         for result in &progress.finished {
-            if !record.state.done().contains(result.chunk.0)
-                && preview.to_mut().complete(node, result).is_ok()
-            {
-                results.push((node.clone(), result.clone()));
+            if record.state.done().contains(result.chunk.0) {
+                continue;
+            }
+            match preview.to_mut().complete(node, result) {
+                Ok(_) => results.push((node.clone(), result.clone())),
+                Err(TaskArrayError::NotHeld { .. } | TaskArrayError::StaleAttempt { .. }) => {}
+                Err(reason) => refused.push(RefusedReport {
+                    batch_id,
+                    node: node.clone(),
+                    chunk: result.chunk,
+                    attempt: result.attempt,
+                    reason,
+                }),
             }
         }
     }
@@ -779,13 +963,15 @@ impl GrantBudget {
         record: &TaskArrayRecord,
         answers: &[(NodeId, &ArrayProgress)],
         replay_unknown: bool,
+        refused: &mut Vec<RefusedReport>,
     ) -> (
         Option<TaskArrayWrite>,
         Option<crate::meat::quota::QuotaError>,
     ) {
         let per_task = task_reservation(&record.template);
         let room = self.ledger.room_for_tasks(&record.namespace, &per_task);
-        let (write, fitted) = plan_sync_within(batch_id, record, answers, replay_unknown, room);
+        let (write, fitted) =
+            plan_sync_reporting(batch_id, record, answers, replay_unknown, room, refused);
         self.ledger
             .charge_tasks(&record.namespace, &per_task, fitted.started);
         let blocked = fitted.held_back.and_then(|tasks| {
@@ -818,6 +1004,40 @@ pub fn quota_blocked_write(
 /// Most cron occurrences the leader fires in one tick.
 pub const MAX_FIRES_PER_TICK: usize = 16;
 
+/// Parsed cron schedules, kept by the leader between ticks so each
+/// definition's expression is parsed once, not once a second (#2532). An
+/// entry is parsed again when its expression changes, and dropped when its
+/// definition goes.
+#[derive(Debug, Default)]
+pub struct CronCache {
+    /// Per definition key: the expression and what parsing it gave (`None`
+    /// for one that doesn't parse, which never matches).
+    schedules: HashMap<String, (String, Option<crate::meat::cron::CronSchedule>)>,
+    /// How many expressions this cache has parsed, for the tests.
+    parses: u64,
+}
+
+impl CronCache {
+    /// Whether `key`'s `expression` matches `at`, parsing it only if the
+    /// cache holds no parse of this exact expression.
+    fn matches(&mut self, key: &str, expression: &str, at: time::OffsetDateTime) -> bool {
+        let fresh = self
+            .schedules
+            .get(key)
+            .is_some_and(|(cached, _)| cached == expression);
+        if !fresh {
+            self.parses += 1;
+            let parsed = crate::meat::cron::CronSchedule::parse(expression).ok();
+            self.schedules
+                .insert(key.to_string(), (expression.to_string(), parsed));
+        }
+        self.schedules
+            .get(key)
+            .and_then(|(_, schedule)| schedule.as_ref())
+            .is_some_and(|schedule| schedule.matches(at))
+    }
+}
+
 /// One schedule due now: its namespace, name and definition revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueSchedule {
@@ -837,16 +1057,27 @@ pub fn due_schedules(
     at: time::OffsetDateTime,
     minute: i64,
     cursor: Option<&str>,
+    cache: &mut CronCache,
 ) -> Vec<DueSchedule> {
+    let scheduled: HashSet<&str> = arrays
+        .jobs()
+        .definitions()
+        .filter(|(_, record)| record.definition.cron.is_some())
+        .map(|(key, _)| key)
+        .collect();
+    cache
+        .schedules
+        .retain(|key, _| scheduled.contains(key.as_str()));
     let due: Vec<DueSchedule> = arrays
         .jobs()
         .definitions()
-        .filter(|(_, record)| {
+        .filter(|(key, record)| {
             record.last_observed_minute.is_none_or(|seen| seen < minute)
-                && record.definition.cron.as_ref().is_some_and(|cron| {
-                    crate::meat::cron::CronSchedule::parse(&cron.expression)
-                        .is_ok_and(|schedule| schedule.matches(at))
-                })
+                && record
+                    .definition
+                    .cron
+                    .as_ref()
+                    .is_some_and(|cron| cache.matches(key, &cron.expression, at))
         })
         .filter_map(|(key, record)| {
             let (namespace, name) = key.split_once('/')?;
@@ -902,6 +1133,28 @@ pub fn refusing_holders(
             progress.refused.is_some() && record.state.held_by(node).is_some()
         })
         .map(|(node, _)| node.clone())
+        .collect()
+}
+
+/// The nodes that could still take work this tick: every target, except
+/// one whose sync calls have kept failing for longer than `grace`.
+/// `failing_since` is when each failing node's calls started to fail. A
+/// node restarting or slow for a tick or two still holds a run open, so
+/// the other nodes' refusals can't fail it for good meanwhile (#2371).
+pub fn eligible_nodes(
+    targets: &[NodeId],
+    failing_since: &HashMap<NodeId, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> BTreeSet<NodeId> {
+    targets
+        .iter()
+        .filter(|node| {
+            failing_since
+                .get(*node)
+                .is_none_or(|since| now.saturating_duration_since(*since) <= grace)
+        })
+        .cloned()
         .collect()
 }
 
@@ -1134,10 +1387,60 @@ pub struct TickInputs<'a> {
     pub silence: Duration,
     /// The leader's wall clock, for the writes.
     pub now_epoch_secs: u64,
-    /// Nodes that could take work: every node the leader syncs whose last
-    /// call didn't fail. A run fails as unrunnable only once each of them
-    /// has refused it for good.
+    /// Nodes that could take work: every node the leader syncs, unless its
+    /// calls have failed for longer than the silence timeout (see
+    /// [`eligible_nodes`]). A run fails as unrunnable only once each of
+    /// them has refused it for good.
     pub eligible: BTreeSet<NodeId>,
+    /// Holders (run, node) whose report of a chunk the state has refused
+    /// [`REFUSALS_BEFORE_REQUEUE`] ticks running (see [`RefusedReports`]).
+    /// Their chunks go back to the queue like a refusing holder's.
+    pub stuck: BTreeSet<(u64, NodeId)>,
+}
+
+/// Ticks in a row a holder may report a chunk the state refuses before
+/// the leader takes its chunks back (#2372).
+pub const REFUSALS_BEFORE_REQUEUE: u32 = 3;
+
+/// How many ticks running each (run, node, chunk, attempt) report has been
+/// refused. A report that isn't refused on a tick starts again from zero.
+#[derive(Debug, Default)]
+pub struct RefusedReports {
+    streaks: HashMap<(u64, NodeId, ChunkId, u64), u32>,
+}
+
+impl RefusedReports {
+    /// Count this tick's refused reports, and return the ones refused for
+    /// the first time, for the caller to log once.
+    pub fn observe<'a>(&mut self, refused: &'a [RefusedReport]) -> Vec<&'a RefusedReport> {
+        let mut streaks = HashMap::with_capacity(refused.len());
+        let mut first_seen = Vec::new();
+        for report in refused {
+            let key = (
+                report.batch_id,
+                report.node.clone(),
+                report.chunk,
+                report.attempt,
+            );
+            let streak = self.streaks.get(&key).copied().unwrap_or(0);
+            if streak == 0 {
+                first_seen.push(report);
+            }
+            streaks.insert(key, streak.saturating_add(1));
+        }
+        self.streaks = streaks;
+        first_seen
+    }
+
+    /// The holders whose report has been refused long enough that their
+    /// chunks should go back to the queue.
+    pub fn stuck(&self) -> BTreeSet<(u64, NodeId)> {
+        self.streaks
+            .iter()
+            .filter(|(_, streak)| **streak >= REFUSALS_BEFORE_REQUEUE)
+            .map(|((batch_id, node, _, _), _)| (*batch_id, node.clone()))
+            .collect()
+    }
 }
 
 /// Every progress write one tick makes, for every running array, in the
@@ -1148,8 +1451,19 @@ pub struct TickInputs<'a> {
 /// grants stay within namespace quotas (see [`GrantBudget`]).
 pub fn plan_tick(
     arrays: &TaskArrays,
+    budget: Option<&mut GrantBudget>,
+    inputs: &TickInputs<'_>,
+) -> Vec<TaskArrayWrite> {
+    plan_tick_reporting(arrays, budget, inputs, &mut Vec::new())
+}
+
+/// [`plan_tick`], also adding to `refused` every chunk report the state
+/// refused (see [`plan_sync_reporting`]).
+pub fn plan_tick_reporting(
+    arrays: &TaskArrays,
     mut budget: Option<&mut GrantBudget>,
     inputs: &TickInputs<'_>,
+    refused: &mut Vec<RefusedReport>,
 ) -> Vec<TaskArrayWrite> {
     let mut writes = Vec::new();
     for (batch_id, record) in arrays.active() {
@@ -1182,6 +1496,16 @@ pub fn plan_tick(
             inputs.silence,
         );
         lost.extend(refusing_holders(record, &for_array));
+        // A holder whose chunk report the state keeps refusing (#2372).
+        let stuck: Vec<NodeId> = record
+            .state
+            .holders()
+            .filter(|node| {
+                inputs.stuck.contains(&(batch_id, (*node).clone())) && !lost.contains(node)
+            })
+            .cloned()
+            .collect();
+        lost.extend(stuck);
         for node in lost {
             if replay_unknown {
                 writes.push(TaskArrayWrite::Requeue {
@@ -1194,11 +1518,18 @@ pub fn plan_tick(
             }
         }
         let (sync, blocked) = match budget.as_deref_mut() {
-            Some(budget) => budget.plan(batch_id, record, &for_array, replay_unknown),
-            None => (
-                plan_sync(batch_id, record, &for_array, replay_unknown),
-                None,
-            ),
+            Some(budget) => budget.plan(batch_id, record, &for_array, replay_unknown, refused),
+            None => {
+                let (write, _) = plan_sync_reporting(
+                    batch_id,
+                    record,
+                    &for_array,
+                    replay_unknown,
+                    u64::MAX,
+                    refused,
+                );
+                (write, None)
+            }
         };
         if let Some(mut write) = sync {
             write.stamp(inputs.now_epoch_secs);
@@ -1219,11 +1550,18 @@ struct LeaderMemory {
     /// The `known` list each node last acknowledged, so an idle cluster
     /// stops syncing once every node has cleaned up.
     last_known: HashMap<NodeId, Vec<u64>>,
-    /// Nodes whose last sync failed, so a dead node is logged once, not
-    /// every tick.
-    failing: HashSet<NodeId>,
+    /// Nodes whose last sync failed, with when they started failing. A
+    /// dead node is logged once, not every tick, and holds runs open for
+    /// the silence timeout (see [`eligible_nodes`]).
+    failing: HashMap<NodeId, Instant>,
+    /// Which runs' templates each node has been sent (#2444).
+    templates: TemplatesSent,
+    /// Chunk reports the state keeps refusing, per holder (#2372).
+    refused: RefusedReports,
     /// The last cron definition fired, so the next tick starts after it.
     cron_cursor: Option<String>,
+    /// Parsed cron schedules, so a tick doesn't parse every one (#2532).
+    cron: CronCache,
     /// Sync calls carried over from earlier ticks.
     calls: SyncCalls,
     /// Which run outcomes this leader has already announced.
@@ -1339,7 +1677,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
     targets
 }
 
-async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
+async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>, cron: &mut CronCache) {
     let now = state.task_arrays.cron_clock.now_epoch_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
@@ -1349,14 +1687,18 @@ async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
         return;
     };
     let after = cursor.clone();
-    let Some((observed, due)) = read_control(state, move |view| {
-        let due = due_schedules(view.arrays, at, minute, after.as_deref());
-        (view.arrays.cron_observed_minute(), due)
+    // The read owns what it touches, so the cache goes in and comes back
+    // out, as the run tracker does. A failed read starts it afresh.
+    let mut moved = std::mem::take(cron);
+    let Some((observed, due, returned)) = read_control(state, move |view| {
+        let due = due_schedules(view.arrays, at, minute, after.as_deref(), &mut moved);
+        (view.arrays.cron_observed_minute(), due, moved)
     })
     .await
     else {
         return;
     };
+    *cron = returned;
     if observed.is_none_or(|seen| minute > seen) {
         if write_task_array(state, TaskArrayWrite::CronObserve { minute })
             .await
@@ -1446,8 +1788,8 @@ struct SyncRound {
     known: Vec<u64>,
     /// Whether any array is running.
     has_active: bool,
-    /// Each node's sync request, with its URL (`None` for this node).
-    requests: Vec<(NodeId, Option<String>, NodeSyncRequest)>,
+    /// What each node's sync request is built from, outside the lock.
+    plan: RequestPlan,
     /// Ids of the arrays and manifests the cluster keeps.
     kept: BTreeSet<u64>,
     /// Ids of the arrays alone.
@@ -1468,28 +1810,25 @@ fn control_version(view: &ControlView<'_>) -> super::task_array_node::ControlVer
     }
 }
 
-/// Each target's sync request against `arrays`, with its URL.
+/// Each target's sync request against `arrays`, every template included.
+#[cfg(test)]
 fn requests_for(
     arrays: &TaskArrays,
     targets: Vec<(NodeId, Option<String>)>,
 ) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
-    targets
-        .into_iter()
-        .map(|(node, url)| {
-            let request = sync_request_for(arrays, &node);
-            (node, url, request)
-        })
-        .collect()
+    let none = TemplatesSent::default();
+    let nodes: Vec<NodeId> = targets.iter().map(|(node, _)| node.clone()).collect();
+    RequestPlan::read(arrays, &nodes, &none).requests(targets, &none)
 }
 
-fn sync_round(view: ControlView<'_>, targets: Vec<(NodeId, Option<String>)>) -> SyncRound {
+fn sync_round(view: ControlView<'_>, targets: &[NodeId], sent: &TemplatesSent) -> SyncRound {
     let arrays = view.arrays;
     let kept_arrays: BTreeSet<u64> = arrays.iter().map(|(id, _)| id).collect();
     SyncRound {
         version: control_version(&view),
         known: arrays.ids(),
         has_active: arrays.has_active(),
-        requests: requests_for(arrays, targets),
+        plan: RequestPlan::read(arrays, targets, sent),
         kept: kept_arrays
             .iter()
             .copied()
@@ -1536,16 +1875,27 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         return;
     }
     super::job_apply::settle(state).await;
-    fire_due_schedules(state, &mut memory.cron_cursor).await;
+    fire_due_schedules(state, &mut memory.cron_cursor, &mut memory.cron).await;
     prune_retired_runs(state).await;
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
     let targets = sync_targets(state).await;
     let target_nodes: Vec<NodeId> = targets.iter().map(|(node, _)| node.clone()).collect();
     let follow_up_targets = targets.clone();
-    let Some(mut round) = read_control(state, move |view| sync_round(view, targets)).await else {
+    // The read runs under the state's lock and must own what it touches,
+    // so the record of sent templates goes in and comes back out.
+    let sent = std::mem::take(&mut memory.templates);
+    let nodes = target_nodes.clone();
+    let Some((mut round, sent)) = read_control(state, move |view| {
+        let round = sync_round(view, &nodes, &sent);
+        (round, sent)
+    })
+    .await
+    else {
         return;
     };
+    memory.templates = sent;
+    memory.templates.retain_active(&round.plan.active());
     if let Some(council) = &state.council {
         round.version.term = council.current_term();
     }
@@ -1560,7 +1910,8 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     // first, so those nodes are free to be called again now.
     let mut arrived = memory.calls.gather_ready();
     let mut told: HashMap<NodeId, HeldSet> = HashMap::new();
-    for (node, url, mut request) in std::mem::take(&mut round.requests) {
+    // Built with the state's lock released (#2444).
+    for (node, url, mut request) in round.plan.requests(targets, &memory.templates) {
         told.insert(node.clone(), held_chunks(&request));
         if memory.calls.is_waiting_on(&node) {
             continue;
@@ -1569,6 +1920,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
         if request.arrays.is_empty() && memory.last_known.get(&node) == Some(&round.known) {
             continue;
         }
+        memory.templates.mark(&node, &request);
         let known = round.known.clone();
         start_sync(state, &mut memory.calls, node, url, request, known);
     }
@@ -1583,14 +1935,18 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     {
         match answer {
             Ok(response) => {
+                memory.templates.forget_unknown(&node, &response);
                 memory.failing.remove(&node);
                 memory.last_heard.insert(node.clone(), Instant::now());
                 memory.last_known.insert(node.clone(), known);
                 answers.push((node, response));
             }
             Err(reason) => {
-                if round.has_active && memory.failing.insert(node.clone()) {
+                // It may have restarted, and lost every template with it.
+                memory.templates.forget_node(&node);
+                if round.has_active && !memory.failing.contains_key(&node) {
                     eprintln!("bun: task arrays: sync with {node} failed: {reason}");
+                    memory.failing.insert(node, Instant::now());
                 }
             }
         }
@@ -1612,19 +1968,18 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 .map(|(node, view)| ((*batch_id, node.clone()), view.slots))
         })
         .collect();
-    // A node whose calls fail can't take work, so it doesn't hold a run
-    // open; one whose call is merely still out does, until it answers or
-    // times out.
-    let eligible: BTreeSet<NodeId> = target_nodes
-        .into_iter()
-        .filter(|node| !memory.failing.contains(node))
-        .collect();
-    let last_heard = memory.last_heard.clone();
+    // A node whose call is still out holds a run open until it answers or
+    // times out. One whose calls fail holds it open for the silence
+    // timeout, the same patience a silent holder gets: a restart or one
+    // slow sync mustn't let the other nodes' refusals fail the run.
     let silence = state.task_arrays.silence_timeout;
+    let eligible = eligible_nodes(&target_nodes, &memory.failing, Instant::now(), silence);
+    let last_heard = memory.last_heard.clone();
     let now_epoch_secs = crate::meat::batch_ids::epoch_now_secs();
     // Plan under the state's read lock: nothing is copied but each array's
     // state, and only for arrays that finished a chunk.
-    let Some(writes) = read_control(state, move |view| {
+    let stuck = memory.refused.stuck();
+    let Some((writes, refused)) = read_control(state, move |view| {
         let mut budget = view.desired.and_then(|desired| {
             GrantBudget::new(
                 &desired.namespaces,
@@ -1641,13 +1996,22 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             silence,
             now_epoch_secs,
             eligible,
+            stuck,
         };
-        plan_tick(view.arrays, budget.as_mut(), &inputs)
+        let mut refused = Vec::new();
+        let writes = plan_tick_reporting(view.arrays, budget.as_mut(), &inputs, &mut refused);
+        (writes, refused)
     })
     .await
     else {
         return;
     };
+    for report in memory.refused.observe(&refused) {
+        eprintln!(
+            "bun: task array {}: refused chunk {} (attempt {}) from {}: {}; its chunks go back to the queue after {REFUSALS_BEFORE_REQUEUE} ticks of this",
+            report.batch_id, report.chunk.0, report.attempt, report.node, report.reason
+        );
+    }
     if writes.is_empty() {
         return;
     }
@@ -1656,7 +2020,14 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             for (batch_id, reason) in refused {
                 eprintln!("bun: task array {batch_id}: tick write refused: {reason}");
             }
-            send_new_grants(state, &mut memory.calls, follow_up_targets, &told).await;
+            send_new_grants(
+                state,
+                &mut memory.calls,
+                &mut memory.templates,
+                follow_up_targets,
+                &told,
+            )
+            .await;
         }
         // The entry may still commit; the next tick's requests carry
         // whatever it granted.
@@ -1698,20 +2069,22 @@ fn start_sync(
 async fn send_new_grants(
     state: &ApiState,
     calls: &mut SyncCalls,
+    templates: &mut TemplatesSent,
     targets: Vec<(NodeId, Option<String>)>,
     told: &HashMap<NodeId, HeldSet>,
 ) {
-    let Some((mut version, known, requests)) = read_control(state, move |view| {
-        (
-            control_version(&view),
-            view.arrays.ids(),
-            requests_for(view.arrays, targets),
-        )
+    let sent = std::mem::take(templates);
+    let nodes: Vec<NodeId> = targets.iter().map(|(node, _)| node.clone()).collect();
+    let Some((mut version, known, plan, sent)) = read_control(state, move |view| {
+        let plan = RequestPlan::read(view.arrays, &nodes, &sent);
+        (control_version(&view), view.arrays.ids(), plan, sent)
     })
     .await
     else {
         return;
     };
+    *templates = sent;
+    let requests = plan.requests(targets, templates);
     if let Some(council) = &state.council {
         version.term = council.current_term();
     }
@@ -1723,6 +2096,7 @@ async fn send_new_grants(
     }
     for (node, url, mut request) in follow_ups(told, requests, calls) {
         request.version = version;
+        templates.mark(&node, &request);
         start_sync(state, calls, node, url, request, known.clone());
     }
 }
@@ -1797,6 +2171,7 @@ async fn sync_node(
 mod tests {
     use super::*;
     use crate::config::job::JobSpec;
+    use crate::config::types::EnvValue;
     use crate::meat::index_set::IndexRangeSet;
     use crate::meat::job_capability::JobCapabilities;
     use crate::meat::task_array::TaskArraySpec;
@@ -1877,6 +2252,7 @@ mod tests {
             slots,
             refused: None,
             unrunnable: false,
+            template_unknown: false,
             finished,
             counters: NodeArrayCounters::default(),
         }
@@ -2136,15 +2512,57 @@ mod tests {
     #[test]
     fn due_schedules_take_turns_after_the_last_one_fired() {
         let (arrays, at) = twenty_schedules();
-        let first = due_schedules(&arrays, at, 3, None);
+        let first = due_schedules(&arrays, at, 3, None, &mut CronCache::default());
         assert_eq!(first.len(), MAX_FIRES_PER_TICK);
         assert_eq!(first[0].name, "job-00");
-        let next = due_schedules(&arrays, at, 3, Some("default/job-15"));
+        let next = due_schedules(
+            &arrays,
+            at,
+            3,
+            Some("default/job-15"),
+            &mut CronCache::default(),
+        );
         assert_eq!(
             names(&next[..6]),
             ["job-16", "job-17", "job-18", "job-19", "job-00", "job-01"]
         );
-        assert!(due_schedules(&arrays, at, 2, None).is_empty());
+        assert!(due_schedules(&arrays, at, 2, None, &mut CronCache::default()).is_empty());
+    }
+
+    /// #2532 (#2444's step 5): a definition's cron expression is parsed
+    /// once, not on every tick, and parsed again when it changes.
+    #[test]
+    fn a_cron_expression_is_parsed_once_until_it_changes() {
+        let (mut arrays, at) = twenty_schedules();
+        let mut cache = CronCache::default();
+        due_schedules(&arrays, at, 3, None, &mut cache);
+        assert_eq!(cache.parses, 20);
+        due_schedules(&arrays, at, 3, None, &mut cache);
+        due_schedules(&arrays, at, 4, None, &mut cache);
+        assert_eq!(cache.parses, 20, "the second and third ticks parsed again");
+        // A changed expression is parsed again, and only that one.
+        let mut definition = crate::meat::job::JobDefinition::from_spec(record(1, 1).template);
+        definition.cron = Some(crate::meat::job::CronPolicy {
+            expression: "*/2 * * * *".into(),
+            overlap: Default::default(),
+            missed: Default::default(),
+        });
+        arrays
+            .apply(
+                &TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Put {
+                    name: "job-00".into(),
+                    namespace: "default".into(),
+                    definition: Box::new(definition),
+                    trigger: None,
+                    now_epoch_secs: 120,
+                })),
+                || 0,
+            )
+            .unwrap();
+        let due = due_schedules(&arrays, at, 3, None, &mut cache);
+        assert_eq!(cache.parses, 21);
+        // 03:00 is not an even minute: job-00 no longer matches.
+        assert!(!names(&due).contains(&"job-00"), "{:?}", names(&due));
     }
 
     fn quota_namespaces(cpu: &str) -> BTreeMap<String, crate::config::NamespaceSpec> {
@@ -2176,7 +2594,7 @@ mod tests {
         let mut budget =
             GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
         let record = arrays.get(1).unwrap();
-        let (write, blocked) = budget.plan(1, record, &answers, true);
+        let (write, blocked) = budget.plan(1, record, &answers, true, &mut Vec::new());
         let Some(TaskArrayWrite::Sync { grants, .. }) = write else {
             panic!("expected a sync");
         };
@@ -2205,7 +2623,7 @@ mod tests {
         )]);
         let mut budget =
             GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
-        let (write, blocked) = budget.plan(1, record, &answers, true);
+        let (write, blocked) = budget.plan(1, record, &answers, true, &mut Vec::new());
         assert_eq!(write, None);
         assert!(blocked.is_some());
 
@@ -2245,6 +2663,7 @@ mod tests {
                     slots,
                     refused: None,
                     unrunnable: false,
+                    template_unknown: false,
                     finished: record
                         .state
                         .held_by(node)
@@ -2271,6 +2690,7 @@ mod tests {
             silence: SILENCE_TIMEOUT,
             now_epoch_secs: 7,
             eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
+            stuck: BTreeSet::new(),
         }
     }
 
@@ -2294,6 +2714,7 @@ mod tests {
             slots: 0,
             refused: Some(reason.to_string()),
             unrunnable: false,
+            template_unknown: false,
             finished: Vec::new(),
             counters: NodeArrayCounters::default(),
         }
@@ -2369,6 +2790,59 @@ mod tests {
         )));
         // Nobody answered at all.
         assert!(!unrunnable(&plan_tick(&arrays, None, &inputs(&[], &heard))));
+    }
+
+    #[test]
+    fn a_node_that_just_missed_a_sync_still_holds_a_run_open() {
+        let arrays = running_arrays(1);
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), refusal_for(&arrays, ISOLATION, true)),
+        ];
+        let heard = HashMap::new();
+        let mut tick = inputs(&answers, &heard);
+        let failing_since = HashMap::from([(node("worker"), tick.now)]);
+        tick.eligible = eligible_nodes(
+            &[node("a"), node("b"), node("worker")],
+            &failing_since,
+            tick.now,
+            SILENCE_TIMEOUT,
+        );
+        let writes = plan_tick(&arrays, None, &tick);
+        assert!(
+            !writes
+                .iter()
+                .any(|write| matches!(write, TaskArrayWrite::Unrunnable { .. })),
+            "{writes:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_failing_past_the_silence_timeout_no_longer_holds_a_run_open() {
+        let arrays = running_arrays(1);
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), refusal_for(&arrays, ISOLATION, true)),
+        ];
+        let heard = HashMap::new();
+        let mut tick = inputs(&answers, &heard);
+        let now = tick.now + Duration::from_secs(31);
+        let failing_since = HashMap::from([(node("worker"), tick.now)]);
+        tick.eligible = eligible_nodes(
+            &[node("a"), node("b"), node("worker")],
+            &failing_since,
+            now,
+            SILENCE_TIMEOUT,
+        );
+        assert_eq!(tick.eligible, BTreeSet::from([node("a"), node("b")]));
+        let writes = plan_tick(&arrays, None, &tick);
+        assert!(
+            matches!(
+                &writes[..],
+                [TaskArrayWrite::Unrunnable { batch_id: 1, .. }]
+            ),
+            "{writes:?}"
+        );
     }
 
     /// A node that runs every kind of job, with `/usr/bin/render` among
@@ -2587,6 +3061,143 @@ mod tests {
             matches!(&writes[..], [TaskArrayWrite::Unrunnable { .. }]),
             "{writes:?}"
         );
+    }
+
+    /// #2372: a node that keeps reporting a chunk the state refuses (here
+    /// one task short) is neither silent nor refusing. After a few ticks
+    /// of it, its chunks go back to the queue.
+    #[test]
+    fn a_refused_chunk_report_goes_back_to_the_queue_instead_of_hanging() {
+        let mut arrays = running_arrays(1);
+        let heard = HashMap::new();
+        let first = [(node("a"), answer_for(&arrays, &node("a"), 10))];
+        for entry in tick_entries(plan_tick(&arrays, None, &inputs(&first, &heard))) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        let attempt = arrays.get(1).unwrap().state.attempt_of(ChunkId(0));
+        let short = NodeSyncResponse {
+            arrays: vec![progress(0, vec![done(0, attempt, 9)])],
+        };
+        let answers = [(node("a"), short)];
+        let requeued = |writes: &[TaskArrayWrite]| {
+            writes.iter().any(|write| {
+                matches!(write, TaskArrayWrite::Requeue { batch_id: 1, node: lost, .. } if *lost == node("a"))
+            })
+        };
+        let mut reports = RefusedReports::default();
+        for tick in 0..REFUSALS_BEFORE_REQUEUE {
+            let mut inputs = inputs(&answers, &heard);
+            inputs.stuck = reports.stuck();
+            let mut refused = Vec::new();
+            let writes = plan_tick_reporting(&arrays, None, &inputs, &mut refused);
+            assert!(!requeued(&writes), "tick {tick}: {writes:?}");
+            assert_eq!(refused.len(), 1, "tick {tick}");
+            let first_seen = reports.observe(&refused);
+            assert_eq!(first_seen.len(), usize::from(tick == 0), "logged once");
+        }
+        let mut inputs = inputs(&answers, &heard);
+        inputs.stuck = reports.stuck();
+        let writes = plan_tick_reporting(&arrays, None, &inputs, &mut Vec::new());
+        assert!(requeued(&writes), "{writes:?}");
+    }
+
+    /// #2532 (#2444's step 2): the first delivery carries the template
+    /// alone. The program, arguments and environment are derived from it,
+    /// so the node works them out instead of being sent them twice.
+    #[test]
+    fn a_first_delivery_carries_the_template_without_what_derives_from_it() {
+        let arrays = running_arrays(2);
+        let a = node("a");
+        let sent = TemplatesSent::default();
+        let request =
+            RequestPlan::read(&arrays, std::slice::from_ref(&a), &sent).request_for(&a, &sent);
+        for run in &request.arrays {
+            assert!(run.template.is_some() && !run.template_known);
+            assert!(run.program.as_os_str().is_empty(), "{:?}", run.program);
+            assert!(run.args.is_empty(), "{:?}", run.args);
+            assert!(run.env.is_empty(), "{:?}", run.env);
+        }
+        // What the node works out is what the leader used to send.
+        let mut derived = request.arrays[0].clone();
+        derived.derive_definition();
+        assert_eq!(derived.program.to_str(), Some("/usr/bin/render"));
+        assert_eq!(derived.args, ["frame", "{index}"]);
+        assert!(derived.env.contains(&("PLAIN".into(), "yes".into())));
+        assert!(
+            derived
+                .env
+                .contains(&("RELIABURGER_JOB_NAME".into(), "render-1".into()))
+        );
+    }
+
+    /// #2444: a node is sent each run's template once. Later requests
+    /// leave it out, until the node says it doesn't know it.
+    #[test]
+    fn a_node_that_already_has_a_template_is_not_sent_it_again() {
+        // Eight runs whose templates carry 1 KiB of environment, a modest
+        // real job (templates go up to 16 KiB).
+        let mut arrays = TaskArrays::default();
+        for id in 1..=8 {
+            let mut record = record(100, 10);
+            record
+                .template
+                .env
+                .insert("PAD".into(), EnvValue::Plain("x".repeat(1024)));
+            arrays
+                .apply(
+                    &TaskArrayWrite::Register {
+                        name: format!("render-{id}"),
+                        namespace: "default".into(),
+                        template: Box::new(record.template),
+                        spec: record.state.spec,
+                        submitted_at_epoch_secs: 1,
+                    },
+                    || id,
+                )
+                .unwrap();
+        }
+        let a = node("a");
+        let targets = [a.clone(), node("b")];
+        let mut sent = TemplatesSent::default();
+        let first = RequestPlan::read(&arrays, &targets, &sent).request_for(&a, &sent);
+        assert!(first.arrays.iter().all(|run| run.template.is_some()));
+        sent.mark(&a, &first);
+        let second = RequestPlan::read(&arrays, &targets, &sent).request_for(&a, &sent);
+        let size = |request: &NodeSyncRequest| serde_json::to_vec(request).unwrap().len();
+        assert!(
+            size(&second) * 4 < size(&first),
+            "{} bytes, then {}",
+            size(&first),
+            size(&second)
+        );
+        assert!(second.arrays.iter().all(|run| run.template_known
+            && run.template.is_none()
+            && run.program.as_os_str().is_empty()
+            && run.env.is_empty()));
+        // Once every target has them, the plan copies no template at all.
+        sent.mark(&node("b"), &first);
+        let plan = RequestPlan::read(&arrays, &targets, &sent);
+        assert!(plan.runs.iter().all(|run| run.shared.template.is_none()));
+        // A node that lost a template (it restarted) gets it back.
+        let unknown = NodeSyncResponse {
+            arrays: vec![ArrayProgress {
+                template_unknown: true,
+                ..refused_progress(3, "no copy")
+            }],
+        };
+        sent.forget_unknown(&a, &unknown);
+        let third = RequestPlan::read(&arrays, &targets, &sent).request_for(&a, &sent);
+        let resent: Vec<u64> = third
+            .arrays
+            .iter()
+            .filter(|run| run.template.is_some())
+            .map(|run| run.batch_id)
+            .collect();
+        assert_eq!(resent, [3]);
+        // A failed call forgets the node altogether.
+        sent.forget_node(&a);
+        let fourth = RequestPlan::read(&arrays, &targets, &sent).request_for(&a, &sent);
+        assert_eq!(fourth, first);
     }
 
     #[test]

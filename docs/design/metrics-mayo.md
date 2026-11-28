@@ -2,7 +2,9 @@
 
 **Component:** Mayo (Metrics store + Built-In Alerts)
 **Binary:** Embedded in Bun (the single-node agent)
-**Status:** Design (this document reconciled against the shipped code)
+**Status:** Partly shipped. Collection, Parquet storage, rollups and the four built-in node alerts ship; the sections marked planned don't.
+**Reconciled against:** not reconciled at a named release; an earlier pass reconciled it with the shipped code, and §10.3 was checked against 0.3.4 (#2515)
+**Sketches:** tiered retention in §3.2, §3.4, §4.4, §5.3, §5.8, the planned tests in §10.3
 **Whitepaper Reference:** Section 15
 
 ---
@@ -18,7 +20,7 @@ Mayo is Reliaburger's embedded, per-node metrics store. It provides a metrics pi
 
 The result is a batteries-included metrics store embedded in the single Bun binary, with no external database and no configuration for the common case.
 
-A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the query language is **SQL**, not PromQL. Several capabilities are now wired: outbound Prometheus scraping of `[[metrics.scrape_targets]]`, cross-council query fan-out and merge, ingress request/response counters, and rollup retention pruning. Others the original design imagined -- remote-read federation, tiered downsampling, PromQL alert expressions, per-app alert tuning -- remain **not wired into a running system** and are each flagged below with **Status: planned -- not yet implemented.**
+A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the internal query language is **SQL** (DataFusion over Parquet), not PromQL. SQL is internal: the HTTP metrics API takes a metric name, a time range and an app, never SQL (the one route that accepts SQL, `/v1/logs/sql`, is for logs). Several capabilities are now wired: outbound Prometheus scraping of `[[metrics.scrape_targets]]`, cross-council query fan-out and merge, ingress request/response counters, and rollup retention pruning. Others the original design imagined -- remote-read federation, tiered downsampling, PromQL alert expressions, per-app alert tuning -- remain **not wired into a running system** and are each flagged below with **Status: planned -- not yet implemented.**
 
 ---
 
@@ -93,8 +95,26 @@ Every read path streams (#377): `/v1/metrics` by name or `*`, `/v1/metrics/app/�
 - **Pushdown.** The table accepts every filter as `Inexact`. From the filters DataFusion pushes, `ScanBounds` derives an inclusive `timestamp` range and a set of `metric_name`s: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND`, and `OR` (as the hull of its sides). Anything else gives no bound. A row group whose footer statistics (min/max of `timestamp` and `metric_name`) can't overlap the bounds isn't decoded; a file with no admitted row group isn't read past its footer. DataFusion still applies the real filter on top, so pruning only has to be safe, never complete. `query_sql_since`'s `since` is one more lower bound.
 - **Projection.** Only the columns a query uses are decoded (`SELECT DISTINCT metric_name` reads one column).
 - **Object store.** A bucket object's footer is fetched with two range reads (the 8-byte tail, then the metadata), so an object the bounds rule out is never downloaded.
+- **The source index.** A node writes a file a minute (about 10,000 in seven days), and every query used to read every footer before deciding a file was out of range: the alert check every 30 s and the rollup worker every 60 s did that on every node (#2425). Each store now keeps a `SourceIndex` (`src/mayo/scan.rs`), an in-memory map from file path or bucket key to the file's `(min, max)` timestamp. A flush records the range of the batch it writes; any other file's range is recorded the first time its footer is read, so after a restart each footer is read once. A source the index places outside the query's time bounds isn't opened. Files never change once written, so an entry is never refreshed; pruning removes it, and prune itself takes a known file's newest timestamp from the index instead of its footer. The remote backend uses the same index keyed by object location, though each query still LISTs the prefix. Compacting minute files into hourly ones, which would bound the file count itself, is not done: it changes the on-disk layout and is a separate item.
 - **Incremental aggregation.** DataFusion's filter, hash aggregate and top-k sort consume the stream as it arrives: an aggregate holds one accumulator per group, `ORDER BY … LIMIT n` holds `n` rows. Sessions use one target partition, because a repartition step after the scan reads ahead of its consumers and queued batches grew with the files read.
-- **What still scales with history.** The list of file names a query starts from (a couple of hundred bytes per file). A query whose *answer* scales with history (`/v1/metrics?name=X` with no start, which has no row cap, or `/v1/metrics/rollup` grouped by minute) still needs memory for that answer.
+- **What still scales with history.** The list of file names a query starts from (a couple of hundred bytes per file). Answers no longer do (§3.1.2).
+
+#### 3.1.2 Query bounds
+
+Every read a caller drives has a row cap, a deadline and, where it lists names, a window (#2382):
+
+| Read | Bound |
+|---|---|
+| `/v1/metrics?name=X` (`MayoStore::query`) | newest `ALL_QUERY_ROW_LIMIT` (10,000) rows, oldest first |
+| `/v1/metrics?name=*`, `/v1/metrics?app=…`, `/v1/metrics/app/…` | 10,000 rows (`ALL_QUERY_ROW_LIMIT`, `APP_QUERY_ROW_LIMIT`); the per-app one defaults to the last 15 minutes |
+| `/v1/metrics/summary`, `/v1/metrics/keys` | names with a sample in the last `METRIC_NAMES_WINDOW_SECS` (one hour) |
+| `/v1/metrics/rollup?name=X` (`RollupStore::query_cluster_metric`) | newest 10,000 sums, oldest first |
+| `/v1/metrics/rollup` (no name) | 10,000 rows |
+| every query above, plus `query_sql`, the rollup and autoscaler aggregates | `QUERY_DEADLINE` (8 s), under the fan-out's 10 s wait |
+
+Every read runs on a snapshot (#2449). `MayoStore::snapshot()` and `RollupStore::snapshot()` list the files and copy the unflushed buffer under the store's read guard, and the query methods live on the returned `MetricsSnapshot` and `RollupSnapshot`. Callers take the snapshot in one statement, so the guard is dropped before the query runs: tokio's `RwLock` is fair, and a guard held through a slow query stalls the collector's (or the aggregator's) write and every read queued behind it. The API handlers, the rollup worker and the alert check all query this way. On the council side the rollup store's write lock is taken only briefly: the report aggregator queues each `NodeRollup` for a separate ingest task (a bounded queue of 1,024; a full queue drops and counts), so its report loop never waits on the lock, and the flush task uses `rollup_store::flush_off_lock`, which freezes the buffer into a pending batch under the lock, writes the Parquet file without it, and drops the batch under the lock once written. Queries read a pending batch from memory, never its file, until then (#2443). The autoscaler (`src/cluster/orchestrate.rs`) takes one rollup snapshot per tick and runs one aggregate query per metric series its apps use, over the longest evaluation window, each app reading only the minutes inside its own (#2530); `relish top`'s local rows query a metrics snapshot too.
+
+A query past its deadline is `MayoError::QueryRejected`, which the handlers answer with a 400 and the reason: the caller's range is the problem, and narrowing it helps where retrying doesn't. `hydrate_seen_windows` at startup has no deadline; it isn't a caller's query.
 
 `tests/mayo_memory.rs` measures each path's peak heap with a counting allocator as history grows from one to four hours and fails if any grows by half. Golden snapshots recorded from the eager implementation (`src/mayo/snapshots/`) and a property test against an eager reference (`streamed_reads_match_the_eager_reader`) hold the answers identical.
 
@@ -214,11 +234,12 @@ pub enum AlertSeverity { Warning, Critical }
 pub enum AlertState {
     Inactive,
     Pending { since: SystemTime },
-    Firing { since: SystemTime },
+    /// `missed`: evaluations in a row with no reading.
+    Firing { since: SystemTime, missed: u32 },
 }
 ```
 
-A rule fires when the latest value for `metric_name` breaches `threshold` under `operator` continuously for `for_duration`. Evaluation is three-way, not two-way: a *missing* metric is not treated as "recovered" -- a firing alert whose telemetry goes stale stays firing (only a genuine in-range reading resolves it), and a pending alert whose data vanishes drops back to inactive.
+A rule fires when the latest value for `metric_name` breaches `threshold` under `operator` continuously for `for_duration`. Evaluation is three-way, not two-way: a *missing* metric is not treated as "recovered" -- a firing alert whose telemetry goes stale stays firing until a genuine in-range reading resolves it or `MAX_MISSED_EVALUATIONS` (10) evaluations in a row pass without a reading (#2387), and a pending alert whose data vanishes drops back to inactive.
 
 **Status: planned -- not yet implemented:** expression (PromQL) rules with `expr`; the `Info` severity; per-app suppression/tuning (`AlertOverride`, `is_builtin`, `app_overrides`); and the `!=`/`>=`/`<=`/`==` operators (only strict `>` and `<` exist).
 
@@ -305,7 +326,7 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 **Status: implemented (explicit targets); per-app auto-scrape planned.**
 
-`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, `max_samples_per_scrape`, and a scrape-timeout counter.
+`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. An app's sample whose name the node writes itself (`is_reserved_metric_name`: the prefixes `node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`, and the exact names `up`, `process_cpu_percent`, `process_memory_bytes` and the job metrics) is stored as `exported_<name>`, as a clashing target label is, so an app can't feed the node's alerts or charts (#2387). `[[metrics.scrape_targets]]` are operator config and keep their names. Every scrape, of an app or a static target, is capped at an 8 MiB body and 20,000 samples (`MAX_BODY_BYTES`, `MAX_SAMPLES_PER_SCRAPE` in `src/mayo/scrape.rs`; fixed constants, not settings). A scrape over either limit fails whole: nothing from it is stored, an app instance's `up` is 0, and Bun writes one line to stderr. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, and a scrape-timeout counter.
 
 ### 5.3 Downsampling
 
@@ -315,7 +336,9 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to the Raft leader as a `ReportingMessage::MetricsRollup` over the reporting transport (postcard-framed, **not** gRPC or a bespoke TCP call). The worker still picks its parent with an FNV-1a hash of the node ID over a council list (`src/reporting/assignment.rs`), but the cluster runtime hands it a one-entry list holding only the current leader (`spawn_leader_target_maintainer` in `src/cluster/runtime.rs`), so every node reports to the leader. Spreading nodes over several council parents is planned (#364).
 
-**Reassignment backfill: implemented.** When the council changes and a node's parent moves, the worker's next push is a backfill: the last five minutes as per-minute rollups (`RollupGenerator::generate_backfill`), each stamped with its own minute so the new parent's `(node, timestamp)` dedup makes re-sends idempotent. A failed send keeps the backfill request set and retries on the next tick; minutes older than the five-minute window stay only in the node's local store.
+**Reassignment backfill: implemented.** When the council changes and a node's parent moves, the worker's next push is a backfill: the last five minutes as per-minute rollups (`RollupGenerator::generate_backfill`), each stamped with its own minute so the new parent's `(node, timestamp, part)` dedup makes re-sends idempotent. A failed send keeps the backfill request set and retries on the next tick; minutes older than the five-minute window stay only in the node's local store.
+
+**Large rollups are split (#2426).** The reporting transport refuses frames over 1 MiB, and an entry is about 149 bytes, so a minute of more than about 7,000 series used to fail every send and silently drop the node from cluster queries. `split_to_fit` (`src/mayo/rollup_worker.rs`) cuts a minute into `NodeRollup` parts, numbered by `part` from 0, that each fit; the split depends only on the (sorted) entries, so a re-sent minute is cut the same way. A part refused as too large (one entry over the limit) doesn't start a backfill, which couldn't succeed either: the worker counts it in the node metric `mayo_rollups_refused_total` and sends the minute's other parts. After a restart the council seeds its dedup from the Parquet files, which don't record parts, so any part of a flushed minute counts as already ingested.
 
 The council member stores received rollups in a rollup store and serves them at `/v1/metrics/rollup` and `/v1/metrics/cluster`. The per-query "data unavailable" gap annotation for a reassignment from earlier drafts is **planned -- not yet implemented**: `QueryWarning::DataUnavailable` is emitted today only when two aggregators return conflicting values for the same node and minute (§5.5).
 
@@ -323,10 +346,12 @@ The council member stores received rollups in a rollup store and serves them at 
 
 **Status: implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) are now wired into the handlers:
 
-- `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
-- `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
+- `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement). Each node answers with at most its newest `APP_QUERY_ROW_LIMIT` (10,000) rows; an answer at that limit adds `QueryWarning::Truncated { node_id, limit }`, on the fan-out and the local path alike (#2477). The merge sorts on `(timestamp, metric_name, labels)` and drops equal rows.
+- `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup/owned` after dropping duplicate worker contributions (falling back to local rollup data on a single node / no council).
 
-Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each fan-out (`src/bun/api/metrics.rs`). Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
+Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each member's whole answer (`src/bun/api/metrics.rs`).
+
+`/v1/metrics/cluster` bounds (#2451): without `start` it reads the last hour (`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`). Each member answers `/v1/metrics/rollup/owned` in pages of at most `OWNED_ROWS_PAGE` (10,000) contributions ending on a whole minute, with an `x-reliaburger-next-start` header while more remain; the entry node follows the pages up to `MAX_OWNED_ROWS` (200,000) per member. A member that refuses (past that total, or one minute larger than a page) is reported as `QueryWarning::QueryRefused { node_id, reason }`, the reason read from its error body; only a member that doesn't answer is `NodeUnresponsive`. The single-node fallback refuses the same ranges with a 400. A live member silent for the window's last `SILENT_AFTER_SECS` (five minutes, the backfill span) is `QueryWarning::NodeSilent { node_id, last_seen }` (#2536): the entry node takes the expected reporters from its remembered gossip members (`KnownMembers::live_since`, skipping any that joined within that span) and asks each council member's `/v1/metrics/rollup/reporters` for the newest window it holds from each node (`RollupStore::reporters`, kept on every ingest and seeded from the flushed files at startup). If any member doesn't answer that, nobody is named. The single-node fallback applies the same check to its own store. Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 
@@ -341,7 +366,9 @@ The alert loop runs when `metrics.alerts_enabled` is set (default true), every `
 | `memory_high` | `node_memory_usage_percent` | `> 70` | 10 min | Warning |
 | `disk_high` | `node_disk_usage_percent` | `> 80` | 5 min | Warning |
 
-These are node-level rules against `node_*` metrics, not per-app rules. The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3.
+These are node-level rules against `node_*` metrics, not per-app rules: a rule on a `node_*` metric reads only series without an `app` label (#2387). The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3. A firing alert with no reading for `MAX_MISSED_EVALUATIONS` (10) evaluations in a row resolves, and its state is dropped. Bun hands each evaluation's transitions to `WebhookDispatcher::dispatch_all`; a semaphore shared by the dispatcher's clones lets at most `MAX_CONCURRENT_DISPATCHES` (8) deliveries run at once.
+
+**Firing alerts survive a restart (#2478).** After any evaluation that produced a transition, Bun saves the firing instances (rule name, labels, firing-since in Unix seconds; `alert::FiringAlerts`) atomically to `<data dir>/alerts-firing.json`, and restores them at start-up before the first evaluation, skipping rules that no longer exist. A condition that cleared while Bun was down then produces its resolve on the first in-range reading. Pending state isn't kept: its timer restarting only delays a firing. A missing or unparseable file restores nothing. The file is node-local, not Raft state or a wire format.
 
 Every rule fires on pressure, none on idleness. Up to 0.3.0 a fifth rule, `cpu_idle`, fired when node CPU stayed below 5 % for 30 minutes, labelled "possible zombie". An idle node isn't a fault: it's spare capacity, and it's what every new or quiet cluster looks like, so the rule turned healthy clusters `DEGRADED` in `relish status`, `relish wtf` and the dashboard. We dropped it in 0.3.1 ([#2171](https://github.com/reliaburger/reliaburger/issues/2171)).
 
@@ -436,7 +463,7 @@ max_storage_mb = 1024
 
 ### 6.2 Scraping Configuration
 
-**Status: partially implemented.** `scrape_interval_secs` now drives the scrape loop and `[[metrics.scrape_targets]]` declares the endpoints (see §5.2). Still absent: per-app `metrics`/`metrics_interval`, a `[metrics.scrape]` block, and a `max_samples_per_scrape` limit.
+**Status: partially implemented.** `scrape_interval_secs` now drives the scrape loop and `[[metrics.scrape_targets]]` declares the endpoints (see §5.2). Still absent: per-app `metrics`/`metrics_interval`, a `[metrics.scrape]` block, and a configurable sample limit (the 20,000-sample and 8 MiB caps are fixed constants, §5.2).
 
 ### 6.3 Alert Configuration (`[alerts]`)
 
@@ -514,7 +541,7 @@ Today the parent is always the current leader, so a reassignment is a leader cha
 - **Internal API:** the `/v1/metrics*` and `/v1/alerts` routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`); inter-node transports are secured by the Sesame PKI where mTLS is enabled.
 - **Per-namespace isolation:** `/v1/metrics/app/{app}/{namespace}` enforces tenant scope via `authorize_scoped`, and every path/name segment that reaches SQL is escaped (single quotes doubled), so a scoped token cannot read another tenant's metrics and a crafted `?name=` cannot break out of the string literal. This is **shipped**, not future.
 - **Prometheus remote-read auth: Status: planned -- not yet implemented** (there is no remote-read endpoint, §3.4).
-- **`max_samples_per_scrape` / label scrubbing:** planned -- not yet implemented. The scrape loop (§5.2) ingests every sample a target returns; there is no per-scrape sample cap or label scrubbing yet.
+- **Scrape limits / label scrubbing:** a scrape is capped at 8 MiB and 20,000 samples (`MAX_BODY_BYTES`, `MAX_SAMPLES_PER_SCRAPE` in `src/mayo/scrape.rs`), and one over either fails whole (§5.2). An app still chooses its own metric names and labels, apart from the names the node reserves (#2387); label scrubbing is planned -- not yet implemented.
 
 ### 8.2 Alert Webhook Authentication
 
@@ -612,15 +639,12 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 
 - Verify that an alert with `for = "5m"` transitions from `Inactive` -> `Pending` -> `Firing` after exactly 5 minutes of continuous threshold breach.
 - Verify that a momentary dip below threshold during the `for` period resets the alert to `Inactive`.
-- Verify that per-app suppression (`cpu.idle = false`) prevents the alert from firing for the suppressed app but not for other apps.
-- Verify that per-app threshold tuning (`memory.low = { threshold = 95 }`) uses the overridden value.
 
 **Integration tests:**
 
-- Deploy a test app that consumes 90% of its memory limit. Verify that the `memory.low` alert fires within the expected timeframe (default: 5 minutes).
-- Deploy a test app that triggers an OOM kill. Verify that the `oom.kill` alert fires immediately (no `for` duration on OOM).
 - Configure a webhook notification destination. Trigger an alert. Verify that the webhook receives the expected JSON payload with correct labels, severity, and timestamps.
-- Configure a per-app suppression. Verify that the suppressed alert does not fire for the suppressed app, does not produce a webhook notification, and is not visible in `relish alerts`.
+
+**Planned, with custom alert rules (#1773).** The shipped rules are four fixed node rules (`default_rules` in `src/mayo/alert.rs`) with no per-app overrides, so these tests wait for that work: per-app suppression and threshold tuning, a per-app memory alert, an OOM-kill alert with no `for` duration, and a command that lists active alerts.
 
 ### 10.4 Prometheus Compatibility Tests
 

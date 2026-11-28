@@ -42,6 +42,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
         check_export_holds(inputs, &mut report);
+        check_image_collection(inputs, &mut report);
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
@@ -90,6 +91,12 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
     record_unknown("export_holds", &evidence.export_holds, "cluster", report);
+    record_unknown(
+        "image_collection",
+        &evidence.image_collection,
+        "cluster",
+        report,
+    );
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
@@ -141,7 +148,7 @@ fn check_nodes(inputs: &WtfInputs, report: &mut WtfReport) {
                 id: "unreachable-nodes".to_string(),
                 title: format!("node {} did not answer its Bun API", node.node_id),
                 details: vec!["authenticated per-node evidence collection failed".to_string()],
-                suggestion: "check the node's bun agent and network: `relish dev shell <node>` / `journalctl -u bun`".to_string(),
+                suggestion: "check the node's bun agent and network: on the node, `systemctl status reliaburger` and `journalctl -u reliaburger`".to_string(),
                 correlated_events: Vec::new(),
                 affected_resource: format!("node.{}", node.node_id),
             });
@@ -156,8 +163,8 @@ fn check_nodes(inputs: &WtfInputs, report: &mut WtfReport) {
                 title: format!("node {} is {}", node.node_id, node.membership_state),
                 details: vec!["Mustard membership does not consider this node alive".to_string()],
                 suggestion: format!(
-                    "node {} is {}; if expected, drain it; if not, check the host",
-                    node.node_id, node.membership_state
+                    "node {} is {}; if it is gone for good, retire it with `relish decommission-node {} --workloads-stopped --reason <why>`; if not, check the host",
+                    node.node_id, node.membership_state, node.node_id
                 ),
                 correlated_events: Vec::new(),
                 affected_resource: format!("node.{}", node.node_id),
@@ -542,6 +549,22 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
             suggestion: "the voter counts towards quorum but can't commit writes; read its \
                          journal for a storage error (a full disk stops Raft), free space, \
                          then restart bun on it"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if let Some(retired) = summary.retired_identities.filter(|r| r.nearly_full()) {
+        healthy = false;
+        report.warnings.push(WtfFinding {
+            id: "council-retired-identities-nearly-full".to_string(),
+            title: "the retired node identity list is nearly full".to_string(),
+            details: vec![crate::relish::council_view::describe_retired_identities(
+                &retired,
+            )],
+            suggestion: "retired identities are permanent, so a retired name is never reused; \
+                         reuse names of nodes that are coming back instead of retiring them, \
+                         and raise the limit with the maintainers if a cluster really needs more"
                 .to_string(),
             correlated_events: Vec::new(),
             affected_resource: "council".to_string(),
@@ -1176,7 +1199,7 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
                 disk.storage_domains.join(", ")
             )],
             suggestion: format!(
-                "node {} disk is at {:.1}%; prune images (`relish pickle gc`) or logs",
+                "node {} disk is at {:.1}%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml",
                 disk.node_id, disk.used_percent
             ),
             correlated_events: Vec::new(),
@@ -1226,6 +1249,50 @@ fn check_export_holds(inputs: &WtfInputs, report: &mut WtfReport) {
             ),
             correlated_events: Vec::new(),
             affected_resource: format!("node.{}", hold.node_id),
+        });
+    }
+}
+
+/// A node whose image collection keeps failing or being refused removes no
+/// unpacked image, and every deploy of a new version adds one (#2423,
+/// #2524). How full the disk already is, `disk-high` says.
+fn check_image_collection(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(nodes) = inputs.cluster.image_collection.value() else {
+        return;
+    };
+    for node in nodes {
+        let failing_for = inputs.collected_at.saturating_sub(node.since);
+        let (what, why) = match node.problem {
+            crate::grill::image::CollectionProblem::Refused => (
+                "is refused",
+                "it can't read the OCI spec of one of its container bundles, so it can't \
+                 tell which unpacked images are in use and removes none",
+            ),
+            crate::grill::image::CollectionProblem::Failed => {
+                ("fails", "a pass hit a filesystem error partway through")
+            }
+        };
+        report.warnings.push(WtfFinding {
+            id: "image-collection-failing".to_string(),
+            title: format!(
+                "node {}'s image collection {what}, so its unpacked images are never removed",
+                node.node_id
+            ),
+            details: vec![
+                format!("{why}; it has for {failing_for} s"),
+                format!(
+                    "unpacked images take {} bytes on the node, and each new image version adds its own",
+                    node.unpacked_bytes
+                ),
+            ],
+            suggestion: format!(
+                "node {}'s Bun log says why (`image collection skipped` or `image collection \
+                 failed`); fix that bundle or the filesystem, and the next pass, at the next \
+                 container start from an image, removes what no container uses",
+                node.node_id
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
         });
     }
 }
@@ -1898,9 +1965,10 @@ pub(super) mod tests {
     use crate::relish::wtf::{
         AlertObservation, BackupObservation, CertificateObservation, CouncilObservation,
         CpuThrottleObservation, DeployObservation, DiskObservation, ExportHoldObservation,
-        FaultObservation, GitOpsObservation, IsolationObservation, LaunchFailureObservation,
-        LogObservation, NodeGitOpsDifference, NodeIsolation, NodeObservation, RegistryObservation,
-        ReplicaObservation, RestartObservation, ServiceObservation, TokenObservation,
+        FaultObservation, GitOpsObservation, ImageCollectionObservation, IsolationObservation,
+        LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeIsolation,
+        NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+        ServiceObservation, TokenObservation,
     };
 
     pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
@@ -1941,6 +2009,7 @@ pub(super) mod tests {
                     used_percent: 20.0,
                 }]),
                 export_holds: available(Vec::new()),
+                image_collection: available(Vec::new()),
                 certificates: available(vec![CertificateObservation {
                     certificate_kind: "node".to_string(),
                     identity: "node-1".to_string(),
@@ -2035,6 +2104,7 @@ pub(super) mod tests {
                 faults: gone(),
                 disks: gone(),
                 export_holds: gone(),
+                image_collection: gone(),
                 certificates: gone(),
                 registry: gone(),
                 tokens: gone(),
@@ -2418,6 +2488,65 @@ pub(super) mod tests {
         assert!(report.ok.iter().any(|ok| ok.id == "nodes"));
     }
 
+    /// #2524: a node whose image collection is refused never removes an
+    /// unpacked image; only Bun's log said so.
+    #[test]
+    fn a_refused_image_collection_is_a_warning_naming_the_node() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.image_collection = available(vec![ImageCollectionObservation {
+            node_id: "node-1".to_string(),
+            problem: crate::grill::image::CollectionProblem::Refused,
+            since: NOW - 120,
+            unpacked_bytes: 3 << 30,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "image-collection-failing")
+            .expect("an image-collection-failing warning");
+        assert_eq!(finding.affected_resource, "node.node-1");
+        assert!(finding.title.contains("is refused"), "{}", finding.title);
+        assert!(
+            finding.details[0].contains("120 s"),
+            "{:?}",
+            finding.details
+        );
+        assert!(
+            finding.details[1].contains(&(3u64 << 30).to_string()),
+            "{:?}",
+            finding.details
+        );
+    }
+
+    /// #2524: an image store close to full is `disk-high` on the images
+    /// domain, like any other.
+    #[test]
+    fn a_full_image_filesystem_is_reported_by_the_disk_check() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
+            node_id: "node-1".to_string(),
+            storage_domains: vec!["images".to_string()],
+            used_bytes: 90,
+            total_bytes: 100,
+            used_percent: 90.0,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "disk-high" && finding.title.contains("images")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
     /// A failing export holds the store's retention, which only Bun's log
     /// said, every five minutes, while the disk filled (#2062).
     #[test]
@@ -2563,6 +2692,7 @@ pub(super) mod tests {
                 voter: true,
             }],
             council_size: None,
+            retired_identities: None,
         }
     }
 
@@ -2676,6 +2806,38 @@ pub(super) mod tests {
             .find(|item| item.id == "council-voter-lagging")
             .unwrap();
         assert_eq!(finding.details, vec!["node-3 (applied 2827, 1149 behind)"]);
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #2375: a retired-identity list at 90% of its limit is a warning,
+    /// before decommissioning starts to be refused; below it, nothing.
+    #[test]
+    fn wtf_warns_when_the_retired_identity_list_is_nearly_full() {
+        use crate::bun::agent::CouncilRole;
+        use crate::cluster::retirement::{MAX_RETIRED_NODES, RetiredIdentities};
+        let council_with = |count: usize| {
+            let mut leader = council_node("node-1", CouncilRole::Leader, 0, None, Some("node-1"));
+            leader.retired_identities = Some(RetiredIdentities::of(count));
+            council_with_nodes(vec![leader])
+        };
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with(3);
+        let report = diagnose(&inputs);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|item| item.id == "council-retired-identities-nearly-full")
+        );
+
+        inputs.cluster.council = council_with(MAX_RETIRED_NODES - 10);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|item| item.id == "council-retired-identities-nearly-full")
+            .unwrap();
+        assert!(finding.details[0].starts_with("65526 of 65536"));
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
     }
 
@@ -4158,5 +4320,75 @@ pub(super) mod tests {
         assert_eq!(at(DISK_WARNING_PERCENT as f64), (true, false));
         assert_eq!(at(DISK_CRITICAL_PERCENT as f64 - 0.1), (true, false));
         assert_eq!(at(DISK_CRITICAL_PERCENT as f64), (false, true));
+
+        // There is no `relish pickle gc` (#2468).
+        let mut inputs = healthy_inputs();
+        inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
+            node_id: "node-1".to_string(),
+            storage_domains: vec!["images".to_string()],
+            used_bytes: 1,
+            total_bytes: 100,
+            used_percent: DISK_WARNING_PERCENT as f64,
+        }]);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|f| f.id == "disk-high")
+            .unwrap();
+        assert!(
+            !finding.suggestion.contains("pickle"),
+            "{}",
+            finding.suggestion
+        );
+        assert!(
+            finding.suggestion.contains("relish images delete"),
+            "{}",
+            finding.suggestion
+        );
+    }
+
+    #[test]
+    fn a_down_node_is_advised_only_commands_that_apply_to_it() {
+        // `relish dev shell` works only on a developer Lima cluster, the
+        // unit is `reliaburger`, not `bun`, and there's no drain (#2468).
+        let mut inputs = healthy_inputs();
+        let mut nodes = inputs.cluster.nodes.value().unwrap().clone();
+        nodes[0].agent_reachable = false;
+        nodes[0].membership_state = "dead".to_string();
+        inputs.cluster.nodes = available(nodes);
+        let report = diagnose(&inputs);
+        let unreachable = report
+            .critical
+            .iter()
+            .find(|f| f.id == "unreachable-nodes")
+            .unwrap();
+        assert!(
+            !unreachable.suggestion.contains("relish dev"),
+            "{}",
+            unreachable.suggestion
+        );
+        assert!(
+            !unreachable.suggestion.contains("-u bun"),
+            "{}",
+            unreachable.suggestion
+        );
+        assert!(
+            unreachable.suggestion.contains("journalctl -u reliaburger"),
+            "{}",
+            unreachable.suggestion
+        );
+        let dead = report
+            .critical
+            .iter()
+            .find(|f| f.id == "node-dead")
+            .unwrap();
+        assert!(!dead.suggestion.contains("drain"), "{}", dead.suggestion);
+        assert!(
+            dead.suggestion.contains("relish decommission-node"),
+            "{}",
+            dead.suggestion
+        );
     }
 }

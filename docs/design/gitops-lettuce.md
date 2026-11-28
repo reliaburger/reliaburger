@@ -1,5 +1,9 @@
 # Lettuce: GitOps Sync Engine
 
+**Status:** Partly shipped.
+**Reconciled against:** not reconciled (§4 checked against 0.3.4, #2515)
+**Sketches:** §4.4–§4.6, the jitter in §5.1, §13
+
 ## 1. Overview
 
 Lettuce is Reliaburger's built-in GitOps sync engine, compiled directly into the Bun binary. It replaces external tools like ArgoCD and Flux with a first-class subsystem that understands the native TOML configuration format, the Raft-based desired state model, and the autoscaler's runtime overrides.
@@ -128,7 +132,7 @@ term moved.
 
 Lettuce parses TOML files in a defined order to handle cross-references:
 
-1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares.
+1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares. A tree with no `.toml` file under `path` fails the sync too while GitOps owns any resource, because its empty config would remove everything GitOps owns (#2467); an explicit empty `.toml` file is how a commit removes everything on purpose. A general cap on removals per sync and a commit-trailer override were considered and not built.
 2. **Namespace resolution.** Files can declare `[namespace]` blocks. If a file doesn't declare a namespace, it inherits the namespace from its parent directory name, or falls back to `default`.
 3. **Parse and validate.** Each file is parsed with the `toml` crate. Validation checks:
    - Required fields present (`image` or `exec`/`script` for apps/jobs)
@@ -328,6 +332,9 @@ pub enum SignatureStatus {
 
 ### 4.4 DiffResult
 
+Original sketch; `DiffResult`, `FieldChange`, `FileParseError` and `ResourceKind` are not in the tree. The shipped diff is `ResourceChange` and `ChangePayload` in `src/lettuce/diff.rs`, with `DiffSummary` in `src/lettuce/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// The complete diff between git desired state and Raft desired state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +422,9 @@ pub enum ResourceKind {
 
 ### 4.5 WebhookPayload
 
+Original sketch; these types are not in the tree. The shipped webhook check is `WebhookValidator` and `WebhookAdmission` in `src/lettuce/webhook.rs`, and an accepted push is a `WebhookEvent` in `src/lettuce/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// Parsed and validated webhook payload. Lettuce supports GitHub and
 /// GitLab webhook formats. The payload is validated for HMAC-SHA256
@@ -451,6 +461,9 @@ pub enum WebhookValidation {
 
 ### 4.6 SigningKeySet
 
+Original sketch; this type is not in the tree. The shipped types are in `src/lettuce/types.rs`: `[gitops] trusted_signing_keys` stays a list of strings, and `verify_commit` in `src/lettuce/verify.rs` checks a commit against it.
+
+<!-- sketch -->
 ```rust
 /// The set of trusted signing keys, parsed from `trusted_signing_keys` in
 /// the GitOps config. Supports both GPG and SSH key fingerprints.
@@ -546,7 +559,7 @@ For instant deploys on push. The webhook endpoint is served on the cluster API p
 1. **Method check.** Only POST is accepted. Other methods return 405.
 2. **HMAC-SHA256 signature validation.** The `X-Hub-Signature-256` header (GitHub format) is checked against the payload body using the configured `webhook_secret`. GitLab uses `X-Gitlab-Token` (compared directly). Lettuce auto-detects the provider from the headers. Invalid signatures return 401.
 3. **Rate limiting.** A token bucket rate limiter allows `webhook_rate_limit` (default 10) triggers per minute. Excess triggers return 429 with a `Retry-After` header.
-4. **Replay detection.** The `X-GitHub-Delivery` (or equivalent) header is stored in a bounded deduplication set (1000 entries, LRU eviction). Duplicate delivery IDs are rejected with 409.
+4. **Replay detection.** The `X-GitHub-Delivery` (or equivalent) header is stored in a bounded deduplication set (1000 entries, LRU eviction). Duplicate delivery IDs are rejected with 409. For an HMAC-signed delivery the SHA-256 of the body is deduplicated too, because the signature covers the body and not the header (#2408); a GitLab token signs nothing, so GitLab deliveries are deduplicated by id alone.
 5. **Branch filter.** The payload is parsed to extract the pushed branch. If it doesn't match the configured branch, the webhook is acknowledged (200) but no sync is triggered.
 6. **Trigger sync.** A signal is sent to the sync loop to run immediately, bypassing the poll timer. The webhook returns 202 (accepted) before the sync completes.
 
@@ -840,7 +853,7 @@ An earlier draft kept git credentials out of the `[gitops]` block, in a per-node
 
 **Cause:** An attacker captures a valid webhook payload and re-sends it.
 
-**Behaviour:** The deduplication set rejects duplicate `delivery_id` values with 409. Even if the deduplication set has evicted the entry (after 1000 newer deliveries), a replayed webhook for an already-applied commit is a no-op (the commit SHA matches `last_applied_commit`, so the sync short-circuits).
+**Behaviour:** The deduplication set rejects duplicate `delivery_id` values (401 today). For a signed delivery it also rejects a body it has admitted before, under any delivery id, because the HMAC covers the body but not the header: an attacker can't replay a captured delivery by changing its id (#2408). The leader's replicated receipt is the body digest, so every node refuses it. The guarantee covers the last 1000 admitted deliveries and nothing older. GitLab's `X-Gitlab-Token` is the shared secret itself, so a captured GitLab request leaks the secret; there the check is the delivery id alone. Even if the deduplication set has evicted the entry (after 1000 newer deliveries), a replayed webhook for an already-applied commit is a no-op (the commit SHA matches `last_applied_commit`, so the sync short-circuits).
 
 **Residual risk:** An attacker could replay a webhook for a commit that has been reverted in git. However, since Lettuce always fetches the latest commit from the remote (not the commit referenced in the webhook), a replayed webhook simply triggers a normal sync cycle that applies whatever is currently at HEAD. The webhook commit SHA isn't used for checkout.
 
@@ -876,7 +889,7 @@ The primary security boundary. Signed commits ensure that only authorised develo
 
 ### 8.2 Webhook HMAC Validation
 
-Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. Use a long random `webhook_secret`; a minimum length is planned (Section 6.3) but not enforced.
+Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. Before the check, a council node reads only the stored `gitops_config` (`read_desired`), never a clone of the whole desired state, and does it before taking the validator lock; the validator unseals the secret only when the stored config has changed since it was last keyed (#2388). An unauthenticated request therefore costs one small clone and one HMAC. Use a long random `webhook_secret`; a minimum length is planned (Section 6.3) but not enforced.
 
 **Provider compatibility:**
 
@@ -896,6 +909,8 @@ Git credentials (SSH keys, HTTPS tokens) are stored on each council member node 
 **SSH keys:** The SSH private key should be readable only by the Bun process user. Lettuce verifies the file permissions at startup and warns if the key is world-readable.
 
 **HTTPS tokens:** Can be encrypted with the cluster's `age` public key (same encryption used for secrets). Bun decrypts at runtime.
+
+**Not in argv or the clone's config (M27, #2414).** Bun hands git the repository URL with the credential removed and supplies the credential through a `credential.helper` that reads it from the child's environment (`RELIABURGER_GIT_PASSWORD`, and `RELIABURGER_GIT_USERNAME` for a token-only `https://TOKEN@host` URL, sent as the username with an empty password, as the URL form would be). The helper string in argv names the variables, never their values. A reused clone whose stored remote still carries a credential is rewritten to the clean URL when it's opened.
 
 **No credential passthrough.** Lettuce never logs, emits, or includes git credentials in error messages, webhook responses, or `SyncState`. Error messages from `git2` are sanitized to remove any credential material before being stored.
 

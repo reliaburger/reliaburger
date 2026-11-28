@@ -126,7 +126,7 @@ Disk space isn't infinite. Cleanup comes in two steps, and keeping them apart is
 
 1. **Reference protection.** A blob any catalogued manifest references is never deleted. The Raft state machine checks this when it approves a deletion, not just the node that asked.
 2. **Sole-copy protection.** A blob is deleted from a node only while some other node also holds it. You can't accidentally destroy the last copy.
-3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight.
+3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight. One kind of untracked blob is kept however old it is: the binary of a rolling upgrade, while the upgrade is active ([chapter 14](14-changing-the-tyres.md#a-binary-nobody-tracks) has why).
 
 The order matters. A node first *nominates* the blobs it would delete and proposes them to Raft as a `GcReport`. The state machine approves only those that pass the rails above and removes this node from their holder sets. Only then, and only for the approved blobs, does the node delete anything from disk, re-checking references once more as it goes (`PickleState::collect_garbage`). Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
 
@@ -460,6 +460,12 @@ pub fn apply_manifest_commit(&mut self, commit: &ManifestCommit) {
 
 The `retain` + `push` pattern for updating the tag list is idiomatic Rust for "replace if exists, insert if not" on a `Vec`. It's not the most efficient approach, but it's clear and correct. At registry scale (hundreds of tags, not millions), clarity wins.
 
+"Hundreds of tags" is an assumption, and a CI pipeline that tags every build `app:<git sha>` breaks it: tagged images never expire, so the catalogue only grows (#2427). Two costs grew with it and didn't need to. GC asked `layer_holders` about every local blob, and each answer was a linear scan of `layer_locations`, so a sweep cost blobs times entries. It now builds a lookup once with `holder_index`, a `HashMap<&str, &BTreeSet<u64>>` whose keys and values borrow from the catalogue instead of copying it. In Go terms it's a map of pointers into a slice that the compiler promises won't change while the map exists. And each push cloned the catalogue twice and wrote it to disk pretty-printed. It now keeps one clone for rollback, changes the guarded catalogue in place, and writes compact JSON. Re-typing the tables themselves as `BTreeMap`s, which keep the deterministic order Raft needs, changes the stored format, so it waits for a release that changes the format anyway. So does tag retention, which would let old build tags expire.
+
+That joined key, `repository:tag`, only works while it splits one way. For a long time the registry took the repository as whatever came before `/manifests/` in the URL and the tag as whatever came after, so a hand-made push of tag `x:y` to `team/app` and of tag `y` to `team/app:x` produced the same key, and the second quietly replaced the first (#2413). Stock clients never send such names, because the OCI distribution spec has a grammar for them: lowercase path components joined by single `.`, `_`, `__` or runs of `-`, and tags of letters, digits, `_`, `.` and `-` that can't start with `.` or `-`. `dispatch_v2` now checks both before anything else reads the name, answering 400 `NAME_INVALID` or `TAG_INVALID`. `apply_manifest_commit` checks again and drops a commit that fails, the same way on every replica, so a name that reaches Raft by some other path can't collide either. Two kinds of name the cluster makes for itself pass by rule rather than by grammar: the `_buildcontext` scratch repository, and pull-through cache copies under `cache/`, whose upstream host may carry a port.
+
+We check the grammar by hand rather than pull in a regular-expression crate. `valid_name_component` walks the bytes with an index: a run of letters and digits, then either the end or one separator and another run. `bytes.get(index)` returns an `Option<&u8>`, `None` past the end, so the loop never indexes out of bounds and never needs a length check of its own.
+
 ### Axum extractors: parse, don't validate
 
 The OCI API handlers show a pattern that axum encourages: let the framework extract and parse, then validate the domain logic yourself.
@@ -584,7 +590,7 @@ The `if` after a pattern is a *match guard*: the arm only matches when the patte
 
 Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.
 
-The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises generation publication across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
+The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises the publication of each generation across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
 
 That marker turned out to be a promise we hadn't kept. The V02 soak powered a node off a few seconds after it unpacked Redis. When the node came back, `gen-…/.complete` was there and `usr/local/bin/redis-server` was 0 bytes: ext4 had written the tiny marker and was still holding the unpacked data in the page cache when the power went. Every redeploy then failed with `exec format error`, the node never got its pinned workload back, and the agent retried every two seconds. The marker now waits for `syncfs` on the unpacked tree, which flushes the whole filesystem in one call rather than fsyncing thousands of files, and is itself written with the same synced temp-file-and-rename as everything else. Cached blobs got the same treatment: they used to be renamed into place without a sync.
 
@@ -640,6 +646,175 @@ but it doesn't quietly turn “rootless” into “every local workload shares o
 writable filesystem”. We can add an unprivileged snapshotter later and keep the
 same ownership contract.
 
+### One lock per generation
+
+That serialisation started life as one node-wide `tokio::sync::Mutex`, taken
+before anything else in `unpack_to`, even the check for the marker (#2456).
+So while a six-gigabyte image unpacked, and then `syncfs` waited for every
+dirty page on the filesystem, a crashed Redis replica whose image was
+unpacked days ago couldn't restart: its create queued behind the same lock
+just to read a marker file. New images unpacked strictly one after another
+too.
+
+Two changes fix it. First, the marker check moved in front of any lock. That's
+safe because of how the marker is written: after the tree is flushed, and
+atomically (temp file, sync, rename), so a reader sees either no marker or
+a marker over a complete tree. A published generation is returned at once,
+whatever else is unpacking. Second, the one lock became one lock per
+generation path, in a `tokio::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`.
+The outer lock guards only the map and is held for a lookup. The inner one,
+an `Arc` so it can outlive the lookup, is what an unpack holds while it
+extracts. The unpack checks the marker again once it has the lock, since
+another pull of the same image may have published it meanwhile, and that
+keeps the property the lock was for: a generation is never cleared and
+re-extracted under a running container. Afterwards `retain` drops every entry
+whose `Arc::strong_count` is 1, which means only the map still holds it, so
+the map doesn't grow with every image the node has ever run.
+
+`syncfs` stayed. It still flushes the whole filesystem, but it now holds only
+its own generation's lock, so a slow flush delays that one image and nothing
+else. Flushing each file of the tree instead would avoid waiting for
+unrelated writers, at the cost of thousands of `fsync` calls per image; we'll
+revisit it if the profile says so.
+
+### Generations nobody runs any more
+
+Content-addressing fixed the clobbering, and it also meant nothing ever
+went away. Every new build of `web` unpacked into a new `gen-…` directory,
+three or four times the size of its compressed layers, and no code removed
+the old one. Pickle's garbage collection expires blobs; it never looked at
+`rootfs/`, the cached manifests or the pin metadata beside them. The November
+2026 audit worked it through: a 300 MB image, deployed three times a day on a
+16 GB data disk, fills the disk in about two weeks (#2423). Then pulls, log
+capture and the Raft log all fail with `ENOSPC` on that node.
+
+So who decides that a generation is garbage? Not the image store: it doesn't
+know which containers exist. The runtime does. Every bundle that uses an image
+names its generation in one of two places. A writable container's
+`rootfs-lower` marker holds the canonical lower directory, and a read-only
+container's `config.json` points runc straight at the generation.
+`live_image_generations` in `src/grill/runc.rs` reads both for every bundle
+and hands the set to `ImageStore::collect_rootfs_garbage`, which removes every
+`gen-*` directory not in it. That covers the reusable job executors too,
+since their bundles sit in the same directory. Note the error policy: if one
+`config.json` can't be read, the whole set is refused. A set that's missing
+a running container's root would delete that container's files.
+
+The collector takes each generation's lock before it touches it, with
+`try_lock`: a generation an unpack holds is skipped, not waited for, so a
+collection pass never stalls a pull and a pull waits for at most one removal.
+
+There's a gap between a pull and a bundle, though. `pull_and_unpack` returns
+a generation, and only some time later does `mount_private` write the marker
+that names it. A collection in that window would see an unused generation and
+delete it under a container that is about to start. The store closes the gap
+itself: it records each generation it hands out, and the collector spares
+anything handed out within the last hour. The marker check and the record
+happen under one lock, and so do the collector's own check and its removal of
+the marker. A pull either claims a generation before the collector gets
+there, and the generation stays, or it finds no marker and unpacks afresh.
+
+Removal order matters as much as it did for publication. The collector deletes
+the `.complete` marker first and the tree second. A crash between the two
+leaves a tree with no marker, which the next unpack or the next pass clears.
+The other order could leave a marker over nothing, and the next pull would hand
+out an empty directory. A tree that never got its marker (an unpack that died)
+goes once it's older than an hour. After the generations, the pass removes
+emptied directories, the cached manifests of images with no tree left, and the
+pin metadata that no remaining pinned image's chain (pin, platform manifest,
+config) refers to.
+
+The trigger is the thing that grows the store. Each create from an image
+starts a pass on its own task if the last one began more than an hour ago, or
+at once when the image filesystem is 95% full. `start_collection` returns a
+`tokio::sync::OwnedMutexGuard` (a lock guard that owns its `Arc` instead of
+borrowing it, so it can move into a spawned task) and holds it for the whole
+pass, so two creates never run two passes. A node that stops deploying stops
+collecting, which is fine: it also stops growing.
+
+### Seeing it from relish
+
+A collector nobody can see is half a fix. The pass logs what it removed, but
+#2423 also asked for the space to show where an operator looks, and that part
+came separately (#2524). Two questions: how much disk do the unpacked images
+take, and is the collector actually running?
+
+The first is cheap to answer if you measure at the right moment. Walking a
+generation's tree to add up its files costs as much as the tree is big, and
+`relish images` shouldn't walk a million files to print a table. But the
+unpack has just written the tree and flushed it, so `publish_generation`
+walks it once then, on the same blocking thread, and writes the total into
+the `.complete` marker as a second line (`complete\n48200000\n`). The marker
+is still the only thing a pull checks, and it checks only that the file
+exists, so nothing else had to change. Listing sizes is now one small read
+per generation. `/v1/images` adds an `unpacked` map, digest to bytes, from
+the node that answered, and `relish images` joins it on the digest into an
+UNPACKED column. The join works because apply binds every tag to a digest
+(see the start of this chapter), so the tag directory under `rootfs/` is
+named after the same digest the catalogue lists. A generation published
+before this change has a one-line marker and simply isn't counted.
+
+The second needed a record. A pass can fail to do its job two ways: it
+can't read one of the bundles' specs, so it refuses to remove anything (the
+error policy above), or it hits a filesystem error partway. Both used to be a
+line in Bun's log and nothing else, and a node in that state grows by one
+image version per deploy, forever. `ImageStore::run_collection` now wraps the
+pass and records the outcome in an `ImageStoreStatus`, a handle every clone
+of the store shares: a problem and when it started, cleared by the next pass
+that works. The diagnostics endpoint copies it into its snapshot, and
+`relish wtf` has an `images` check that warns `image-collection-failing`,
+naming the node, how long it's been failing and how much its unpacked images
+take. It reports no reason text, on purpose: an error can name a host path,
+and the diagnostics payload never carries one. The reason is in Bun's log,
+and the suggestion says to look there.
+
+"Close to full" needed nothing new. The `disks` check already reads every
+storage domain, `images` included, and warns at 85%. The test
+`a_full_image_filesystem_is_reported_by_the_disk_check` pins that, so it
+stays true if the disk check changes.
+
+`ImageStoreStatus` uses a `std::sync::Mutex`, not tokio's, for the same
+reason `ExportHolds` does: it's held only to copy or replace one small value,
+never across an `.await`. And it implements `PartialEq` by hand, comparing
+the two handles' `Arc`s with `Arc::ptr_eq` (are these the same allocation?)
+rather than their contents, because the static evidence it sits in derives
+`PartialEq` and "the same record" is the only equality that means anything
+for a shared handle.
+
+### How big may an image get?
+
+Collection removes what nobody uses. It can't help with one image that is
+simply too big, and the same audit found that nothing stopped one (#2385).
+Picture a layer that's a 10 MB gzip of a 20 GB file of zeros. It downloads,
+its digest checks out, it's well under `[images] max_storage` (which counts
+compressed bytes), and then the unpacker writes all 20 GB into the node's data
+filesystem. Every other writer on that disk fails with it.
+
+`unpack_layers_with_owner` now takes an `UnpackLimits` and keeps two running
+totals across all of an image's layers: the bytes of file content and the
+number of tar entries. Both are counted from the entry's header *before* the
+entry is written, so the entry that would cross a ceiling never reaches the
+disk. The tar crate's `Entry::size` is already the expanded size for a sparse
+file, which is the number we want: a sparse file of holes costs little on
+disk, but the count stays conservative.
+
+The ceilings are 16 GiB and a million entries, and `unpack_to` lowers the byte
+ceiling further to the image filesystem's free space less 1 GiB, so the
+biggest image a node accepts still leaves room for logs, metrics and the Raft
+log. When an unpack fails, for this reason or any other, `unpack_to` removes
+the partial tree before it returns. Nothing would ever run from it (it has no
+`.complete` marker), so all it could do is take disk.
+
+What this doesn't bound is what a running container writes. A container's
+writable layer is an overlay upper directory on the same data filesystem, and
+an unsized volume is a plain directory, so `dd if=/dev/zero of=/fill` inside a
+container still fills the node's disk. A per-app limit needs either a project
+quota on the upper directory (XFS, or ext4 with `prjquota`) or Btrfs qgroups,
+or the agent measuring each upper directory and stopping the instance that
+passes a limit. The first doesn't work on every filesystem; the second needs a
+policy for what to stop. That's a decision for its own release, and until then
+the manual says plainly that these two are unbounded.
+
 ### One authoritative catalogue
 
 Pickle has two catalogues: the council's Raft-replicated `manifest_catalog`, and each node's local `PickleState::catalog`. The push path proposes to Raft; the read path — `manifest_get` and `tags_list` — read the *local* one. So a manifest a peer committed to Raft was invisible on a node that hadn't received the original PUT, until a heal tick happened to reconcile it. Push on node A, `docker pull` from node B, get a 404.
@@ -676,7 +851,7 @@ listening, or that peers can't reach, warns however many nodes there are.
 
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 
-Two resource limits ride along. A storage **quota** caps the bytes each node's blob store holds (`[images] max_storage`, `0` meaning unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings. A registry with no quota and no session expiry is a disk-exhaustion waiting to happen. (There used to be a per-repository quota too. Nothing could configure it, so 0.2.1 deleted it rather than keep a feature that existed only in this chapter.)
+Two resource limits ride along. A storage **quota** caps the bytes each node's blob store holds (`[images] max_storage`, `0` meaning unlimited, the default), and a file cap, `[images] max_files` (65,536 by default), bounds what bytes alone can't: empty uploads and the small receipt each pushed blob leaves beside it. The file cap used to be a constant, and hitting it returned the byte quota's message, so an operator with no quota and a half-empty disk was told their quota was exceeded (#2431). It now has its own `PickleError` variant, `StorageFileLimitExceeded { limit }`, whose message names the count and the setting. A variant with named fields, like this one, works like a small struct inside the enum, and `#[error("... {limit} ...")]` from `thiserror` can use the field in the message. And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings. A registry with no quota and no session expiry is a disk-exhaustion waiting to happen. (There used to be a per-repository quota too. Nothing could configure it, so 0.2.1 deleted it rather than keep a feature that existed only in this chapter.)
 
 One more thing moved off the hot path: whole-blob hashing. Verifying a digest re-hashes the entire blob, which for a 500 MB layer is real CPU work. Running it on a Tokio worker would stall every other request on that thread, so it now runs under `spawn_blocking`:
 
@@ -741,8 +916,8 @@ backpressure: a slow disk slows the sender. Completion hashes the file with a
 content-addressed store. The digest must match before the blob becomes visible.
 Manifests still need parsing in memory, so they have a separate 4 MiB limit.
 
-A semaphore allows four simultaneous write requests. A fifth waits up to a
-minute for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
+A semaphore allows four simultaneous write requests. A fifth waits up to six
+minutes for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
 its body stays unread on the socket, so the queue costs a connection, not
 memory. (It used to get the 429 at once. Then docker pushed its layers in
 parallel and gave up on the whole image. "Four clients, no `--insecure`"
@@ -887,9 +1062,10 @@ A `const` is evaluated at compile time and inlined wherever it's used, which is
 why `Duration::from_secs` has to be a `const fn` to appear here. The retry loop
 gives each attempt `min(now + attempt, deadline)` through
 `tokio::time::timeout_at`, and treats an expired attempt like any other
-transient failure. A single attempt keeps the old ceiling (30 seconds for
-metadata, 120 per layer); the totals (two and six minutes) leave room for the
-retries. Server errors (500, 408) and refused connections joined the transient
+transient failure. A single metadata attempt keeps the old ceiling (30
+seconds); the two-minute total leaves room for the retries. Layers had the
+same shape, 120 seconds an attempt and six minutes in all, until we noticed
+what that meant for a big layer on a slow link (below). Server errors (500, 408) and refused connections joined the transient
 list too. The unit tests drive it with `#[tokio::test(start_paused = true)]` and
 `std::future::pending()`, a future that never completes, so "the registry hung
 for 30 seconds" takes no real time at all.
@@ -935,6 +1111,198 @@ conversion. There's no way to build an `ImageMirrors` holding `https://…` or a
 path, so the pull code never has to check again. Loopback mirrors use plain
 HTTP, like the loopback registries the tests already use; everything else stays
 on HTTPS.
+
+### A layer is a stream, not a buffer
+
+The November 2026 audit (#2424) read both pull paths, Bun's direct pull and
+the pull-through cache, and found the push-side lesson above unlearned on the
+way in. Each read a layer into a `Vec<u8>`, then hashed it, then wrote it.
+On a 2 GB Wyse a 1.5 GB layer is more than the node has: a `Vec` doubles its
+capacity as it grows, and Bun's `OOMScoreAdjust=-900` means the kernel kills
+the node's workloads first. The deadline was wrong too. 120 seconds an
+attempt, restarting from byte 0, means a 400 MB layer over a 20 Mbit/s link
+(160 seconds) could never arrive. And the pull-through cache held one
+node-wide lock for each fill, so every other new image waited behind it.
+
+Both paths now call one function, `grill::oci_pull::pull_layer_to_store`. It
+opens an upload in the blob store (the same temporary file a `docker push`
+writes), reads the response with `oci_client`'s `pull_blob_stream`, feeds
+each chunk to a SHA-256 hasher and gathers it into a one-megabyte batch, and
+appends each batch to the upload file. When the stream ends it checks the
+size and the digest, and only then renames the file into
+`blobs/sha256/<digest>/data`. On any error the upload is removed. Memory
+holds one batch, whatever the layer's size.
+
+The function keeps its progress in a small struct and its attempts in a
+`loop`, rather than in a closure handed to `retry_registry_read` as before:
+
+```rust
+struct LayerTransfer<'a> {
+    client: &'a Client,
+    reference: &'a Reference,
+    layer: &'a OciDescriptor,
+    store: &'a BlobStore,
+    size: u64,
+    upload: String,
+    hasher: Sha256,
+    received: u64,
+    resumed: bool,
+}
+```
+
+The `'a` is a *lifetime parameter*. A struct that holds references has to
+say how long they live, and `'a` says "all of these borrow from something
+that outlives this struct". The compiler then refuses any use of a
+`LayerTransfer` after the client or the store it borrows has gone. It's the
+same promise a Go programmer makes silently when stashing a pointer in a
+struct; Rust makes you write it down. `impl LayerTransfer<'_>` in the
+methods below means "for whatever lifetime it has"; they don't need to name
+it.
+
+Owning the state is what makes resuming possible. The retry closure built a
+fresh future for each attempt so that a broken response couldn't leak a
+prefix into the next one. Now the bytes already written and hashed are
+exactly the prefix we want to keep. A retry calls `pull_blob_stream_partial`
+with `received` as the offset, which sends `Range: bytes=N-`. A registry that
+honours it answers `206 Partial Content` and the transfer carries on. One
+that ignores it answers `200` with the whole blob, and we start the upload
+again. If the digest of a resumed transfer is wrong, the registry may have
+served a range of different bytes, so that earns one clean retry from byte 0
+instead of a terminal error.
+
+The deadline changed shape. An attempt fails when nothing arrives for 60
+seconds (`LAYER_IDLE`), each `stream.next()` wrapped in its own
+`tokio::time::timeout`, not when the whole layer is slow. That alone would
+let a registry trickle a byte a minute forever, so all attempts together get
+six minutes, or the layer's size at 64 KiB/s if that's longer. The error says
+which: `layer sha256:… of N bytes did not arrive within T s (M bytes
+received)`. It used to be `registry read deadline exceeded on attempt 3 of
+4`, which blamed the registry for a layer that was simply big.
+
+Before any of that, a pull adds up the sizes of the layers it doesn't hold
+and compares the sum with the room left under `[images] max_storage`. The
+manifest is already verified, and the upload file would refuse the first
+byte past the ceiling anyway, but refusing early means a node never downloads
+most of a layer it can't keep. `BlobStore::remaining_capacity` reads the
+budget the registry and the runtime share. The test that pinned the old
+behaviour set the ceiling to one byte and expected the layer to be fetched
+anyway; its new sibling expects zero layer requests.
+
+The slow-layer test needed a registry that keeps sending. The hermetic
+fixture gained a `trickle` fault that sends the layer in five pieces 40
+seconds apart. The test pauses Tokio's clock, advances 40 seconds, resumes
+for a moment so the piece can cross the socket, and repeats. Five gaps make
+200 simulated seconds, past the old 120-second attempt, each inside the 60-
+second idle deadline. Under the old code the attempt was abandoned and the
+layer requested twice; now it arrives once. A `resumable` fault sends a true
+prefix, breaks the connection, and honours the range on the retry, and its
+test counts exactly one ranged request.
+
+The cache's lock went per image. `FillLocks` maps
+`"<cached repository>@<tag or digest>"` to an `Arc<Mutex<()>>`, and a fill
+holds an `OwnedMutexGuard`: a guard that owns an `Arc` of its mutex rather
+than borrowing it, so it can outlive the map lookup that produced it. The
+map drops an entry once its `Arc::strong_count` is one, meaning nobody holds
+or waits for it. A suite test stalls one image's upstream forever and checks
+that another image still fills within ten seconds; with one shared key it
+times out.
+
+`UpstreamRegistry::fetch_blob` still returns a `Vec<u8>`, for the few blobs
+that really are small: cosign signatures and test fixtures. It now refuses
+anything over 64 MiB before asking. Layers go through the new
+`store_blob`, whose default implementation (for the test doubles) still
+reads into memory, and which `OciUpstream` overrides with the streaming
+function.
+
+### Not every layer is gzip
+
+The same audit (#2465) noticed the unpacker wrapped every layer in a
+`GzDecoder` without looking. OCI allows three layer formats: a plain tar, a
+gzipped tar and, since image-spec 1.1, a zstd-compressed tar, which BuildKit
+writes with `compression=zstd`. An image like that applied fine, downloaded
+and verified, and then failed on every node with `invalid gzip header`.
+
+The obvious fix is to read the layer's media type from the manifest. Only
+one of our three paths has it, though: a cluster or pull-through image
+arrives at the runtime as `LocalImageBlobs`, a list of file paths. So the
+unpacker looks at the bytes instead, which every path has. `1f 8b` starts
+every gzip stream, `28 b5 2f fd` every zstd frame, and a tar has `ustar` at
+offset 257 (or, if it's empty, a first block of zeros). Anything else fails
+with `unsupported layer compression` and the first four bytes, which beats a
+gzip error for a file that was never gzip.
+
+```rust
+fn layer_reader(file: File, digest: &str) -> Result<Box<dyn std::io::Read>, ImageError> {
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let head = reader.fill_buf()?;
+    if head.starts_with(&[0x1f, 0x8b]) {
+        return Ok(Box::new(flate2::read::GzDecoder::new(reader)));
+    }
+    // … zstd, then plain tar, then the error
+}
+```
+
+The three readers are three different types, and a function can return only
+one. `Box<dyn Read>` is that one type: a pointer to *something* that
+implements `Read`, with calls dispatched through a table at run time, much
+like a Go interface value. `tar::Archive` doesn't care which it gets.
+`fill_buf` lets us peek without consuming: the bytes stay in the
+`BufReader`'s buffer, and the decoder reads them again from the start.
+
+The direct pull, which does have the manifest, also refuses an unknown layer
+media type before downloading it, naming the type. The pull-through cache
+doesn't: it caches cosign signature images too, whose "layers" are JSON, so
+there the bytes decide at unpack time.
+
+An apply used to accept such an image anyway, because binding only asked the
+registry for a digest and never saw the manifest. So `relish apply` said yes,
+and then every node's pull failed. The binder now checks too (#2528). Once it
+has bound an image, `check_layers` looks for the layers in the catalogue
+first: a Pickle image, or the pull-through cache's copy, is already there,
+and checking it costs nothing. For anything else it asks the registry for the
+platform manifest, one more request per distinct image an apply binds (an
+image named twice in one apply is checked once, like the digest). That's the
+price, and we judged it worth paying: an apply already waits on one round trip
+per image, and a refusal at apply names the image and the type while the
+person who wrote it is still looking. A registry that doesn't answer within
+the binding timeout doesn't fail the apply; the pull still refuses the image
+on the node, as before. For a multi-platform image in the catalogue, every
+catalogued platform is checked except the `unknown` entries BuildKit adds for
+its build attestations, whose layers are JSON and which nobody runs. The test
+`a_cluster_apply_refuses_an_image_whose_layers_no_node_can_unpack` applies an
+image with an `lz4` layer and finds an error naming the type and nothing in
+Raft.
+
+### A restart shouldn't need a leader
+
+Chapter 17 tells how a warm digest pin stopped asking the registry (#790):
+the pull keeps the index, manifest and config it verified under
+`metadata/sha256/`, and the next pull of that pin resolves from disk. The
+audit found the shortcut covered only images fetched straight from an
+external registry (#2421). Images that came through Pickle, pushed to the
+cluster or filled by the pull-through cache (the default path for external
+images), went through `unpack_local`, which kept nothing. So every container
+create asked the catalogue again, and a catalogue read needs a leader to
+confirm it. Lose quorum, and a crashed replica couldn't restart, though its
+rootfs and `.complete` marker sat right there on disk.
+
+The fix gives the runtime what the direct pull already had. `LocalImageBlobs`,
+what the cluster source hands over, gained the platform manifest and the
+index that named it, as paths into the blob store: Pickle keeps raw manifest
+bytes as blobs anyway, so there's nothing new to fetch. After a successful
+unpack of a digest pin, `unpack_local` stores those bytes and the config
+through the same `store_metadata`, which checks each against its digest
+first. `pinned_image_from_local` doesn't change at all, and keeps re-hashing
+every file it reads. A failure to store is a warning, not a failed pull: the
+metadata is a cache, and a miss only means the next start asks the source.
+
+The fields are `Option`s, so a test double, or a source that has no manifest
+to give, leaves them `None` and gets the old behaviour. Tags still never take
+the shortcut. The unit test serves an image once from a fake source that
+then answers "no leader", as the catalogue does without quorum: the second
+pull succeeds with the same rootfs and the source sees one call, for a
+cluster image and a pull-through one alike. Then it overwrites the stored
+metadata, and the next pull goes back to the source.
 
 ## Who owns these bytes?
 
@@ -1180,7 +1548,16 @@ match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned()).await 
 }
 ```
 
-`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a one-minute clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+
+That clock was a minute at first, and a minute was too short (#2466). Each upload request may take five minutes to arrive (`UPLOAD_TIMEOUT`) and carry 512 MiB (`MAX_REQUEST_BYTES`); the bound keeps one slow client from holding a slot for ever. But it also means four slow, perfectly live uploads can hold every slot for longer than a minute, and then the fifth layer got the 429 docker never retries. The wait is now derived from the upload timeout, so it can't fall behind it again:
+
+```rust
+const WRITE_ADMISSION_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(UPLOAD_TIMEOUT.as_secs() + 60);
+```
+
+A `const` is evaluated at compile time, so only `const fn`s can appear on its right-hand side. `Duration::from_secs` and `Duration::as_secs` are both `const fn`, which is why one constant can be computed from another here. Heal copies between nodes (`/replicas/`) can hold their request for five minutes as well, so they now queue for their own four slots and never take a client's. `a_queued_writer_outlasts_a_slow_but_live_upload` waits two virtual minutes with every slot held and checks the fifth writer is still queued, then admitted. `a_running_replica_copy_leaves_every_client_write_slot_free` stalls a heal copy and three uploads and checks that a fourth upload goes straight through. The manual now states all of these limits, and `the_manual_states_the_registry_push_limits` renders them from the constants and looks for them in the chapter, so the two can't drift apart (#2520).
 
 The rest were already right, and now there are tests to keep them that way. docker's anonymous `GET /v2/` gets the `Basic` challenge and an OCI error body. It now also gets `Docker-Distribution-API-Version: registry/2.0`, which the spec asks for and docker reads to tell a v2 registry from anything else. A blob `HEAD` returns the digest and the real length. And when skopeo copies an image between two repositories, it offers a cross-repository mount (`POST …/blobs/uploads/?mount=<digest>&from=<repo>`). Pickle doesn't mount. It answers `202` with an ordinary upload location, which the spec allows, and skopeo uploads the bytes instead. All three have portable tests next to the client ones, so you don't need docker installed to break them.
 
@@ -1189,6 +1566,20 @@ oras speaks the same API, but nothing runs it, so the manual calls it untested. 
 The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients need a TLS listener, which a cluster node with an identity has and a plaintext node doesn't. Node certificates name the node rather than an address, so a hostname-verifying client has to reach the registry by the node's name and trust the cluster root CA. And a loopback-only TLS listener answers docker's anonymous probe with 200, so docker never learns to send credentials there. Clustered listeners are routable, so that last one only bites hand-built setups.
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
+
+A token's scope wasn't the last thing the registry forgot. A `[permission]` block can narrow a Deployer token to, say, `deploy` on `shop/web` and nothing else. The API honoured that, and so did `/v1/build` for the image it pushes, but the registry port only asked about role and scope. With that token as the password, `docker push NODE:5050/shop/api:v1` went through, and the next apply of `shop/api:v1` ran whatever it pushed (#2398). The write gate now asks one more question after the scope check:
+
+```rust
+let deploy = crate::config::PermissionAction::Deploy;
+match repository_namespace(repository) {
+    Some((namespace, app)) if spec.allows(deploy, app, namespace) => Ok(()),
+    Some((namespace, app)) => Err(PermissionDenied::App { /* ... */ }),
+    None if spec.allows_cluster_wide(deploy) => Ok(()),
+    None => Err(PermissionDenied::ClusterWide { /* ... */ }),
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm matches only when the pattern fits and the condition holds, so the two `Some` arms split on whether the block allows the push without a nested `if`. A bare name like `web` places no namespace, so only a block that grants `deploy` on every app everywhere covers it, the same rule `/v1/build` applies. Reads stay outside blocks, because there's no pull action to grant. The block comes from the node's replica of the desired state, and `permission_refusal` copies out only the writer's own entry inside `read_desired`, rather than cloning the whole desired state for every blob a push uploads.
 
 ## A burger in the five-minute tour
 

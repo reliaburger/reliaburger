@@ -777,7 +777,7 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
             upstream: None,
             pull_through: false,
             cache_recheck_secs: 300,
-            fill_lock: tokio::sync::Mutex::new(()),
+            fill_locks: Default::default(),
         };
         assert!(
             source
@@ -1470,4 +1470,81 @@ async fn registry_cleanup_remains_pending_until_every_storage_node_confirms() {
             );
         }
     }
+}
+
+/// #2398: a `[permission]` block written through Raft narrows what its token
+/// may push, on the registry exactly as on the API. The narrowed token still
+/// publishes the app its block grants.
+#[tokio::test]
+async fn a_push_outside_a_replicated_permission_block_is_refused() {
+    use reliaburger::pickle::{
+        api::PickleState,
+        registry_auth::{DEFAULT_UPLOAD_TTL, QuotaConfig, UploadSessions},
+        store::{BlobStore, compute_sha256},
+        types::ManifestCatalog,
+    };
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    use tokio::sync::RwLock;
+    let hierarchy = ca::generate_ca_hierarchy("registry", &IKM).unwrap();
+    let leader = council(&hierarchy, true).await;
+    leader
+        .write(RaftRequest::PermissionSpec {
+            name: "ci-web".into(),
+            spec: Box::new(reliaburger::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["web".into()],
+                namespaces: Some(vec!["shop".into()]),
+            }),
+        })
+        .await
+        .unwrap();
+    let created = reliaburger::sesame::token::create_token(
+        "ci-web",
+        ApiRole::Deployer,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let tokens = reliaburger::sesame::auth::new_token_store();
+    tokens.write().await.push(created.token);
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlobStore::new(root.path().join("blobs")));
+    let config = compute_sha256(b"config");
+    store.write_blob(b"config", &config).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": config.as_str(), "size": 6}, "layers": []
+    }))
+    .unwrap();
+    let state = PickleState {
+        store,
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+        node_raft_id: 1,
+        council: Some(leader.clone()),
+        forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
+        persist_path: Some(root.path().join("catalog.json")),
+        auth: Some(reliaburger::sesame::auth::AuthState::new(tokens, None)),
+        require_read_auth: false,
+        allow_unauthenticated_bootstrap: false,
+        quota: QuotaConfig::default(),
+        sessions: UploadSessions::new(DEFAULT_UPLOAD_TTL),
+    };
+    let app = reliaburger::pickle::api::router(state);
+    let push = |repository: &str| {
+        Request::put(format!("/v2/{repository}/manifests/v1"))
+            .header("authorization", format!("Bearer {}", created.plaintext))
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    let refused = app.clone().oneshot(push("shop/api")).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let accepted = app.clone().oneshot(push("shop/web")).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let catalog = leader.manifest_catalog().await;
+    assert!(catalog.get_manifest_by_tag("shop/web", "v1").is_some());
+    assert!(catalog.get_manifest_by_tag("shop/api", "v1").is_none());
+    leader.shutdown().await.unwrap();
 }
