@@ -27,6 +27,12 @@ one instance, `--duration` and `--reason`, which is recorded with the fault.
 On runc a pause freezes every process in the container. Kill signals the
 instance's pid, as `relish apps NAME` shows it.
 
+`disk-io` throttles the disk under the node's volumes directory
+(`/var/lib/reliaburger/volumes` by default). When that directory is on a
+partition, Bun throttles the whole disk the partition belongs to, because the
+kernel's `io.max` takes only whole disks. Volumes on Btrfs, overlayfs or tmpfs
+have no block device to throttle, and Bun refuses the fault and says so.
+
 A paused instance still reports its pid in `relish apps NAME`, and you can stop
 or delete it without clearing the pause first. Bun follows the stop signal
 with SIGCONT, on the process runtime and on runc alike, so the instance gets

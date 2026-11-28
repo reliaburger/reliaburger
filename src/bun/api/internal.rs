@@ -689,7 +689,7 @@ pub(super) async fn placements_handler(
         // All discovery fields describe the same committed state; serving them
         // does not discharge any cleanup obligation.
         endpoint_generation: desired.endpoint_withdrawals.generation,
-        endpoint_catalog: desired.endpoint_catalog.clone(),
+        endpoint_catalog: (*desired.endpoint_catalog).clone(),
         endpoint_withdrawals: desired
             .endpoint_withdrawals
             .pending

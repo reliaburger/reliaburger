@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -70,7 +70,8 @@ pub const ACTIVE_STORAGE_BYTES_PER_TASK: u64 = 50;
 pub const RESULT_PAGE_SPAN: u32 = 4096;
 
 /// Largest leader sync call a node accepts. Every active run's template
-/// rides in it, so it must cover the active-run cap at the largest template
+/// rides in the first call that tells a node about the run (#2444), so it
+/// must cover the active-run cap at the largest template
 /// (`control_state_stays_within_budget_at_the_global_cap` checks that).
 pub const MAX_SYNC_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
@@ -87,7 +88,14 @@ pub struct HeldChunk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArrayAssignment {
     /// Owned container template; host assignments retain the allowlist gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<Box<crate::config::job::JobSpec>>,
+    /// The leader sent this node the run's definition (`template`,
+    /// `program`, `args` and `env`) in an earlier call, so this one leaves
+    /// it out and the node uses its own copy (#2444). A node without one
+    /// answers [`ArrayProgress::template_unknown`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template_known: bool,
     /// Per-task resource request; a queued chunk does not reserve this multiplied by its size.
     pub resources: crate::meat::Resources,
     /// The array's batch id.
@@ -95,12 +103,16 @@ pub struct ArrayAssignment {
     /// Count and policy.
     pub spec: TaskArraySpec,
     /// Host binary every task runs.
+    #[serde(default, skip_serializing_if = "path_is_empty")]
     pub program: PathBuf,
     /// Argument template, with `{index}` placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Plain environment variables from the template.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
     /// Chunks this node holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<HeldChunk>,
     /// The array has stopped: finish nothing new, report what's held.
     pub stopping: bool,
@@ -109,6 +121,11 @@ pub struct ArrayAssignment {
     /// Labels for this node's job metrics: never a task index or run id.
     #[serde(default)]
     pub labels: crate::mayo::job_metrics::JobLabels,
+}
+
+/// Whether `path` is empty, for leaving it out of the wire format.
+fn path_is_empty(path: &Path) -> bool {
+    path.as_os_str().is_empty()
 }
 
 /// Orders cluster recovery, leadership and committed assignment revisions.
@@ -258,6 +275,10 @@ pub struct ArrayProgress {
     /// leader fails a run every node refuses this way (#777).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unrunnable: bool,
+    /// The assignment left the run's definition out and this node has no
+    /// copy of it, so the leader must send it again (#2444).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template_unknown: bool,
     /// Chunks finished at the attempt the leader asked for, not yet
     /// retired. Sent on every sync until the leader stops listing them.
     pub finished: Vec<ChunkResult>,
@@ -454,6 +475,49 @@ struct ArrayRun {
     failure: Arc<Mutex<Option<String>>>,
 }
 
+/// How to run one array's tasks: the part of its assignment the leader
+/// sends a node only once (#2444).
+struct RunDefinition {
+    template: Option<Box<crate::config::job::JobSpec>>,
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// `assignment` with its run's definition: as sent, keeping a copy for
+/// later calls, or filled in from that copy when the leader left it out.
+/// `None` when it was left out and this node has no copy.
+fn with_definition<'a>(
+    definitions: &mut HashMap<u64, RunDefinition>,
+    assignment: &'a ArrayAssignment,
+) -> Option<std::borrow::Cow<'a, ArrayAssignment>> {
+    use std::borrow::Cow;
+    if !assignment.template_known {
+        definitions.insert(
+            assignment.batch_id,
+            RunDefinition {
+                template: assignment.template.clone(),
+                program: assignment.program.clone(),
+                args: assignment.args.clone(),
+                env: assignment.env.clone(),
+            },
+        );
+        return Some(Cow::Borrowed(assignment));
+    }
+    let definition = definitions.get(&assignment.batch_id)?;
+    Some(Cow::Owned(ArrayAssignment {
+        template: definition.template.clone(),
+        template_known: false,
+        program: definition.program.clone(),
+        args: definition.args.clone(),
+        env: definition.env.clone(),
+        held: assignment.held.clone(),
+        spec: assignment.spec.clone(),
+        labels: assignment.labels.clone(),
+        ..*assignment
+    }))
+}
+
 /// The one sync allowed on this node's disk at a time (#770).
 ///
 /// A sync holds it while it runs, and so does every blocking disk call the
@@ -532,6 +596,8 @@ pub struct TaskArrayNode {
     root_durable: Arc<std::sync::atomic::AtomicBool>,
     /// One permit, for [`SyncClaim`].
     sync_gate: Arc<Semaphore>,
+    /// Each running array's definition, as the leader sent it once (#2444).
+    definitions: Mutex<HashMap<u64, RunDefinition>>,
     /// Fires when Bun starts stopping: no array starts another attempt
     /// (#1965).
     draining: CancellationToken,
@@ -539,6 +605,31 @@ pub struct TaskArrayNode {
     /// the disk hang there.
     #[cfg(test)]
     fence_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The task data's size as last measured (#2446).
+    task_data: Arc<Mutex<TaskDataSize>>,
+    /// How often [`Self::task_data_bytes`] measures it again.
+    task_data_refresh: Duration,
+    /// How many times this node has walked its task data, for tests.
+    #[cfg(test)]
+    walks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes every walk adds, so a test can push a node over its limit.
+    #[cfg(test)]
+    extra_bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// How often a node measures its task data again for disk pressure. A
+/// node may take up to this long, plus a sync, to notice its task data
+/// passing its share of the disk (#2446).
+pub const TASK_DATA_REFRESH: Duration = Duration::from_secs(30);
+
+/// The size of a node's task data and audit log, as last measured.
+#[derive(Default)]
+struct TaskDataSize {
+    bytes: u64,
+    /// When, or `None` before the first measurement.
+    measured: Option<Instant>,
+    /// A measurement is running in the background.
+    refreshing: bool,
 }
 
 impl TaskArrayNode {
@@ -565,11 +656,18 @@ impl TaskArrayNode {
             grant_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_gate: Arc::new(Semaphore::new(1)),
+            definitions: Mutex::new(HashMap::new()),
             draining: CancellationToken::new(),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fence_probe: None,
+            task_data: Default::default(),
+            task_data_refresh: TASK_DATA_REFRESH,
+            #[cfg(test)]
+            walks: Default::default(),
+            #[cfg(test)]
+            extra_bytes: Default::default(),
         }
     }
 
@@ -649,9 +747,68 @@ impl TaskArrayNode {
         self.grant_syncs.load(Ordering::Relaxed)
     }
 
-    /// Whether task data and the audit log, or the filesystem holding them,
-    /// are too full to take new grants. Blocking I/O.
-    fn task_data_pressured(root: &Path, audit_dir: Option<&Path>) -> bool {
+    /// Re-measure task data every `refresh` rather than every
+    /// [`TASK_DATA_REFRESH`].
+    pub fn with_task_data_refresh(mut self, refresh: Duration) -> Self {
+        self.task_data_refresh = refresh;
+        self
+    }
+
+    /// How many bytes task data and the audit log hold, for this sync. The
+    /// first sync measures under its claim, so a full node never takes a
+    /// grant unmeasured. Later syncs use the last measurement, and once it
+    /// is older than the refresh interval start a new one in the
+    /// background, one at a time: walking every file can take seconds,
+    /// and the leader gives a sync three (#2446). `None` if the first
+    /// measurement failed.
+    async fn task_data_bytes(&self, claim: &SyncClaim) -> Option<u64> {
+        let mut size = self.task_data.lock().await;
+        let Some(measured) = size.measured else {
+            // BLOCKING-OK: this only builds the walk; it runs on the blocking pool
+            let bytes = claim.spawn_blocking(self.task_data_walk()).await.ok()?;
+            size.bytes = bytes;
+            size.measured = Some(Instant::now());
+            return Some(bytes);
+        };
+        if measured.elapsed() >= self.task_data_refresh && !size.refreshing {
+            size.refreshing = true;
+            // BLOCKING-OK: this only builds the walk; it runs on the blocking pool
+            let walk = self.task_data_walk();
+            let cache = Arc::clone(&self.task_data);
+            tokio::spawn(async move {
+                let bytes = tokio::task::spawn_blocking(walk).await;
+                let mut size = cache.lock().await;
+                size.refreshing = false;
+                if let Ok(bytes) = bytes {
+                    size.bytes = bytes;
+                    size.measured = Some(Instant::now());
+                }
+            });
+        }
+        Some(size.bytes)
+    }
+
+    /// A walk of every file under the task data and the audit log, to run
+    /// on the blocking pool.
+    fn task_data_walk(&self) -> impl FnOnce() -> u64 + Send + 'static {
+        let root = self.config.root.clone();
+        let audit_dir = self.config.audit_dir.clone();
+        #[cfg(test)]
+        let (walks, extra) = (Arc::clone(&self.walks), Arc::clone(&self.extra_bytes));
+        move || {
+            let bytes = super::disk_pressure::node_data_bytes(&root, audit_dir.as_deref());
+            #[cfg(test)]
+            let bytes = {
+                walks.fetch_add(1, Ordering::Relaxed);
+                bytes.saturating_add(extra.load(Ordering::Relaxed))
+            };
+            bytes
+        }
+    }
+
+    /// Whether `bytes` of task data and audit log, or the filesystem
+    /// holding them, are too full to take new grants. Blocking I/O.
+    fn task_data_pressured(root: &Path, bytes: u64) -> bool {
         let usage = match super::disk_pressure::FilesystemUsage::of(root) {
             Ok(usage) => usage,
             Err(error) => {
@@ -659,7 +816,6 @@ impl TaskArrayNode {
                 return true;
             }
         };
-        let bytes = super::disk_pressure::node_data_bytes(root, audit_dir);
         super::disk_pressure::task_data_pressured(
             bytes,
             usage,
@@ -803,15 +959,34 @@ impl TaskArrayNode {
         self.compact_finished(&claim, &request.known, &running)
             .await;
         self.telemetry.retain_runs(|id| running.contains(&id));
-        let root = self.config.root.clone();
-        let audit_dir = self.config.audit_dir.clone();
-        let pressured = claim
-            .spawn_blocking(move || Self::task_data_pressured(&root, audit_dir.as_deref()))
-            .await
-            .unwrap_or(true);
+        // The free-space half is one statvfs, so it's checked every sync;
+        // the walk over every file is measured off the sync path (#2446).
+        let pressured = match self.task_data_bytes(&claim).await {
+            Some(bytes) => {
+                let root = self.config.root.clone();
+                claim
+                    .spawn_blocking(move || Self::task_data_pressured(&root, bytes))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => true,
+        };
 
+        let mut definitions = self.definitions.lock().await;
+        definitions.retain(|id, _| running.contains(id));
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
+            let Some(assignment) = with_definition(&mut definitions, assignment) else {
+                response.arrays.push(ArrayProgress {
+                    template_unknown: true,
+                    ..refused(
+                        assignment.batch_id,
+                        "this node has no copy of the run's template yet".into(),
+                    )
+                });
+                continue;
+            };
+            let assignment = assignment.as_ref();
             if let Err(reason) = self.admit(assignment) {
                 response.arrays.push(ArrayProgress {
                     unrunnable: true,
@@ -1086,6 +1261,13 @@ impl TaskArrayNode {
             }
         }
         if changed {
+            // A chunk the leader no longer lists here is retired or taken
+            // back: its result is forgotten below, and only a stale leader
+            // could name its old attempt again, which the control fence
+            // has already refused. So the fence keeps the chunks in play,
+            // not every chunk ever granted, and a write costs what's held
+            // (#2429). Retired chunks leave with the next new grant.
+            run.highest.retain(|chunk, _| held.contains_key(chunk));
             run.pool.counters().unknown.store(false, Ordering::Relaxed);
             let path = self
                 .array_dir(assignment.batch_id)
@@ -1312,6 +1494,7 @@ impl TaskArrayNode {
             },
             refused: None,
             unrunnable: false,
+            template_unknown: false,
             finished,
             counters: NodeArrayCounters {
                 running: callers,
@@ -1603,6 +1786,7 @@ fn refused(batch_id: u64, reason: String) -> ArrayProgress {
         slots: 0,
         refused: Some(reason),
         unrunnable: false,
+        template_unknown: false,
         finished: Vec::new(),
         counters: NodeArrayCounters::default(),
     }
@@ -1834,6 +2018,7 @@ mod tests {
     fn assignment(batch_id: u64, count: u32, held: &[(u32, u64)]) -> ArrayAssignment {
         ArrayAssignment {
             template: None,
+            template_known: false,
             batch_id,
             resources: crate::meat::Resources::new(1000, 64 << 20, 0),
             spec: TaskArraySpec {
@@ -2051,6 +2236,80 @@ mod tests {
                 progress.finished.len()
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// #2444: the leader sends a run's definition once. A node keeps it
+    /// for later calls that leave it out, and says so when it has none.
+    #[tokio::test]
+    async fn a_node_keeps_a_runs_template_for_calls_that_leave_it_out() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let full = assignment(1, 20, &[(0, 1)]);
+        let mut bare = assignment(1, 20, &[(0, 1), (1, 1)]);
+        bare.template_known = true;
+        bare.program = PathBuf::new();
+        bare.args.clear();
+        // Never sent: the node asks for it, and isn't refusing for good.
+        let progress = node.sync(&request(vec![bare.clone()])).await.unwrap();
+        let progress = &progress.arrays[0];
+        assert!(progress.template_unknown);
+        assert!(!progress.unrunnable);
+        assert_eq!(progress.slots, 0);
+        // Sent once, then left out: the node runs both chunks.
+        let progress = node.sync(&request(vec![full])).await.unwrap();
+        assert!(!progress.arrays[0].template_unknown);
+        let progress = sync_until_finished(&node, &request(vec![bare.clone()]), 2).await;
+        assert!(!progress.template_unknown);
+        assert!(progress.slots > 0);
+        // A run the leader stops listing is forgotten.
+        node.sync(&request(Vec::new())).await.unwrap();
+        let progress = node.sync(&request(vec![bare])).await.unwrap();
+        assert!(progress.arrays[0].template_unknown);
+    }
+
+    /// #2446: the walk over every task-data file runs off the sync path,
+    /// at most once per refresh interval, not on every sync.
+    #[tokio::test]
+    async fn a_sync_does_not_walk_the_task_data_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("7");
+        std::fs::create_dir_all(&kept).unwrap();
+        for file in 0..1000 {
+            std::fs::write(kept.join(format!("{file}.seg")), b"x").unwrap();
+        }
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let request = NodeSyncRequest {
+            known: vec![7],
+            ..NodeSyncRequest::default()
+        };
+        for _ in 0..10 {
+            node.sync(&request).await.unwrap();
+        }
+        assert_eq!(node.walks.load(Ordering::Relaxed), 1);
+    }
+
+    /// #2446: a node that passes its task-data limit stops offering slots
+    /// within one refresh interval (and a sync).
+    #[tokio::test]
+    async fn a_node_over_its_task_data_limit_stops_offering_slots_within_one_refresh() {
+        let refresh = Duration::from_millis(50);
+        let root = tempfile::tempdir().unwrap();
+        let node =
+            fake_node(root.path(), FakeRunner::always_succeeds()).with_task_data_refresh(refresh);
+        let request = request(vec![assignment(1, 20, &[])]);
+        let slots = |response: NodeSyncResponse| response.arrays[0].slots;
+        assert!(slots(node.sync(&request).await.unwrap()) > 0);
+        node.extra_bytes.store(u64::MAX / 2, Ordering::Relaxed);
+        // Until the interval passes, the last measurement stands.
+        assert!(slots(node.sync(&request).await.unwrap()) > 0);
+        let start = Instant::now();
+        while slots(node.sync(&request).await.unwrap()) > 0 {
+            assert!(
+                start.elapsed() < refresh + Duration::from_secs(5),
+                "still offering slots"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -2534,6 +2793,50 @@ mod tests {
         let stale = request(vec![assignment(1, 400, &[(29, 1)])]);
         let progress = sync_until_finished(&restarted, &stale, 1).await;
         assert_eq!(progress.finished[0].attempt, 30);
+    }
+
+    /// Eight one-task chunks with `held` held.
+    fn one_task_chunks(held: &[(u32, u64)]) -> NodeSyncRequest {
+        let mut array = assignment(1, 8, held);
+        array.spec.chunk_size = 1;
+        request(vec![array])
+    }
+
+    fn fenced_chunks(node: &TaskArrayNode) -> Vec<(u32, u64)> {
+        let fence = node.array_dir(1).join(super::super::grant_fence::FILE_NAME);
+        let (highest, _) = super::super::grant_fence::read(&fence).unwrap().unwrap();
+        highest.into_iter().collect()
+    }
+
+    /// #2429: a chunk the leader has retired leaves the grant fence when
+    /// it's next written, so the fence holds the chunks in play, not every
+    /// chunk the node was ever granted.
+    #[tokio::test]
+    async fn a_retired_chunk_leaves_the_grant_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let first: Vec<(u32, u64)> = (0..4).map(|chunk| (chunk, 1)).collect();
+        sync_until_finished(&node, &one_task_chunks(&first), 4).await;
+        let next: Vec<(u32, u64)> = (4..8).map(|chunk| (chunk, 1)).collect();
+        node.sync(&one_task_chunks(&next)).await.unwrap();
+        assert_eq!(fenced_chunks(&node), next);
+    }
+
+    /// #2429: dropping retired chunks keeps the fence's promise for the
+    /// chunks still held: a restarted node never runs an older attempt.
+    #[tokio::test]
+    async fn a_restart_after_chunks_retire_still_refuses_an_older_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let first: Vec<(u32, u64)> = (0..4).map(|chunk| (chunk, 1)).collect();
+        sync_until_finished(&node, &one_task_chunks(&first), 4).await;
+        let next: Vec<(u32, u64)> = (4..8).map(|chunk| (chunk, 2)).collect();
+        node.sync(&one_task_chunks(&next)).await.unwrap();
+        drop(node);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&restarted, &one_task_chunks(&[(5, 1)]), 1).await;
+        assert_eq!(progress.finished[0].chunk, ChunkId(5));
+        assert_eq!(progress.finished[0].attempt, 2);
     }
 
     #[tokio::test]

@@ -5,7 +5,42 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Bound permanent identity tombstones without ever silently forgetting one.
+/// At the bound, every further decommission is refused with "retired
+/// identity limit reached"; nothing removes a tombstone, so `relish council
+/// status` and `relish wtf` report how full the list is (#2375).
 pub const MAX_RETIRED_NODES: usize = 65_536;
+
+/// How full the retired-identity list may get, in percent of
+/// [`MAX_RETIRED_NODES`], before `relish wtf` and `relish council status`
+/// warn.
+pub const RETIRED_IDENTITY_WARNING_PERCENT: usize = 90;
+
+/// How many permanent identity tombstones the cluster holds, against the
+/// limit (#2375).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredIdentities {
+    /// Retired identities recorded in the replicated CRL.
+    pub count: usize,
+    /// The most there can be: [`MAX_RETIRED_NODES`].
+    pub limit: usize,
+}
+
+impl RetiredIdentities {
+    /// The usage for `count` tombstones against [`MAX_RETIRED_NODES`].
+    pub fn of(count: usize) -> Self {
+        Self {
+            count,
+            limit: MAX_RETIRED_NODES,
+        }
+    }
+
+    /// Whether the list is at or past [`RETIRED_IDENTITY_WARNING_PERCENT`]
+    /// of its limit.
+    pub fn nearly_full(&self) -> bool {
+        self.count.saturating_mul(100)
+            >= self.limit.saturating_mul(RETIRED_IDENTITY_WARNING_PERCENT)
+    }
+}
 
 /// The operator's attestation that this node can no longer run its old workloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +108,16 @@ pub fn validate_node_id(node_id: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_retired_identity_list_is_nearly_full_from_ninety_percent() {
+        let threshold = (MAX_RETIRED_NODES * RETIRED_IDENTITY_WARNING_PERCENT).div_ceil(100);
+        assert_eq!(threshold, 58_983);
+        assert!(!RetiredIdentities::of(0).nearly_full());
+        assert!(!RetiredIdentities::of(threshold - 1).nearly_full());
+        assert!(RetiredIdentities::of(threshold).nearly_full());
+        assert!(RetiredIdentities::of(MAX_RETIRED_NODES).nearly_full());
+    }
 
     #[test]
     fn decommission_requires_an_identity_reason_and_explicit_attestation() {

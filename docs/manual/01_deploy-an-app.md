@@ -68,6 +68,24 @@ so `relish apply` refuses `memory = "8Mi"` instead of letting the start fail.
 The request can still be smaller (`memory = "4Mi-16Mi"`). Host apps (`exec` or
 `script`) have no floor.
 
+An image app's container can hold at most 4,096 processes and threads at once
+(its cgroup's `pids.max`), and so can each sidecar. One fork bomb or leaking
+thread pool then fills its own container, not the node's process table, and
+Bun can still start `runc` to stop it. Threads count, so an app that runs more
+(a big JVM, a database with thousands of connections) sets its own, up to
+32,768:
+
+```toml
+[app.search]
+image = "ghcr.io/example/search:8.1"
+memory = "2Gi-4Gi"
+pids = 16384
+```
+
+Before 0.3.4 a container had no limit, so an app that already runs more than
+4,096 threads needs `pids` before it moves to 0.3.4. `pids` doesn't apply to
+`exec` and `script` apps, which run on the node itself.
+
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
 `networking`, metrics scraping in `observability`. Every `[app.*]` field is

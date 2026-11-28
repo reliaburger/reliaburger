@@ -149,6 +149,17 @@ pub const FINDINGS: &[FindingKind] = &[
         }],
     },
     FindingKind {
+        id: "council-retired-identities-nearly-full",
+        severities: WARNING,
+        meaning: "the council's list of permanently retired node identities is nearly at its limit, after which `relish decommission-node` is refused",
+        thresholds: &[Threshold {
+            constant: "RETIRED_IDENTITY_WARNING_PERCENT",
+            value: crate::cluster::retirement::RETIRED_IDENTITY_WARNING_PERCENT as u64,
+            unit: Unit::Percent,
+            meaning: "of the 65,536 retired identities a cluster can hold",
+        }],
+    },
+    FindingKind {
         id: "council-multiple-leaders",
         severities: CRITICAL,
         meaning: "more than one node reports itself, or is reported, as the council leader",

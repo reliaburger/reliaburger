@@ -182,9 +182,9 @@ healthy_on() { at_least "$healthy $1" "${2:-1}"; }
 on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$target"; }
 newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $target" >/dev/null; }
 finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $target: complete"; }
-# relish answered no DHCP here, so the streamed lines are under the node's
-# address.
-streamed="$work/netlog/logs/$ip.log"
+# relish answered no DHCP here, so the node's hello names its lines: they're
+# under its MAC (#2390).
+streamed="$work/netlog/logs/$mac.log"
 streamed_seen() { grep -a -c -e "$1" "$streamed" 2>/dev/null || true; }
 said_hello() { [ "$(streamed_seen "reliaburger-netlog: streaming from")" -ge 1 ]; }
 boot_logs_are() { "$relish" os boot-logs 2>/dev/null | tee "$work/boot-logs.txt" | grep "^solo-1 *$1\$" >/dev/null; }

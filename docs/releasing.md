@@ -926,7 +926,7 @@ it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-Three things to check before you start the fresh cluster:
+Six things to check before you start the fresh cluster:
 
 - **Node names.** `[node] name` must be one DNS label: 1 to 63 lowercase
   letters, digits and `-`. Bun refuses to start otherwise, and
@@ -944,6 +944,21 @@ Three things to check before you start the fresh cluster:
   too, which a 0.3.3 Bun can't read, so a 0.3.3 node can't stage a 0.3.4
   binary with `relish upgrade` even apart from the format bump
   ([#2403](https://github.com/reliaburger/reliaburger/issues/2403)).
+- **Process limits.** An image app's container and each sidecar now get a
+  limit of 4,096 processes and threads unless they set `pids` (up to
+  32,768). Set `pids` on any app or sidecar that runs more before you apply
+  it to the new cluster
+  ([#2386](https://github.com/reliaburger/reliaburger/issues/2386)).
+- **Set-uid binaries.** Rootful runc containers run with no-new-privileges
+  under Docker's default seccomp filter, so an image that starts as a
+  non-root user and relies on `sudo` or another set-uid binary must start as
+  root instead
+  ([#2402](https://github.com/reliaburger/reliaburger/issues/2402)).
+- **Council backups.** A backup's ciphertext is now stored as base64, and
+  `relish council recover --from` skips a backup written before 0.3.4.
+  Don't plan to carry state over through an old backup; take new ones once
+  the 0.3.4 cluster runs
+  ([#2452](https://github.com/reliaburger/reliaburger/issues/2452)).
 
 ## Signing identity
 
@@ -1736,8 +1751,16 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
-   Linux x86_64 and Linux arm64. From a checkout of the same `main`:
+3. **Qualify the staged install on Apple silicon**, twice. Before
+   promotion this is the only host the staged install runs on; it covers
+   `relish-macos-aarch64` and, inside the quickstart's VMs,
+   `bun-linux-aarch64`. The x86-64 pair is run by the candidate's own
+   `build.yml`: before uploading them, `build-binaries` starts each Linux
+   target's release `bun` with its `relish` and runs one app
+   ([`smoke-release-bun.sh`](../scripts/release/smoke-release-bun.sh),
+   [#2486](https://github.com/reliaburger/reliaburger/issues/2486)), so a
+   green build run is that check. The Linux cold installs come after
+   promotion (below). From a checkout of the same `main`:
 
    ```sh
    scripts/release/qualify-staged-install.sh \
@@ -1764,11 +1787,13 @@ the real `curl … | sh` install against it on every host we advertise.
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 
-   Run it at least twice per host for V04: once with nothing cached (the
-   script always starts empty) and again for repeatability.
+   Run it at least twice for V04: once with nothing cached (the script
+   always starts empty) and again for repeatability.
 
-   The Linux rows of V04 measure the published release on a clean host, once
-   it's promoted. `scripts/release/qualify-cold-install.sh --prepare` installs
+   The Linux rows of V04 measure the published release on a clean host,
+   after promotion, for every minor release; the closure record says whether
+   they ran, or why not, and names the build run whose release-bun step
+   passed. `scripts/release/qualify-cold-install.sh --prepare` installs
    QEMU and opens `/dev/kvm`, pipes `https://reliaburger.com/install.sh` to
    `bash -s -- --laptop --timings` in the real home, checks the cluster,
    destroys it, uninstalls, and diffs the host against how it started. Run it
@@ -2195,9 +2220,22 @@ the real `curl … | sh` install against it on every host we advertise.
    whether a release got slower, or why. The [0.2.3 host-job
    profile](qualification/2026-10-20-host-job-profile/README.md) found a
    GitOps loop burning a core and grants running in lockstep that no test or
-   soak had noticed. This step runs that profile on every release and
-   compares it with the previous one. The staging pre-release is gone by now,
-   so point it at the published release:
+   soak had noticed. This step runs that profile and compares it with the
+   last profiled release.
+
+   It runs on every minor release (`X.Y.0`), and on a patch release that
+   changes the job path or follows a throughput regression. The step said
+   "every release" until November 2026, and with releases two to four days
+   apart six of the eight releases after 0.2.4 went without one, so #2209
+   (0.3.1's jobs 22 to 28% slower than 0.2.8's) had no profile to answer it
+   ([#2488](https://github.com/reliaburger/reliaburger/issues/2488)). The
+   closure record says which: the profile's record, or why there is none.
+   `the_newest_minor_release_has_a_profile_record` in
+   `tests/suite/website.rs` fails while the newest minor series in the
+   [release log](release-log.md) has no `-vX.Y.*-profile` record; it's
+   ignored until the 0.3 series has one, and that record removes the
+   `#[ignore]`. The
+   staging pre-release is gone by now, so point it at the published release:
 
    ```sh
    scripts/release/qualify-profile.sh \
@@ -2208,7 +2246,8 @@ the real `curl … | sh` install against it on every host we advertise.
    It creates a disposable Lima VM `rb-profile-<random>` with the profile
    record's shape (VZ, 4 vCPUs, 8 GiB, 60 GiB, `template:ubuntu-24.04`),
    and installs two versions in it: the candidate, and the previous release
-   (the patch number one lower; `--previous vX.Y.Z` names another). Every
+   (by default the patch number one lower; name the last profiled release
+   with `--previous vX.Y.Z`, which a `.0` release must). Every
    binary is checked against its `candidate.json`. Rates come from those
    release binaries, unchanged. Attribution comes from each version's
    profiling build: `build.yml` builds `bun` and `relish` for Linux arm64
@@ -2360,6 +2399,12 @@ the real `curl … | sh` install against it on every host we advertise.
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+
+    For a minor release, revisit the coverage floor: read the line coverage
+    of the release commit's last green `portable Linux` run (the `coverage`
+    artefact's `lcov.info`; [how](design/test-harness.md#benchmarks-and-coverage)), and when
+    it sits more than about a point above `COVERAGE_MIN_LINES`, raise the floor
+    to the figure minus one point. Never lower it.
     `scripts/ci/test_changelog.py` fails while a release in the log has no
     dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 

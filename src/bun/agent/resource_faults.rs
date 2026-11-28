@@ -25,11 +25,12 @@ pub(super) enum CgroupFault {
     Cpu { percentage: u8, cores: Option<u32> },
     /// Lower `memory.high` toward the hard limit, which forces reclaim.
     Memory { percentage: u8 },
-    /// Throttle `io.max` on one block device.
+    /// Throttle `io.max` on one block device. `device` is the reason the
+    /// node has none to throttle when it's an error, which `apply` reports.
     DiskIo {
         bytes_per_sec: u64,
         write_only: bool,
-        device: String,
+        device: Result<String, String>,
     },
 }
 
@@ -44,7 +45,10 @@ pub(super) struct Written {
 impl CgroupFault {
     /// The cgroup fault a fault type is, if it is one. `device` names the
     /// block device an I/O throttle keys on; only that fault calls it.
-    pub(super) fn of(fault: &FaultType, device: impl FnOnce() -> String) -> Option<Self> {
+    pub(super) fn of(
+        fault: &FaultType,
+        device: impl FnOnce() -> Result<String, String>,
+    ) -> Option<Self> {
         match fault {
             FaultType::CpuStress { percentage, cores } => Some(Self::Cpu {
                 percentage: *percentage,
@@ -88,6 +92,7 @@ impl CgroupFault {
                 write_only,
                 device,
             } => {
+                let device = device.as_ref().map_err(Clone::clone)?;
                 resource::apply_disk_io_throttle(cgroup, *bytes_per_sec, *write_only, device)
                     .map_err(|e| e.to_string())?;
                 Ok(cgroup.to_string_lossy().into_owned())
@@ -102,6 +107,8 @@ impl CgroupFault {
             Self::Cpu { .. } => ("cpu.max", resource::restore_cpu_max(cgroup, saved)),
             Self::Memory { .. } => ("memory.high", resource::restore_memory_high(cgroup, saved)),
             Self::DiskIo { device, .. } => {
+                // With no device, `apply` wrote nothing to undo.
+                let Ok(device) = device else { return };
                 ("io.max", resource::remove_disk_io_throttle(cgroup, device))
             }
         };
@@ -123,10 +130,15 @@ impl CgroupFault {
                 written.into_iter().map(|w| (w.instance, w.saved)).collect(),
             ),
             Self::DiskIo { device, .. } => FaultReversal::DiskIo {
-                instances: written
-                    .into_iter()
-                    .map(|w| (w.saved, device.clone()))
-                    .collect(),
+                // With no device nothing was written, so there's nothing
+                // to reverse.
+                instances: match device {
+                    Ok(device) => written
+                        .into_iter()
+                        .map(|w| (w.saved, device.clone()))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                },
             },
         }
     }
@@ -362,7 +374,7 @@ mod tests {
                 bytes_per_sec: 1024,
                 write_only: true,
             },
-            || "259:0".to_string(),
+            || Ok("259:0".to_string()),
         )
         .unwrap();
         let reversal = fault.reversal(vec![Written {
@@ -379,6 +391,33 @@ mod tests {
 
     #[test]
     fn signal_faults_are_not_cgroup_faults() {
-        assert_eq!(CgroupFault::of(&FaultType::Pause, String::new), None);
+        assert_eq!(
+            CgroupFault::of(&FaultType::Pause, || Ok(String::new())),
+            None
+        );
+    }
+
+    /// #2463: with no block device to throttle, the fault fails with the
+    /// reason and writes nothing, instead of guessing `8:0`.
+    #[test]
+    fn an_io_throttle_with_no_device_is_refused_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("io.max"), "").unwrap();
+        let fault = CgroupFault::of(
+            &FaultType::DiskIoThrottle {
+                bytes_per_sec: 1024,
+                write_only: false,
+            },
+            || Err("disk-io fault: /var/lib/reliaburger/volumes is not on a block device".into()),
+        )
+        .unwrap();
+
+        let error = fault.apply(dir.path()).unwrap_err();
+
+        assert!(error.contains("not on a block device"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("io.max")).unwrap(),
+            ""
+        );
     }
 }

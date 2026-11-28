@@ -1544,7 +1544,7 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
                     _ = ticker.tick() => {}
                 }
                 let _ = identity
-                    .adopt_council_trust(&council.security_state().await)
+                    .adopt_council_trust(&*council.security_state().await)
                     .await;
             }
         });

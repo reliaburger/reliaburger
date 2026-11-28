@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
@@ -26,7 +27,8 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::service_id::ServiceId;
@@ -93,6 +95,25 @@ const MAX_INFLIGHT_FORWARDS: usize = 64;
 
 /// Maximum clients allowed to hold a DNS-over-TCP task at once.
 const MAX_INFLIGHT_TCP: usize = 64;
+
+/// The most forward slots (UDP) or TCP tasks one source address may hold:
+/// a quarter of the node's. Without it one container resolving names that
+/// never answer holds every slot, and every other workload on the node
+/// gets SERVFAIL for external names (#2384).
+const MAX_SHARE_PER_SOURCE: usize = 16;
+
+/// How long an upstream that didn't answer is tried after the others.
+/// A dead first nameserver would otherwise add its whole timeout to every
+/// external lookup on the node (#2384).
+const UPSTREAM_FAILURE_MEMORY: Duration = Duration::from_secs(10);
+
+/// The longest a positive answer stays in the cache, whatever its TTL.
+/// Short, so a changed record reaches workloads quickly.
+const CACHE_MAX_TTL_SECS: u32 = 30;
+
+/// The most answers the cache holds. A full cache stores nothing new
+/// until entries expire.
+const CACHE_CAPACITY: usize = 1024;
 
 /// A client that never finishes its length-prefixed query must release its
 /// TCP slot promptly instead of pinning one forever.
@@ -336,14 +357,23 @@ impl BoundDnsResponder {
         dns_faults: watch::Receiver<DnsFaultState>,
         shutdown: CancellationToken,
     ) {
-        let udp = serve(
+        let forwarder = Arc::new(Forwarder::new(&self.config));
+        let udp = serve_udp(
             Arc::clone(&self.config),
             self.udp,
             service_map.clone(),
             dns_faults.clone(),
+            Arc::clone(&forwarder),
             shutdown.clone(),
         );
-        let tcp = serve_tcp(self.config, self.tcp, service_map, dns_faults, shutdown);
+        let tcp = serve_tcp(
+            self.config,
+            self.tcp,
+            service_map,
+            dns_faults,
+            forwarder,
+            shutdown,
+        );
         // Both loops normally finish only on shutdown. If either returns or
         // panics first, this combined future also ends, and Bun's outer task
         // monitor withdraws readiness by shutting the node down.
@@ -445,7 +475,21 @@ pub async fn serve(
     dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) {
+    let forwarder = Arc::new(Forwarder::new(&config));
+    serve_udp(config, socket, service_map, dns_faults, forwarder, shutdown).await;
+}
+
+/// The UDP loop, sharing its upstream health and cache with the TCP one.
+async fn serve_udp(
+    config: Arc<DnsConfig>,
+    socket: Arc<UdpSocket>,
+    service_map: watch::Receiver<ServiceMap>,
+    dns_faults: watch::Receiver<DnsFaultState>,
+    forwarder: Arc<Forwarder>,
+    shutdown: CancellationToken,
+) {
     let forwards = Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARDS));
+    let shares = Arc::new(SourceShares::default());
     let mut buf = [0u8; MAX_PACKET];
 
     loop {
@@ -494,17 +538,29 @@ pub async fn serve(
                     continue;
                 }
 
+                if let Some(response) = forwarder.cached(&query).await {
+                    let _ = socket.send_to(&response, src).await;
+                    continue;
+                }
+
                 // Public name: forward on a task of its own so one slow
-                // upstream exchange never delays other queries.
+                // upstream exchange never delays other queries. The source's
+                // share is taken first, so a source past it never touches
+                // the node-wide slots.
+                let Some(share) = shares.try_take(src.ip()) else {
+                    let _ = socket.send_to(&build_status_response(&query, RCODE_SERVFAIL), src).await;
+                    continue;
+                };
                 let Ok(permit) = Arc::clone(&forwards).try_acquire_owned() else {
                     let _ = socket.send_to(&build_status_response(&query, RCODE_SERVFAIL), src).await;
                     continue;
                 };
                 let socket = Arc::clone(&socket);
-                let config = Arc::clone(&config);
+                let forwarder = Arc::clone(&forwarder);
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    let response = forward_upstreams(&query, &config)
+                    let _held = (permit, share);
+                    let response = forwarder
+                        .forward_udp(&query)
                         .await
                         .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL));
                     let _ = socket.send_to(&response, src).await;
@@ -525,28 +581,43 @@ async fn serve_tcp(
     listener: TcpListener,
     service_map: watch::Receiver<ServiceMap>,
     dns_faults: watch::Receiver<DnsFaultState>,
+    forwarder: Arc<Forwarder>,
     shutdown: CancellationToken,
 ) {
     let clients = Arc::new(Semaphore::new(MAX_INFLIGHT_TCP));
+    let shares = Arc::new(SourceShares::default());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { continue };
+                let (stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    // Out of descriptors, the connection stays queued and
+                    // an immediate retry fails the same way (#2383).
+                    Err(error) => {
+                        crate::sesame::connection::pause_after_accept_error(&error, &shutdown)
+                            .await;
+                        continue;
+                    }
+                };
+                let Some(share) = shares.try_take(peer.ip()) else {
+                    continue;
+                };
                 let Ok(permit) = Arc::clone(&clients).try_acquire_owned() else {
                     continue;
                 };
                 let config = Arc::clone(&config);
                 let service_map = service_map.clone();
                 let dns_faults = dns_faults.clone();
+                let forwarder = Arc::clone(&forwarder);
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _held = (permit, share);
                     tokio::select! {
                         _ = shutdown.cancelled() => {}
                         _ = tokio::time::timeout(
                             TCP_QUERY_TIMEOUT,
-                            answer_tcp_query(stream, peer, config, service_map, dns_faults),
+                            answer_tcp_query(stream, peer, config, service_map, dns_faults, forwarder),
                         ) => {}
                     }
                 });
@@ -562,6 +633,7 @@ async fn answer_tcp_query(
     config: Arc<DnsConfig>,
     service_map: watch::Receiver<ServiceMap>,
     dns_faults: watch::Receiver<DnsFaultState>,
+    forwarder: Arc<Forwarder>,
 ) {
     let mut len_buf = [0u8; 2];
     if stream.read_exact(&mut len_buf).await.is_err() {
@@ -591,9 +663,13 @@ async fn answer_tcp_query(
                 qtype,
                 peer.ip(),
             ),
-            None => forward_upstreams_tcp(&query, &config)
-                .await
-                .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL)),
+            None => match forwarder.cached(&query).await {
+                Some(cached) => cached,
+                None => forwarder
+                    .forward_tcp(&query)
+                    .await
+                    .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL)),
+            },
         }
     };
     let mut framed = Vec::with_capacity(response.len() + 2);
@@ -702,26 +778,259 @@ fn service_id_for(stripped: &str, namespace: Option<&str>) -> Option<ServiceId> 
     }
 }
 
-/// Forward a query over UDP to each upstream in turn and return the first
-/// reply. `None` means none answered in time.
-async fn forward_upstreams(query: &[u8], config: &DnsConfig) -> Option<Vec<u8>> {
-    for upstream in &config.upstreams {
-        if let Some(reply) = forward_upstream(query, *upstream, config.upstream_timeout).await {
-            return Some(reply);
-        }
-    }
-    None
+/// How many forward slots or TCP tasks each source address holds.
+///
+/// A [`SourceShare`] gives its slot back when it's dropped, whichever way
+/// the task holding it ends.
+#[derive(Debug, Default)]
+struct SourceShares {
+    // A std mutex, not tokio's: `SourceShare::drop` is synchronous and
+    // can't await. The lock is held only to change one counter.
+    held: std::sync::Mutex<HashMap<IpAddr, usize>>,
 }
 
-/// Forward a query over TCP to each upstream in turn and return the first
-/// reply. `None` means none answered in time.
-async fn forward_upstreams_tcp(query: &[u8], config: &DnsConfig) -> Option<Vec<u8>> {
-    for upstream in &config.upstreams {
-        if let Some(reply) = forward_upstream_tcp(query, *upstream, config.upstream_timeout).await {
-            return Some(reply);
+impl SourceShares {
+    /// Take one of `source`'s slots, or `None` when it already holds its
+    /// share.
+    fn try_take(self: &Arc<Self>, source: IpAddr) -> Option<SourceShare> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = held.entry(source).or_default();
+        if *count >= MAX_SHARE_PER_SOURCE {
+            return None;
+        }
+        *count += 1;
+        Some(SourceShare {
+            shares: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+/// One slot of a source's share, given back on drop.
+#[derive(Debug)]
+struct SourceShare {
+    shares: Arc<SourceShares>,
+    source: IpAddr,
+}
+
+impl Drop for SourceShare {
+    fn drop(&mut self) {
+        let mut held = self
+            .shares
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&self.source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&self.source);
+            }
         }
     }
-    None
+}
+
+/// Forwards external questions upstream, remembering which upstreams
+/// recently failed and keeping recent positive answers.
+///
+/// One `Forwarder` serves both the UDP and the TCP loop, so a dead
+/// upstream learned over one transport is skipped on the other.
+#[derive(Debug)]
+struct Forwarder {
+    upstreams: Vec<SocketAddr>,
+    timeout: Duration,
+    /// The reference point for `failed_at`.
+    started: Instant,
+    /// Per upstream, when it last failed to answer, as milliseconds after
+    /// `started` plus one; 0 means it answered last time. Atomics, so
+    /// concurrent forwards read and update them without a lock.
+    failed_at: Vec<AtomicU64>,
+    cache: Mutex<AnswerCache>,
+}
+
+impl Forwarder {
+    fn new(config: &DnsConfig) -> Self {
+        Self {
+            upstreams: config.upstreams.clone(),
+            timeout: config.upstream_timeout,
+            started: Instant::now(),
+            failed_at: config.upstreams.iter().map(|_| AtomicU64::new(0)).collect(),
+            cache: Mutex::new(AnswerCache::default()),
+        }
+    }
+
+    /// The upstreams to try, in configured order, except that one which
+    /// failed in the last [`UPSTREAM_FAILURE_MEMORY`] goes after the rest.
+    /// A failed upstream is still tried: it may be the only one left.
+    fn upstream_order(&self) -> Vec<usize> {
+        let now = self.elapsed_ms();
+        let memory = UPSTREAM_FAILURE_MEMORY.as_millis() as u64;
+        let recently_failed = |index: &usize| {
+            let failed_at = self.failed_at[*index].load(Ordering::Relaxed);
+            failed_at != 0 && now.saturating_sub(failed_at - 1) < memory
+        };
+        let (failed, healthy): (Vec<usize>, Vec<usize>) =
+            (0..self.upstreams.len()).partition(recently_failed);
+        healthy.into_iter().chain(failed).collect()
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn record(&self, index: usize, answered: bool) {
+        let value = if answered { 0 } else { self.elapsed_ms() + 1 };
+        self.failed_at[index].store(value, Ordering::Relaxed);
+    }
+
+    /// A cached answer to `query`, carrying its transaction ID and question.
+    async fn cached(&self, query: &[u8]) -> Option<Vec<u8>> {
+        self.cache.lock().await.answer(query)
+    }
+
+    /// Forward over UDP and return the first reply. `None` means no
+    /// upstream answered in time.
+    async fn forward_udp(&self, query: &[u8]) -> Option<Vec<u8>> {
+        for index in self.upstream_order() {
+            let reply = forward_upstream(query, self.upstreams[index], self.timeout).await;
+            self.record(index, reply.is_some());
+            if let Some(reply) = reply {
+                self.cache.lock().await.store(query, &reply);
+                return Some(reply);
+            }
+        }
+        None
+    }
+
+    /// Forward over TCP and return the first reply. TCP answers aren't
+    /// cached: they may be too large for a UDP client.
+    async fn forward_tcp(&self, query: &[u8]) -> Option<Vec<u8>> {
+        for index in self.upstream_order() {
+            let reply = forward_upstream_tcp(query, self.upstreams[index], self.timeout).await;
+            self.record(index, reply.is_some());
+            if reply.is_some() {
+                return reply;
+            }
+        }
+        None
+    }
+}
+
+/// What a cached answer was asked: the lowercased name, the type, and
+/// whether the client sent EDNS (with its DNSSEC-OK bit). A client without
+/// EDNS must never get an answer sized for one with it.
+type CacheKey = (String, u16, Option<bool>);
+
+/// A small cache of positive external answers.
+///
+/// Only a complete NOERROR answer with at least one record and a non-zero
+/// TTL is kept, for its smallest TTL capped at [`CACHE_MAX_TTL_SECS`].
+/// Negative answers (NXDOMAIN, empty NOERROR) and failures always go
+/// upstream again.
+#[derive(Debug, Default)]
+struct AnswerCache {
+    entries: HashMap<CacheKey, CachedAnswer>,
+}
+
+#[derive(Debug)]
+struct CachedAnswer {
+    message: Message,
+    stored: Instant,
+    expires: Instant,
+}
+
+fn cache_key(query: &Message) -> Option<CacheKey> {
+    let question = query.queries.first()?;
+    Some((
+        question.name.to_ascii().to_ascii_lowercase(),
+        question.query_type.into(),
+        query.edns.as_ref().map(|edns| edns.flags().dnssec_ok),
+    ))
+}
+
+impl AnswerCache {
+    fn answer(&mut self, query: &[u8]) -> Option<Vec<u8>> {
+        let query = decode_query(query)?;
+        let key = cache_key(&query)?;
+        let now = Instant::now();
+        let entry = self.entries.get(&key)?;
+        if now >= entry.expires {
+            self.entries.remove(&key);
+            return None;
+        }
+        let aged = now.duration_since(entry.stored).as_secs() as u32;
+        let mut message = entry.message.clone();
+        message.metadata.id = query.metadata.id;
+        message.metadata.recursion_desired = query.metadata.recursion_desired;
+        // The client's own spelling: a resolver that randomises the case of
+        // its question checks the echo.
+        message.queries = query.queries;
+        for record in message
+            .answers
+            .iter_mut()
+            .chain(message.authorities.iter_mut())
+            .chain(message.additionals.iter_mut())
+        {
+            record.ttl = record.ttl.saturating_sub(aged);
+        }
+        message.to_vec().ok()
+    }
+
+    fn store(&mut self, query: &[u8], reply: &[u8]) {
+        if reply.len() > MAX_PACKET {
+            return;
+        }
+        let (Some(query), Ok(mut message)) = (decode_query(query), Message::from_vec(reply)) else {
+            return;
+        };
+        let Some(key) = cache_key(&query) else {
+            return;
+        };
+        if message.metadata.response_code != ResponseCode::NoError
+            || message.metadata.truncation
+            || message.answers.is_empty()
+            || message.signature.is_some()
+        {
+            return;
+        }
+        let ttl = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(0)
+            .min(CACHE_MAX_TTL_SECS);
+        if ttl == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if self.entries.len() >= CACHE_CAPACITY {
+            self.entries.retain(|_, entry| entry.expires > now);
+            if self.entries.len() >= CACHE_CAPACITY {
+                return;
+            }
+        }
+        for record in message
+            .answers
+            .iter_mut()
+            .chain(message.authorities.iter_mut())
+            .chain(message.additionals.iter_mut())
+        {
+            record.ttl = record.ttl.min(ttl);
+        }
+        self.entries.insert(
+            key,
+            CachedAnswer {
+                message,
+                stored: now,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+    }
 }
 
 /// Forward a query to one upstream resolver and return its reply.

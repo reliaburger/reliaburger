@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{ConfigFileSpec, EnvValue, MAX_REPLICAS, Replicas, ResourceRange, VolumeSpec};
+use super::types::{
+    ConfigFileSpec, EnvValue, MAX_REPLICAS, PidsLimit, Replicas, ResourceRange, VolumeSpec,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +78,12 @@ pub struct AppSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub cpu: Option<ResourceRange>,
+    /// Most processes and threads the container may hold at once, its
+    /// cgroup's `pids.max` (#2386). An image app gets
+    /// [`crate::grill::oci::DEFAULT_CONTAINER_PIDS`] when unset; a host
+    /// (`exec` or `script`) app can't set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<PidsLimit>,
     /// Number of GPUs required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<u32>,
@@ -420,6 +428,10 @@ pub struct SidecarSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub cpu: Option<ResourceRange>,
+    /// Most processes and threads the sidecar may hold, in its own cgroup.
+    /// [`crate::grill::oci::DEFAULT_CONTAINER_PIDS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<PidsLimit>,
 }
 
 /// Ingress configuration for external traffic routing.
@@ -558,6 +570,26 @@ mod tests {
         // Wrap in [app.test] table for top-level parsing,
         // or parse directly as an AppSpec
         toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn an_app_and_a_sidecar_take_a_pids_limit_from_one_to_the_maximum() {
+        use crate::config::types::PidsLimit;
+        let app =
+            parse_app("image = \"web:v1\"\npids = 512\n[[sidecar]]\nname = \"proxy\"\npids = 64");
+        assert_eq!(app.pids.map(PidsLimit::get), Some(512));
+        assert_eq!(app.sidecar[0].pids.map(PidsLimit::get), Some(64));
+        assert_eq!(parse_app("image = \"web:v1\"").pids, None);
+        for refused in ["0", "32769", "-1", "\"many\""] {
+            assert!(
+                toml::from_str::<AppSpec>(&format!("image = \"web:v1\"\npids = {refused}"))
+                    .is_err(),
+                "pids = {refused} was accepted"
+            );
+        }
+        // Absent stays absent on the wire.
+        let json = serde_json::to_string(&parse_app("image = \"web:v1\"")).unwrap();
+        assert!(!json.contains("pids"), "{json}");
     }
 
     #[test]

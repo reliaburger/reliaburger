@@ -134,7 +134,23 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   is written, its hash checked and its boot entry made. Fetching the
   installer records nothing, so a machine whose install failed gets the
   install script again. A disk report (`POST /disk`) needs the ticket too,
-  once per ticket. At most 256 tickets are outstanding, each for an hour.
+  once per ticket. At most 256 tickets are outstanding, each for an hour,
+  and a machine holds one: a new ticket cancels its older one.
+- A ticket goes only to the address the machine's latest DHCP request (to
+  UDP 67 or 4011, from an address of its own) came from, or asked the LAN's
+  DHCP server for (option 50 in a broadcast DHCPREQUEST, ciaddr still
+  0.0.0.0). iPXE takes its boot file from relish's proxy offer and its
+  address from the LAN's server, and that address needn't be the one the
+  firmware asked from on 4011: in CI's reinstall the firmware asked from
+  `.111` and iPXE fetched `boot.ipxe` from `.110`. A `boot.ipxe` from
+  anywhere else gets the install script without a ticket, and relish logs
+  that it withheld one. So a host that only speaks HTTP can't mark another
+  machine installed, ask a question about its disk, or fill the ticket table.
+  This isn't authentication: DHCP isn't authenticated either, so a host that
+  forges a DHCP request with another machine's MAC, or spoofs its address
+  (which needs ARP spoofing to win the TCP handshake), can still get that
+  machine's ticket. The install LAN is trusted for availability; image
+  integrity doesn't depend on it, since the installer checks signed sums.
 - `--for` doesn't cut an install off: when it's up, relish waits up to 20
   more minutes for installs that were sent the install script and haven't
   reported.
@@ -142,6 +158,14 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   gets the installer once per run.
 - A machine whose wipe was declined this run gets a script that boots its
   disk.
+- With `--stream-logs` (and in `relish machines logs`), boot log lines from
+  a machine relish answered go to `logs/<mac>.log`; lines from any other
+  address, which anyone can forge, share `logs/unserved.log`, each prefixed
+  with its address. `relish machines logs` answers nobody, so there the
+  machine's hello names it instead, for at most 64 machines: a hello can
+  name any MAC, and past that strangers share `unserved.log` again. At most 64 files are open at once (the one written
+  longest ago is closed, and reopened in append mode if needed), and each
+  stops at 64 MiB, after which its lines only print.
 
 ### 2.5 Refusing to start beside another boot server
 
@@ -332,7 +356,10 @@ and open no window. A machine outside the network the cluster admits
 ### 3.5 Seeds and the prepare state machine
 
 A seed is a gzipped tar of at most 1 MiB, with safe relative paths only
-(`src/appliance/seed.rs`). `seed.toml` (schema 1) names the `cluster`, the
+(`src/appliance/seed.rs`). Unpacked, it holds at most 64 entries and 4 MiB
+of files, each at most 1 MiB; the parser adds up the sizes the tar headers
+state and refuses a seed past either limit before reading the entry that
+crosses it, so a body that gzip shrank a thousand to one can't fill memory. `seed.toml` (schema 1) names the `cluster`, the
 `node`, the `role` (`create` or `join`), `advertise`, `peers` and
 `operators`. A create seed may also set `council_size` and `faults =
 "development"`. A join seed has `[join] members, ca_fingerprint, token`.
@@ -490,11 +517,25 @@ appliance or is already updating to another version. Then, off the request:
 2. Download exactly three files, the UKI, `usr.<uuid>.raw.zst` and
    `usr-verity.<uuid>.raw.zst`, into a private `.incoming` directory,
    checking each one's hash, then move them into staging.
+   The signed sums don't name the architecture (both builds name their files
+   the same), so the node also reads the UKI's PE header and refuses one whose
+   machine type (0x8664 x86_64, 0xAA64 aarch64) isn't its own. Binding the
+   architecture into what is signed, by passing the channel's per-architecture
+   `sums_sha256` in the directive, would change the wire format; it hasn't
+   been done.
 3. Run `systemd-sysupdate` with `/usr/lib/reliaburger/sysupdate.d`. It writes
    `/usr` and its verity into the inactive slot, and the UKI into
    `/EFI/Linux` with two tries left (`TriesLeft=2`). Its own verification is
    off, because bun has already checked every byte.
 4. Reboot.
+
+Every step is bounded, so staging ends in `Rebooting` or `Failed`, never in a
+`Staging` only a bun restart clears: 30 s to connect, 60 s with no bytes
+arriving on a download (there's no limit on a whole download), 1 MiB for
+`SHA256SUMS` and its signature, 20 minutes for `systemd-sysupdate` and 2 for
+the reboot command, whose child is killed when it runs over. The defaults are
+`StagingTimeouts`; tests shorten them. A `Failed` node pauses the rollout with
+its reason, and `resume` starts a fresh attempt.
 
 The node's progress is in `/var/lib/reliaburger/os-update.json` (Idle,
 Staging, Rebooting, Failed) and in `/v1/version` as `os_version` and

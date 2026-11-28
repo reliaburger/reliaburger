@@ -98,6 +98,38 @@ pub fn asset_url(
     Ok(format!("{base}/os-{version}-{arch}/{file}"))
 }
 
+/// How much of the UKI [`OsSlot`] reads to find its PE header. The DOS
+/// stub in front of it is a few hundred bytes in every UKI we build.
+const PE_HEAD_BYTES: u64 = 4096;
+
+/// The architecture a PE image (the UKI) is built for, by Rust's name for
+/// it (`std::env::consts::ARCH`), from the first bytes of the file.
+///
+/// The DOS header starts `MZ` and holds the PE header's offset at 0x3c; the
+/// PE header is `PE\0\0` followed by the machine type.
+pub fn pe_architecture(head: &[u8]) -> Result<&'static str, String> {
+    if !head.starts_with(b"MZ") {
+        return Err("it isn't a PE image (no MZ header)".to_string());
+    }
+    let truncated = || "its PE header is cut short".to_string();
+    let offset = head.get(0x3c..0x40).ok_or_else(truncated)?;
+    let offset = u32::from_le_bytes([offset[0], offset[1], offset[2], offset[3]]) as usize;
+    let header = offset
+        .checked_add(6)
+        .and_then(|end| head.get(offset..end))
+        .ok_or_else(truncated)?;
+    if &header[..4] != b"PE\0\0" {
+        return Err("it isn't a PE image (no PE signature)".to_string());
+    }
+    match u16::from_le_bytes([header[4], header[5]]) {
+        0x8664 => Ok("x86_64"),
+        0xAA64 => Ok("aarch64"),
+        other => Err(format!(
+            "its PE machine type 0x{other:04x} is neither x86_64 nor aarch64"
+        )),
+    }
+}
+
 /// What the saved state means once the node is up again on `running`: a
 /// reboot into the target that left us on another version was a fallback.
 ///
@@ -161,6 +193,35 @@ pub struct SlotPaths {
     /// Succeeds once this boot is blessed (`boot-complete.target` reached),
     /// as argv.
     pub boot_complete: Vec<String>,
+    /// How long staging waits on the network and on its commands.
+    pub timeouts: StagingTimeouts,
+}
+
+/// How long staging waits before it gives up and reports `Failed`, so a
+/// stalled download or a hung command ends the update instead of leaving
+/// the node in `Staging` until bun restarts.
+#[derive(Debug, Clone, Copy)]
+pub struct StagingTimeouts {
+    /// To connect to the release's host.
+    pub connect: std::time::Duration,
+    /// Between two reads of a download. There's no limit on a whole
+    /// download: a gigabyte over a slow link takes many minutes.
+    pub idle: std::time::Duration,
+    /// For `systemd-sysupdate` to write the slot.
+    pub sysupdate: std::time::Duration,
+    /// For the reboot command to return.
+    pub reboot: std::time::Duration,
+}
+
+impl Default for StagingTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(30),
+            idle: std::time::Duration::from_secs(60),
+            sysupdate: std::time::Duration::from_secs(20 * 60),
+            reboot: std::time::Duration::from_secs(2 * 60),
+        }
+    }
 }
 
 impl Default for SlotPaths {
@@ -183,6 +244,7 @@ impl Default for SlotPaths {
                 "-q".into(),
                 "boot-complete.target".into(),
             ],
+            timeouts: StagingTimeouts::default(),
         }
     }
 }
@@ -268,12 +330,13 @@ impl OsSlot {
         if !*trial {
             return false;
         }
-        let blessed = tokio::time::timeout(
+        let blessed = run(
+            &self.paths.boot_complete,
+            &[],
             std::time::Duration::from_secs(5),
-            run(&self.paths.boot_complete, &[]),
         )
         .await
-        .is_ok_and(|done| done.is_ok());
+        .is_ok();
         if !blessed {
             return true;
         }
@@ -351,7 +414,7 @@ impl OsSlot {
         }
         if rebooting {
             eprintln!("bun: os update: {target} staged; rebooting into it");
-            if let Err(error) = run(&self.paths.reboot, &[]).await {
+            if let Err(error) = run(&self.paths.reboot, &[], self.paths.timeouts.reboot).await {
                 let failed = OsUpdateState::Failed {
                     target,
                     reason: format!("rebooting: {error}"),
@@ -366,13 +429,18 @@ impl OsSlot {
     async fn stage(&self, directive: &OsDirective) -> Result<(), String> {
         let version = &directive.version;
         let url = |file: &str| asset_url(&directive.channel_url, version, &self.arch, file);
+        let timeouts = self.paths.timeouts;
+        // No total timeout: a gigabyte over a slow link takes many minutes.
+        // `read_timeout` is reqwest's idle timeout between reads.
         let client = crate::http_client::builder()
             .user_agent("bun")
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.idle)
             .build()
             .map_err(|e| e.to_string())?;
         let sums_name = format!("reliaburger-os_{version}.SHA256SUMS");
-        let sums = fetch(&client, &url(&sums_name)?).await?;
-        let signature = fetch(&client, &url(&format!("{sums_name}.sig"))?).await?;
+        let sums = fetch(&client, &url(&sums_name)?, timeouts.idle).await?;
+        let signature = fetch(&client, &url(&format!("{sums_name}.sig"))?, timeouts.idle).await?;
         let entries = signed_sums(&sums_name, &sums, &signature, &self.keys)
             .map_err(|e: OsError| e.to_string())?;
         let files = wanted(&entries, version)?;
@@ -383,15 +451,51 @@ impl OsSlot {
             .map_err(|e| e.to_string())??;
         for file in &files {
             eprintln!("bun: os update: fetching {file}");
-            let digest = download(&client, &url(file)?, &incoming.join(file)).await?;
+            let digest =
+                download(&client, &url(file)?, &incoming.join(file), timeouts.idle).await?;
             check_asset(&entries, &sums_name, file, &digest).map_err(|e| e.to_string())?;
         }
+        // The signed sums name no architecture, and both builds name their
+        // files the same, so the UKI's own header is what says whose it is.
+        let uki = files
+            .iter()
+            .find(|file| file.ends_with(".efi"))
+            .ok_or_else(|| "the release has no UKI".to_string())?;
+        self.check_architecture(&incoming.join(uki)).await?;
         let staging = self.paths.staging.clone();
         tokio::task::spawn_blocking(move || promote_incoming(&staging, &incoming, &files))
             .await
             .map_err(|e| e.to_string())??;
         eprintln!("bun: os update: {version} checked; running systemd-sysupdate");
-        run(&self.paths.sysupdate, &[version.as_str()]).await
+        run(
+            &self.paths.sysupdate,
+            &[version.as_str()],
+            timeouts.sysupdate,
+        )
+        .await
+    }
+}
+
+impl OsSlot {
+    /// Refuse a UKI built for another architecture than this node's.
+    async fn check_architecture(&self, uki: &Path) -> Result<(), String> {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        tokio::fs::File::open(uki)
+            .await
+            .map_err(|e| format!("{}: {e}", uki.display()))?
+            .take(PE_HEAD_BYTES)
+            .read_to_end(&mut head)
+            .await
+            .map_err(|e| format!("{}: {e}", uki.display()))?;
+        let built_for = pe_architecture(&head).map_err(|e| format!("the release's UKI: {e}"))?;
+        if built_for != self.arch {
+            return Err(format!(
+                "the release's UKI is for {built_for}, this node is {}",
+                self.arch
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -449,13 +553,22 @@ fn set_private(_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run(argv: &[String], extra: &[&str]) -> Result<(), String> {
+/// The most [`fetch`] reads: `SHA256SUMS` and its signature are a few KiB.
+const MAX_FETCH_BYTES: usize = 1024 * 1024;
+
+/// Run `argv` with `extra` arguments, giving up after `limit`. The child is
+/// killed when it's given up on, so a hung `systemd-sysupdate` doesn't
+/// outlive the update it belonged to.
+async fn run(argv: &[String], extra: &[&str], limit: std::time::Duration) -> Result<(), String> {
     let (program, args) = argv.split_first().ok_or_else(|| "no command".to_string())?;
     let output = tokio::process::Command::new(program)
         .args(args)
         .args(extra)
-        .output()
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(limit, output)
         .await
+        .map_err(|_| format!("{program} didn't finish within {} s", limit.as_secs_f32()))?
         .map_err(|e| format!("{program}: {e}"))?;
     if output.status.success() {
         Ok(())
@@ -467,7 +580,39 @@ async fn run(argv: &[String], extra: &[&str]) -> Result<(), String> {
     }
 }
 
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+/// The next chunk of a download, or an error once none has arrived for
+/// `idle`. The client's own read timeout should fire first; this holds the
+/// bound whatever the client does.
+async fn next_chunk<S, Chunk>(
+    stream: &mut S,
+    url: &str,
+    idle: std::time::Duration,
+) -> Result<Option<Chunk>, String>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Chunk>> + Unpin,
+{
+    match tokio::time::timeout(idle, stream.next()).await {
+        Err(_) => Err(format!(
+            "{url}: download stalled for {} s",
+            idle.as_secs_f32()
+        )),
+        Ok(None) => Ok(None),
+        Ok(Some(chunk)) => chunk.map(Some).map_err(|e| {
+            if e.is_timeout() {
+                format!("{url}: download stalled for {} s", idle.as_secs_f32())
+            } else {
+                format!("{url}: {e}")
+            }
+        }),
+    }
+}
+
+/// A small file, whole: at most [`MAX_FETCH_BYTES`].
+async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    idle: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .send()
@@ -476,15 +621,24 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("{url}: {}", response.status()));
     }
-    Ok(response
-        .bytes()
-        .await
-        .map_err(|e| format!("{url}: {e}"))?
-        .to_vec())
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = next_chunk(&mut stream, url, idle).await? {
+        if body.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(format!("{url}: larger than {MAX_FETCH_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Stream `url` into `path`, returning its SHA-256.
-async fn download(client: &reqwest::Client, url: &str, path: &Path) -> Result<String, String> {
+async fn download(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    idle: std::time::Duration,
+) -> Result<String, String> {
     let response = client
         .get(url)
         .send()
@@ -498,8 +652,7 @@ async fn download(client: &reqwest::Client, url: &str, path: &Path) -> Result<St
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("{url}: {e}"))?;
+    while let Some(chunk) = next_chunk(&mut stream, url, idle).await? {
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
@@ -564,6 +717,31 @@ mod tests {
             ]
         );
         assert!(wanted(&entries[..2], "2026.42.0").is_err());
+    }
+
+    #[test]
+    fn the_uki_s_pe_header_names_its_architecture() {
+        assert_eq!(pe_architecture(&pe_header(0x8664)), Ok("x86_64"));
+        assert_eq!(pe_architecture(&pe_header(0xAA64)), Ok("aarch64"));
+        assert!(
+            pe_architecture(&pe_header(0x014c))
+                .unwrap_err()
+                .contains("0x014c")
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_whole_pe_header_names_no_architecture() {
+        let whole = pe_header(0x8664);
+        assert!(pe_architecture(b"uki").is_err(), "no MZ");
+        assert!(pe_architecture(&whole[..0x3e]).is_err(), "no offset");
+        assert!(pe_architecture(&whole[..0x44]).is_err(), "no machine");
+        let mut far = whole.clone();
+        far[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(pe_architecture(&far).is_err(), "offset past the end");
+        let mut unsigned = whole;
+        unsigned[0x40] = b'X';
+        assert!(pe_architecture(&unsigned).is_err(), "no PE signature");
     }
 
     #[test]
@@ -734,13 +912,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn staging_checks_the_release_then_runs_sysupdate_and_reboots() {
-        let dir = tempfile::tempdir().unwrap();
-        let (signing, public) = keypair();
-        let version = "2026.42.0";
-        let files = [
-            (format!("reliaburger-os_{version}.efi"), b"uki".to_vec()),
+    /// The first bytes of a PE image (a UKI) built for `machine`: the DOS
+    /// header's `MZ`, the offset of the PE header at 0x3c, and the PE
+    /// signature followed by the machine field.
+    fn pe_header(machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x40];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        bytes.extend_from_slice(b"PE\0\0");
+        bytes.extend_from_slice(&machine.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 18]);
+        bytes
+    }
+
+    /// The three files of release `version`, with `uki` as its UKI.
+    fn release_files(version: &str, uki: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+        vec![
+            (format!("reliaburger-os_{version}.efi"), uki),
             (
                 format!("reliaburger-os_{version}.usr.0a1b.raw.zst"),
                 b"usr".to_vec(),
@@ -749,7 +937,19 @@ mod tests {
                 format!("reliaburger-os_{version}.usr-verity.2c3d.raw.zst"),
                 b"verity".to_vec(),
             ),
-        ];
+        ]
+    }
+
+    /// Serve `files` and their signed `SHA256SUMS` as the x86_64 release
+    /// `version`, on a loopback port. A file named in `stall` sends its
+    /// first chunk and then nothing, without closing. Returns the channel
+    /// URL a directive carries.
+    async fn serve_release(
+        version: &str,
+        files: &[(String, Vec<u8>)],
+        signing: impl Fn(&[u8]) -> Vec<u8>,
+        stall: Option<&str>,
+    ) -> String {
         let sums: String = files
             .iter()
             .map(|(name, bytes)| format!("{}  {name}\n", hex::encode(Sha256::digest(bytes))))
@@ -760,26 +960,41 @@ mod tests {
         served.insert(format!("{sums_name}.sig"), signing(sums.as_bytes()));
         served.insert(sums_name, sums.into_bytes());
         let served = Arc::new(served);
+        let stall = stall.map(str::to_string);
         let app = axum::Router::new().route(
-            "/releases/download/os-2026.42.0-x86_64/{file}",
-            axum::routing::get({
-                let served = Arc::clone(&served);
+            &format!("/releases/download/os-{version}-x86_64/{{file}}"),
+            axum::routing::get(
                 move |axum::extract::Path(file): axum::extract::Path<String>| {
                     let served = Arc::clone(&served);
+                    let stall = stall.clone();
                     async move {
-                        served
+                        let bytes = served
                             .get(&file)
                             .cloned()
-                            .ok_or(axum::http::StatusCode::NOT_FOUND)
+                            .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+                        if stall.as_deref() != Some(file.as_str()) {
+                            return Ok(axum::body::Body::from(bytes));
+                        }
+                        let first = futures_util::stream::once(async move {
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes))
+                        });
+                        Ok::<_, axum::http::StatusCode>(axum::body::Body::from_stream(
+                            first.chain(futures_util::stream::pending()),
+                        ))
                     }
-                }
-            }),
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{address}/releases/download/os-channel/os-channel.json")
+    }
 
-        let log = dir.path().join("commands.log");
+    /// Paths in `dir` whose sysupdate and reboot only append their name and
+    /// arguments to `commands.log`.
+    fn recording_paths(dir: &Path) -> SlotPaths {
+        let log = dir.join("commands.log");
         let record = |name: &str| {
             vec![
                 "sh".to_string(),
@@ -788,38 +1003,65 @@ mod tests {
                 "sh".to_string(),
             ]
         };
-        let paths = SlotPaths {
-            state_file: dir.path().join("os-update.json"),
-            staging: dir.path().join("staging"),
+        SlotPaths {
+            state_file: dir.join("os-update.json"),
+            staging: dir.join("staging"),
             sysupdate: record("sysupdate"),
             reboot: record("reboot"),
-            boot_count: dir.path().join("LoaderBootCountPath"),
+            boot_count: dir.join("LoaderBootCountPath"),
             boot_complete: vec!["true".into()],
-        };
-        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
-        let directive = OsDirective {
+            ..SlotPaths::default()
+        }
+    }
+
+    /// Wait up to five seconds for staging to end, in a reboot or a failure.
+    async fn settled(slot: &OsSlot, log: &Path) -> OsUpdateState {
+        for _ in 0..100 {
+            match slot.state().await {
+                OsUpdateState::Failed { .. } => break,
+                OsUpdateState::Rebooting { .. }
+                    if std::fs::read_to_string(log).is_ok_and(|l| l.contains("reboot")) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        slot.state().await
+    }
+
+    fn directive(version: &str, channel_url: String) -> OsDirective {
+        OsDirective {
             rollout_id: "r1".into(),
             version: version.into(),
-            channel_url: format!("http://{address}/releases/download/os-channel/os-channel.json"),
-        };
+            channel_url,
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_checks_the_release_then_runs_sysupdate_and_reboots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let slot = OsSlot::new(
+            recording_paths(dir.path()),
+            "x86_64",
+            vec![public],
+            Some("2026.41.0".into()),
+        );
+        let directive = directive(version, channel_url);
         assert_eq!(slot.begin(&directive).await.unwrap(), Begun::Started);
         assert_eq!(slot.begin(&directive).await.unwrap(), Begun::InProgress);
         let mut other = directive.clone();
         other.version = "2026.43.0".into();
         assert!(slot.begin(&other).await.is_err(), "one update at a time");
 
-        for _ in 0..100 {
-            if matches!(
-                slot.state().await,
-                OsUpdateState::Rebooting { .. } | OsUpdateState::Failed { .. }
-            ) && std::fs::read_to_string(&log).is_ok_and(|l| l.contains("reboot"))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
         assert_eq!(
-            slot.state().await,
+            settled(&slot, &log).await,
             OsUpdateState::Rebooting {
                 target: version.into()
             }
@@ -842,6 +1084,103 @@ mod tests {
         };
         let again = OsSlot::new(paths, "x86_64", Vec::new(), Some("2026.41.0".into()));
         assert!(matches!(again.state().await, OsUpdateState::Failed { .. }));
+    }
+
+    /// The signed sums name no architecture, and both builds name their
+    /// files the same, so an aarch64 release served at an x86_64 node's URL
+    /// passes the signature and sum checks. The UKI's PE header doesn't.
+    #[tokio::test]
+    async fn a_release_built_for_another_architecture_is_never_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0xAA64));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let slot = OsSlot::new(
+            recording_paths(dir.path()),
+            "x86_64",
+            vec![public],
+            Some("2026.41.0".into()),
+        );
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. }
+                if reason.contains("aarch64") && reason.contains("x86_64")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "neither sysupdate nor the reboot ran");
+    }
+
+    /// A connection that stops delivering bytes without closing (a
+    /// middlebox dropped the flow) used to leave the node in `Staging` for
+    /// good, answering every retry with "in progress".
+    #[tokio::test]
+    async fn a_stalled_download_fails_the_update_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let stalled = files[1].0.clone();
+        let channel_url = serve_release(version, &files, signing, Some(&stalled)).await;
+        let log = dir.path().join("commands.log");
+        let mut paths = recording_paths(dir.path());
+        paths.timeouts.idle = std::time::Duration::from_millis(200);
+        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. } if reason.contains("stalled")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "neither sysupdate nor the reboot ran");
+    }
+
+    #[tokio::test]
+    async fn a_sysupdate_that_never_exits_fails_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let mut paths = recording_paths(dir.path());
+        paths.sysupdate = vec!["sh".into(), "-c".into(), "sleep 3600".into(), "sh".into()];
+        paths.timeouts.sysupdate = std::time::Duration::from_millis(300);
+        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. } if reason.contains("didn't finish")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "the node didn't reboot");
+    }
+
+    /// `SHA256SUMS` and its signature are a few KiB; a host that answers
+    /// with an endless body is refused, not read into memory.
+    #[tokio::test]
+    async fn an_oversized_sums_file_is_refused() {
+        let app = axum::Router::new().route(
+            "/big",
+            axum::routing::get(|| async { vec![b'x'; 2 * 1024 * 1024] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let error = fetch(
+            &client,
+            &format!("http://{address}/big"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
     }
 
     #[tokio::test]
@@ -870,6 +1209,7 @@ mod tests {
             reboot: vec!["false".into()],
             boot_count: dir.path().join("LoaderBootCountPath"),
             boot_complete: vec!["true".into()],
+            timeouts: StagingTimeouts::default(),
         };
         let slot = OsSlot::new(paths, "x86_64", vec![other_public], Some("0".into()));
         let directive = OsDirective {

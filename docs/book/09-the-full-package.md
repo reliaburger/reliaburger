@@ -576,6 +576,20 @@ And then there's the bug that writing this introduced, which is the part worth r
 
 Changing what you persist changes what your equality checks mean. If some code compares a stored value against a configured one, and you alter the stored form, go and find that comparison.
 
+The listing above has a fall-through arm, `_ => (url.to_string(), None)`, and a later audit found what went through it (#2414). A GitHub personal access token is often written as `https://ghp_abc@github.com/org/repo`, the token alone in the username slot. That URL has no `:`, so nothing moved, and the token leaked both ways again. The comment on that arm said why it was left: git reads the token as a username, and moving it to the password slot would change which credential git presents. True, but there was a third choice. Take the whole userinfo out of the URL, and have the helper hand it back to git *as the username*, with an empty password. git then sends exactly the Basic credential the URL did, `ghp_abc:`, but from the environment. So `split_credentials` now returns a small struct instead of an `Option<String>`:
+
+```rust
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct GitCredentials {
+    username: Option<String>, // the token in `scheme://TOKEN@host`
+    password: Option<String>, // the password in `scheme://user:password@host`
+}
+```
+
+and the helper prints a `username=` line from a second variable when it's set. The shell test it uses is `[ -n "${RELIABURGER_GIT_USERNAME+x}" ]`: `${VAR+x}` expands to `x` when the variable is set, even to the empty string, and to nothing when it isn't. That matters for the password, which is set but empty here; a plain `[ -n "$VAR" ]` would skip it, and git would then try to prompt for one. `with_credentials` also removes whichever variable the URL doesn't carry, so a stray `RELIABURGER_GIT_PASSWORD` in Bun's own environment can't stand in for it.
+
+A clone made before the change still has the token in its `config`, and the reuse check compares sanitised URLs, so it would have been reused with the token in it forever. `clone_or_open` now rewrites a reused clone's stored remote to the credential-free URL when the two differ. The tests cover each piece: `a_token_only_url_keeps_the_token_out_of_the_url_git_is_given` and `the_credential_helper_supplies_a_token_only_username_from_the_environment` check the split and the helper's argv and environment; `a_clone_from_a_token_only_url_keeps_the_token_out_of_its_config` clones from `file://ghp_abc123@localhost/…` and reads the clone's config; `an_existing_clone_whose_config_holds_a_token_is_rewritten_on_open` plants an old-style remote and expects it scrubbed without a re-clone. The last one, `git_presents_the_url_credential_through_the_helper`, is the check the comment's worry deserved: a tiny HTTP server on a loopback port answers 401 to everything and records each `Authorization` header git sends, and the test decodes them. Both URL forms present the same credential they did before.
+
 ### Switching it on
 
 All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.

@@ -155,7 +155,7 @@ pub const JOB_FIELDS: [&str; 20] = [
 /// checks this is exactly where [`APP_FIELDS`] and [`JOB_FIELDS`] meet,
 /// less `runtime`, which means an app's kernel knobs but a job's execution
 /// state.
-pub const WORKLOAD_FIELDS: [&str; 12] = [
+pub const WORKLOAD_FIELDS: [&str; 13] = [
     "name",
     "image",
     "command",
@@ -163,6 +163,7 @@ pub const WORKLOAD_FIELDS: [&str; 12] = [
     "script",
     "memory",
     "cpu",
+    "pids",
     "env",
     "firewall",
     "egress",
@@ -176,7 +177,7 @@ const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 37] = [
+pub const APP_FIELDS: [&str; 38] = [
     "name",
     "image",
     "command",
@@ -192,6 +193,7 @@ pub const APP_FIELDS: [&str; 37] = [
     "health",
     "memory",
     "cpu",
+    "pids",
     "gpu",
     "env",
     "config_file",

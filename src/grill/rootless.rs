@@ -116,6 +116,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string()],
                 env: vec![],
@@ -149,6 +150,9 @@ mod tests {
                 },
             ],
             linux: OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![
                     OciNamespace {
                         ns_type: "pid".to_string(),

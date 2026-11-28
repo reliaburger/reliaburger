@@ -2,7 +2,9 @@
 //!
 //! Produces a complete HTML page for a single application, showing
 //! instance table, resource charts, streaming logs, deploy history,
-//! and environment variables (with encrypted values masked).
+//! and environment variable names. Plain values show as `[redacted]` and
+//! encrypted ones as `[encrypted]`; only a provider reference, which names
+//! where a secret lives rather than the secret, is shown as written.
 
 use super::dashboard::escape_html;
 use super::fragments::render_instance_table_fragment;

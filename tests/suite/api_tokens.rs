@@ -576,7 +576,7 @@ async fn leased_token_is_atomically_owned_expiry_bounded_and_reaped_without_a_cl
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let tokens = council.security_state().await.api_tokens;
+    let tokens = council.security_state().await.api_tokens.clone();
     assert_eq!(tokens.len(), 1);
     let expiry = tokens[0].expires_at.expect("leased token must expire");
     assert!(expiry <= SystemTime::UNIX_EPOCH + Duration::from_millis(lease.expires_at_unix_ms));
@@ -1093,8 +1093,9 @@ impl TokenCluster {
             .security_state()
             .await
             .api_tokens
-            .into_iter()
+            .iter()
             .find(|token| token.name == name)
+            .cloned()
             .unwrap();
         self.follower_tokens.write().await.push(stored);
         assert_eq!(
@@ -1487,7 +1488,7 @@ async fn a_join_token_created_through_a_follower_commits_on_the_leader() {
     let answer: serde_json::Value = response.json().await.unwrap();
     assert!(answer["token"].is_string(), "{answer}");
     assert_eq!(answer["ttl_seconds"], 900);
-    let stored = cluster.leader.security_state().await.join_tokens;
+    let stored = cluster.leader.security_state().await.join_tokens.clone();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].node_id, "node-7");
 }

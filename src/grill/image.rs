@@ -771,6 +771,21 @@ impl ImageStore {
         // cluster or cache lookup acts on it.
         image_ref.to_oci_reference()?;
 
+        // Unpacked trees keep their set-id bits, owned by the container id
+        // range, so no other local user may reach them (#2412). With an
+        // owner shift, container root's group still passes through: runc
+        // hands a read-only root straight from here.
+        let unpacked = self.store_root.join("rootfs");
+        let group = self.owner_shift;
+        tokio::task::spawn_blocking(move || super::bundle::close_to_other_users(&unpacked, group))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|closed| closed)
+            .map_err(|error| ImageError::UnpackFailed {
+                digest: "rootfs".to_string(),
+                reason: format!("failed to close the unpacked image store: {error}"),
+            })?;
+
         let rootfs = self.rootfs_path(&image_ref);
 
         // A digest names exact bytes. When this node already holds them,
@@ -3826,6 +3841,29 @@ mod tests {
         assert_eq!(pulled.config.cmd, ["-c", "true"]);
         assert_eq!(pulled.config.env, ["FIXTURE=1"]);
         assert_eq!(pulled.config.working_dir.as_deref(), Some("/etc"));
+    }
+
+    /// #2412: an unpacked image keeps its set-id bits, so the tree must be
+    /// closed to other local users. A tighter store is tightened again.
+    #[tokio::test]
+    async fn the_unpacked_image_store_is_closed_to_other_local_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(store_root.join("rootfs")).unwrap();
+        std::fs::set_permissions(
+            store_root.join("rootfs"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let store = ImageStore::new(store_root.clone());
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let mode = std::fs::metadata(store_root.join("rootfs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o007, 0, "{mode:o}");
     }
 
     #[tokio::test]

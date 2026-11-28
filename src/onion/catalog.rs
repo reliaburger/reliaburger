@@ -13,7 +13,7 @@
 /// small owned record. That makes the JSON snapshot deterministic and lets
 /// a pre-theme snapshot (which has no catalogue at all) load cleanly under
 /// `#[serde(default)]`.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
@@ -199,6 +199,73 @@ impl EndpointCatalog {
     }
 }
 
+/// What changed between two catalogues, service by service (#2438).
+///
+/// The leader publishes this, not the whole catalogue: a backend's health
+/// flipping writes that one service into the Raft log, so an entry's size
+/// follows the change, not the cluster. Each changed service travels whole,
+/// so applying the changes needs nothing but the committed catalogue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointChanges {
+    /// Services added or changed, keyed by qualified id, each in full.
+    pub changed: BTreeMap<String, CatalogService>,
+    /// Qualified ids of the services that left the catalogue.
+    pub removed: BTreeSet<String>,
+}
+
+impl EndpointChanges {
+    /// Whether applying these changes would leave a catalogue as it was.
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.removed.is_empty()
+    }
+}
+
+impl EndpointCatalog {
+    /// The changes that turn this catalogue into `next`.
+    pub fn changes_to(&self, next: &EndpointCatalog) -> EndpointChanges {
+        EndpointChanges {
+            changed: next
+                .services
+                .iter()
+                .filter(|(qualified, service)| self.services.get(*qualified) != Some(*service))
+                .map(|(qualified, service)| (qualified.clone(), service.clone()))
+                .collect(),
+            removed: self
+                .services
+                .keys()
+                .filter(|qualified| !next.services.contains_key(*qualified))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// This catalogue with `changes` applied. Refuses a change set that both
+    /// changes and removes one service, or removes one it doesn't hold: the
+    /// leader computed it against a different catalogue.
+    pub fn with_changes(&self, changes: &EndpointChanges) -> Result<EndpointCatalog, &'static str> {
+        if changes
+            .removed
+            .iter()
+            .any(|qualified| changes.changed.contains_key(qualified))
+        {
+            return Err("endpoint changes both change and remove one service");
+        }
+        let mut next = self.clone();
+        for qualified in &changes.removed {
+            if next.services.remove(qualified).is_none() {
+                return Err("endpoint changes remove a service the catalogue does not hold");
+            }
+        }
+        next.services.extend(
+            changes
+                .changed
+                .iter()
+                .map(|(qualified, service)| (qualified.clone(), service.clone())),
+        );
+        Ok(next)
+    }
+}
+
 /// Usable VIP slots in `127.128.0.0/16` (65,534: excludes .0.0 and .255.255).
 const VIP_SPACE: u32 = 65_534;
 
@@ -247,6 +314,59 @@ mod tests {
             .unwrap();
         pair.sort_by_key(ServiceId::qualified);
         (pair[0].clone(), pair[1].clone())
+    }
+
+    /// #2438: the changes between two catalogues name only what moved, and
+    /// applying them to the first gives the second.
+    #[test]
+    fn changes_carry_only_what_moved_and_rebuild_the_next_catalogue() {
+        let api = ServiceId::new("default", "api");
+        let web = ServiceId::new("default", "web");
+        let db = ServiceId::new("default", "db");
+        let previous = EndpointCatalog::rebuild([
+            (
+                api.clone(),
+                80,
+                vec![backend("a", [10, 0, 0, 1], 30001, true)],
+            ),
+            (
+                web.clone(),
+                80,
+                vec![backend("b", [10, 0, 0, 2], 30002, true)],
+            ),
+            (db.clone(), 5432, vec![]),
+        ])
+        .unwrap();
+        let next = previous
+            .reconcile([
+                (
+                    api.clone(),
+                    80,
+                    vec![backend("a", [10, 0, 0, 1], 30001, false)],
+                ),
+                (
+                    web.clone(),
+                    80,
+                    vec![backend("b", [10, 0, 0, 2], 30002, true)],
+                ),
+            ])
+            .unwrap();
+        let changes = previous.changes_to(&next);
+        assert_eq!(
+            changes.changed.keys().collect::<Vec<_>>(),
+            vec![&api.qualified()]
+        );
+        assert_eq!(
+            changes.removed.iter().collect::<Vec<_>>(),
+            vec![&db.qualified()]
+        );
+        assert_eq!(previous.with_changes(&changes).unwrap(), next);
+        assert!(next.changes_to(&next).is_empty());
+
+        let mut overlapping = changes.clone();
+        overlapping.removed.insert(api.qualified());
+        assert!(previous.with_changes(&overlapping).is_err());
+        assert!(next.with_changes(&changes).is_err());
     }
 
     #[test]

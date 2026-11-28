@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Arch, MacAddress, NetbootError};
 
-/// Install tickets outstanding at once. A lab boots a handful of machines;
-/// past this, a machine is sent to its disk until one finishes or expires.
+/// Install tickets outstanding at once, one per machine. A lab boots a
+/// handful of machines; past this, a machine is sent to its disk until one
+/// finishes or expires.
 pub const MAX_INSTALL_TICKETS: usize = 256;
 
 /// How long an install ticket lasts: long enough for a slow install and a
@@ -39,20 +40,28 @@ struct Issued {
 /// command line, and the installer sends it back with its reports: the
 /// disk it found (`POST /disk`) and, once the image is written and checked,
 /// that it installed (`POST /installed`). A report is believed only with a
-/// ticket issued to the machine it names, so nobody else on the LAN can
-/// mark a machine installed or ask questions about its disk, and a machine
-/// counts as installed when its install succeeded, not when it fetched the
-/// installer.
+/// ticket issued to the machine it names, and a machine counts as installed
+/// when its install succeeded, not when it fetched the installer.
+///
+/// The HTTP server issues a ticket only to the address the machine's own
+/// DHCP request came from, and a machine holds one ticket at a time: a new
+/// one cancels the old. So a host that only speaks HTTP can't get another
+/// machine's ticket, and nobody can fill the table by naming one MAC over
+/// and over. It isn't authentication. DHCP isn't authenticated either, so a
+/// host that forges a DHCP request naming a machine's MAC, or takes over
+/// its address, can still get one: the install LAN is trusted.
 #[derive(Debug, Default)]
 pub struct InstallTickets {
     tickets: std::collections::HashMap<String, Issued>,
 }
 
 impl InstallTickets {
-    /// A new ticket for `client`, or `None` while [`MAX_INSTALL_TICKETS`]
-    /// are outstanding.
+    /// A new ticket for `client`, cancelling any it held, or `None` while
+    /// [`MAX_INSTALL_TICKETS`] are outstanding.
     pub fn issue(&mut self, client: &BootClient, now: std::time::Instant) -> Option<String> {
         self.expire(now);
+        self.tickets
+            .retain(|_, issued| !issued.client.same_machine(client));
         if self.tickets.len() >= MAX_INSTALL_TICKETS {
             return None;
         }
@@ -734,11 +743,40 @@ mod tests {
         let ticket = tickets.issue(&machine, now).unwrap();
         let later = now + INSTALL_TICKET_LIFETIME + std::time::Duration::from_secs(1);
         assert!(!tickets.complete(&ticket, &machine, later), "expired");
-        for _ in 0..MAX_INSTALL_TICKETS {
-            assert!(tickets.issue(&machine, later).is_some());
+        let machines: Vec<BootClient> = (0..=MAX_INSTALL_TICKETS)
+            .map(|n| {
+                client(
+                    Some(&format!("52:54:00:00:{:02x}:{:02x}", n / 256, n % 256)),
+                    None,
+                )
+            })
+            .collect();
+        for machine in &machines[..MAX_INSTALL_TICKETS] {
+            assert!(tickets.issue(machine, later).is_some());
         }
-        assert!(tickets.issue(&machine, later).is_none(), "full");
+        assert!(
+            tickets
+                .issue(&machines[MAX_INSTALL_TICKETS], later)
+                .is_none(),
+            "full"
+        );
         assert_eq!(tickets.in_flight(later), MAX_INSTALL_TICKETS);
+    }
+
+    /// A machine that boots again gets a new ticket, and its older one is
+    /// cancelled: so one machine, or someone naming it over and over,
+    /// can't fill the table and keep every other machine from installing.
+    #[test]
+    fn one_machine_cannot_hold_more_than_one_ticket() {
+        let now = std::time::Instant::now();
+        let machine = client(Some(MAC), Some(UUID));
+        let mut tickets = InstallTickets::default();
+        let first = tickets.issue(&machine, now).unwrap();
+        for _ in 0..300 {
+            assert!(tickets.issue(&machine, now).is_some());
+        }
+        assert_eq!(tickets.tickets.len(), 1);
+        assert!(!tickets.complete(&first, &machine, now), "cancelled");
     }
 
     #[test]

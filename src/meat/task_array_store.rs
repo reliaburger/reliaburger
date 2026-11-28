@@ -2646,6 +2646,18 @@ mod tests {
             bytes <= crate::bun::task_array_node::MAX_SYNC_REQUEST_BYTES,
             "{bytes} bytes in one node's sync call at the cap"
         );
+        // Every later call leaves the templates out (#2444): what a node
+        // is sent each second doesn't grow with the template size.
+        use crate::bun::task_array_leader::{RequestPlan, TemplatesSent};
+        let mut sent = TemplatesSent::default();
+        let targets = [node("node-000")];
+        sent.mark(&targets[0], &request);
+        let steady = RequestPlan::read(&arrays, &targets, &sent).request_for(&targets[0], &sent);
+        let steady_bytes = serde_json::to_vec(&steady).unwrap().len();
+        assert!(
+            steady_bytes <= 64 * 1024,
+            "{steady_bytes} bytes in one node's steady-state sync call at the cap"
+        );
     }
 
     #[test]

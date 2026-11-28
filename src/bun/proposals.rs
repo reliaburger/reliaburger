@@ -444,7 +444,7 @@ async fn ingress_hosts_as_author(council: &CouncilNode, proposal: &Proposal) -> 
     if !routes {
         return None;
     }
-    let tokens = council.security_state().await.api_tokens;
+    let tokens = council.security_state().await.api_tokens.clone();
     let Some(author) =
         crate::sesame::auth::context_for_principal(&proposal.author.principal_id, &tokens)
     else {

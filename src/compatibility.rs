@@ -306,6 +306,21 @@ pub struct Compatibility {
 /// `NodeRollup` carries a `part` number, so a minute too large for one
 /// report frame goes out in parts and the council's rollup dedup key is
 /// `(node, window, part)` (#2426).
+/// `RaftRequest::PublishEndpoints` carries `EndpointChanges`, only the
+/// services that changed and the ones removed, instead of the whole endpoint
+/// catalogue, so an old node can't read a new log entry and a new node
+/// refuses an old log (#2438).
+/// A council backup's `SealedBackup.ciphertext` is one base64 string, not a
+/// JSON array of numbers; `BACKUP_ENVELOPE_VERSION` follows `CURRENT.state`,
+/// so a backup written before 0.3.4 doesn't restore (#2452).
+/// `ArrayAssignment` carries `template_known` and `ArrayProgress`
+/// `template_unknown`, so the leader sends a run's template to a node once;
+/// empty `template`, `program`, `args`, `env` and `held` are no longer
+/// serialised, and an older node would read a template-less assignment as a
+/// host job with an empty binary (#2444).
+/// `AppSpec` and `SidecarSpec` carry `pids`, a process and thread limit, and
+/// refuse unknown fields, so the app spec on the wire and in the replicated
+/// desired state changes (#2386).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

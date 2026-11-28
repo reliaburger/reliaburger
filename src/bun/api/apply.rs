@@ -42,7 +42,7 @@ pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
 /// which every node shares, or this node's own when it runs standalone.
 async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
     match (&state.council, &state.pickle_catalog) {
-        (Some(council), _) => council.manifest_catalog().await,
+        (Some(council), _) => (*council.manifest_catalog().await).clone(),
         (None, Some(catalog)) => catalog.read().await.clone(),
         (None, None) => ManifestCatalog::default(),
     }
