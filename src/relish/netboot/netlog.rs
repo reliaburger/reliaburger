@@ -60,6 +60,11 @@ const MAX_OPEN_LOG_FILES: usize = 64;
 /// boot's kernel log is a few hundred KiB.
 const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most machines `relish machines logs` names by their hello alone.
+/// A hello can name any MAC, so past this the senders share
+/// [`UNSERVED_LOG`] like any stranger: the files stay bounded (#2390).
+const MAX_MACHINES_NAMED_BY_HELLO: usize = 64;
+
 /// The largest datagram the listener reads. netconsole sends at most a
 /// few hundred bytes a packet; anything longer is cut there.
 const MAX_DATAGRAM: usize = 2048;
@@ -67,7 +72,8 @@ const MAX_DATAGRAM: usize = 2048;
 /// Who sent a boot log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sender {
-    /// A machine this process answered over DHCP, by its MAC.
+    /// A machine this process answered over DHCP, or, for `relish
+    /// machines logs`, one its hello named, by its MAC.
     Served(MacAddress),
     /// An address this process never answered.
     NotServed(Ipv4Addr),
@@ -102,9 +108,21 @@ pub struct Peers {
     /// LAN's server for. Only DHCP sets it, never a hello, which anyone can
     /// send.
     asked_from: HashMap<MacAddress, Ipv4Addr>,
+    /// `relish machines logs` answers nobody, so a hello naming a MAC it
+    /// hasn't seen names a machine, up to [`MAX_MACHINES_NAMED_BY_HELLO`].
+    hello_names_machines: bool,
 }
 
 impl Peers {
+    /// The peers of a listener that serves nothing (`relish machines
+    /// logs`): each machine is named by the MAC in its hello.
+    pub fn listening_only() -> Self {
+        Self {
+            hello_names_machines: true,
+            ..Self::default()
+        }
+    }
+
     /// Remember that this process answered `mac`, asking from `address`. A
     /// later request from the same address replaces it, since leases move.
     /// A request from no address yet (0.0.0.0) only remembers the MAC.
@@ -144,8 +162,17 @@ impl Peers {
     /// addresses from the LAN's DHCP server with a client ID of their own,
     /// so the address they send from needn't be the one iPXE asked from.
     /// A MAC this process never answered names nothing.
+    ///
+    /// A listener that serves nothing ([`Peers::listening_only`]) has
+    /// answered no MAC, so there a hello names its machine, for at most
+    /// [`MAX_MACHINES_NAMED_BY_HELLO`] machines. It never gives a machine
+    /// an install ticket: only DHCP sets [`Peers::asked_from`].
     pub fn hello(&mut self, address: Ipv4Addr, mac: MacAddress) {
-        if self.answered.contains(&mac) {
+        let named = self.answered.contains(&mac)
+            || (self.hello_names_machines
+                && self.answered.len() < MAX_MACHINES_NAMED_BY_HELLO
+                && self.answered.insert(mac));
+        if named {
             self.by_address.insert(address, mac);
         }
     }
@@ -524,15 +551,12 @@ pub async fn run_listener(
     );
     if let Some(directory) = &directory {
         println!(
-            "  appending each machine's lines to {}",
-            directory
-                .join(LOGS_DIRECTORY)
-                .join("<machine>.log")
-                .display()
+            "  appending each machine's lines to {}, named by the MAC in its hello; lines from senders without one go to {UNSERVED_LOG}",
+            directory.join(LOGS_DIRECTORY).join("<mac>.log").display()
         );
     }
     let log: Log = Arc::new(|line| println!("{line}"));
-    let peers = SharedPeers::default();
+    let peers: SharedPeers = Arc::new(Mutex::new(Peers::listening_only()));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("relish machines logs: stopped");
@@ -694,12 +718,99 @@ mod tests {
 
     #[test]
     fn a_hello_naming_a_mac_this_server_never_answered_names_nothing() {
-        // `relish machines logs` answers nobody, so every sender stays
-        // marked, whatever its hello says.
+        // `relish netboot` names only machines it answered: a hello naming
+        // another MAC stays marked, whatever it says.
         let mut peers = Peers::default();
         let stranger = Ipv4Addr::new(192, 168, 1, 99);
         peers.hello(stranger, MAC);
         assert_eq!(peers.sender(stranger), Sender::NotServed(stranger));
+    }
+
+    /// `relish machines logs` answers nobody, so a hello is all it has to
+    /// name a machine by (#2149): an installed node streams there after
+    /// `relish os boot-logs --to`, and the OS-update test reads its lines
+    /// from `logs/<mac>.log`.
+    #[test]
+    fn the_listener_alone_names_a_machine_by_its_hello() {
+        let mut peers = Peers::listening_only();
+        let node = Ipv4Addr::new(10, 42, 0, 31);
+        assert_eq!(peers.sender(node), Sender::NotServed(node));
+        peers.hello(node, MAC);
+        assert_eq!(peers.sender(node), Sender::Served(MAC));
+        assert_eq!(peers.sender(node).file_name(), "52:54:00:12:34:56.log");
+        // A hello names a machine, never an install ticket's address.
+        assert_eq!(peers.asked_from(MAC), None);
+    }
+
+    /// Anyone can send a hello naming any MAC, so the listener names at
+    /// most [`MAX_MACHINES_NAMED_BY_HELLO`] machines that way (#2390).
+    /// Later strangers share `unserved.log`; a named machine that moves
+    /// keeps its name.
+    #[test]
+    fn the_listener_names_a_bounded_number_of_machines_by_hello() {
+        let mut peers = Peers::listening_only();
+        for i in 0..MAX_MACHINES_NAMED_BY_HELLO {
+            let index = u8::try_from(i).unwrap();
+            peers.hello(
+                Ipv4Addr::new(10, 1, 0, index),
+                MacAddress([2, 0, 0, 0, 0, index]),
+            );
+        }
+        let late = Ipv4Addr::new(10, 42, 0, 31);
+        peers.hello(late, MAC);
+        assert_eq!(peers.sender(late), Sender::NotServed(late));
+
+        let moved = Ipv4Addr::new(10, 2, 0, 1);
+        peers.hello(moved, MacAddress([2, 0, 0, 0, 0, 0]));
+        assert_eq!(
+            peers.sender(moved),
+            Sender::Served(MacAddress([2, 0, 0, 0, 0, 0]))
+        );
+    }
+
+    /// The OS-update test's stream (run 46082879273): the node's hello,
+    /// then its lines, land in `logs/<mac>.log` of `relish machines logs`.
+    #[tokio::test]
+    async fn the_listener_alone_files_a_machines_lines_under_the_mac_in_its_hello() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = socket.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let log: Log = Arc::new(move |line| {
+            let _ = tx.send(line);
+        });
+        let task = tokio::spawn(listen(
+            socket,
+            Arc::new(Mutex::new(Peers::listening_only())),
+            Some(directory.path().to_path_buf()),
+            StreamLogs::All,
+            log,
+        ));
+        let node = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = "reliaburger: bun healthy on OS 2026.48.358";
+        node.send_to(format!("{HELLO}\n{healthy}\n").as_bytes(), listener)
+            .await
+            .unwrap();
+        let mut printed = Vec::new();
+        while printed.len() < 2 {
+            printed.push(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        task.abort();
+        assert_eq!(printed[1], format!("log 52:54:00:12:34:56: {healthy}"));
+        let written = tokio::fs::read_to_string(
+            directory
+                .path()
+                .join(LOGS_DIRECTORY)
+                .join("52:54:00:12:34:56.log"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, format!("{HELLO}\n{healthy}\n"));
     }
 
     #[tokio::test]

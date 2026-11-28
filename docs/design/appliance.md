@@ -163,7 +163,9 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
 - With `--stream-logs` (and in `relish machines logs`), boot log lines from
   a machine relish answered go to `logs/<mac>.log`; lines from any other
   address, which anyone can forge, share `logs/unserved.log`, each prefixed
-  with its address. At most 64 files are open at once (the one written
+  with its address. `relish machines logs` answers nobody, so there the
+  machine's hello names it instead, for at most 64 machines: a hello can
+  name any MAC, and past that strangers share `unserved.log` again. At most 64 files are open at once (the one written
   longest ago is closed, and reopened in append mode if needed), and each
   stops at 64 MiB, after which its lines only print.
 

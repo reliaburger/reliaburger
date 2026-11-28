@@ -456,8 +456,10 @@ relish machines logs --interface en7 --dir os
 ```
 
 It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
-answered no machine, so it names each line by its address, marked
-`(not served)`, and with `--dir` every line goes to `os/logs/unserved.log`.
+answered no machine, so it names a machine by the MAC in its first line, and
+with `--dir` that machine's lines go to `os/logs/<mac>.log`. It names at most
+64 machines that way, since anyone can send such a line. Lines from any other
+sender print marked `(not served)` and go to `os/logs/unserved.log`.
 
 #### Turn boot logs on or off later
 
