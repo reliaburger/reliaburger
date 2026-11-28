@@ -641,6 +641,12 @@ jobs:
             ${{ runner.temp }}/linux-snapshots
           if-no-files-found: warn
           retention-days: 14
+      - name: Hand the build back to the runner for the cache
+        # The provisioned tests ran as root: give rust-cache, which saves as
+        # the runner after this, back whatever they wrote, as linux-next
+        # does (#1723).
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" -- "$CARGO_HOME" target
   linux-next:
     # The privileged suite on the newest Ubuntu LTS too (#1559): Linux 7.0's
     # verifier and sudo-rs both broke things 24.04 never showed (#1557). The
@@ -771,6 +777,15 @@ jobs:
             ${{ runner.temp }}/linux-next-snapshots
           if-no-files-found: warn
           retention-days: 14
+      - name: Hand the build back to the runner for the cache
+        # The tests built as root, so the crates they unpacked under
+        # CARGO_HOME and the build under target/ are root's, and
+        # rust-cache's save, which runs as the runner after this, failed on
+        # every nightly ("Permission denied", run 45997532768). With no
+        # cache this job built every dependency cold, about four minutes of
+        # each merge group (#1723).
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" -- "$CARGO_HOME" target
 
   build-tests:
     outputs:
@@ -1198,11 +1213,21 @@ jobs:
     # the release build when they touch what `make bench` measures: the
     # gossip protocol, the scheduler's planning pass, policy evaluation, or
     # their benches (the `gossip` output, scripts/ci/select-jobs.sh, #2493).
+    #
+    # The release profile's single codegen unit made the workspace crate a
+    # 20-minute build on one core, and this was the merge queue's last job
+    # in 18 of 29 groups (25-27 Nov 2026, #1723). Pull requests and merge
+    # groups only need the benchmarks to run, so they build the crate with
+    # 16 codegen units; only the crate, so the dependencies keep the cache
+    # task-array benchmarks shares. The nightly and pushes keep the release
+    # profile, so the numbers kept from them compare with earlier ones.
     name: benchmarks
     needs: changes
     if: needs.changes.outputs.gossip == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      BENCH_CARGO: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'cargo --config profile.bench.package.reliaburger.codegen-units=16' || 'cargo' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -1213,8 +1238,8 @@ jobs:
           shared-key: bench
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - run: make bench
-      - run: make bench-large
+      - run: make bench CARGO="$BENCH_CARGO"
+      - run: make bench-large CARGO="$BENCH_CARGO"
       - uses: actions/upload-artifact@v4
         with:
           name: criterion

@@ -1,0 +1,25 @@
+{
+  "name": "render",
+  "namespace": "media",
+  "spec": {
+    "chunk_size": 64,
+    "count": 10000,
+    "max_attempts": 3,
+    "max_failed_indexes": 10,
+    "per_node_concurrency": 4,
+    "task_timeout_secs": 600
+  },
+  "template": {
+    "command": [
+      "/renderer",
+      "--frame",
+      "{index}"
+    ],
+    "cpu": "250m-500m",
+    "env": {
+      "QUALITY": "high"
+    },
+    "image": "renderer:v1",
+    "memory": "256Mi-512Mi"
+  }
+}

@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use crate::council::types::RecoveryClaim;
 use crate::meat::NodeId;
@@ -26,6 +27,18 @@ pub struct NodeEndpoints {
     /// The node's reporting-tree endpoint.
     pub reporting_address: SocketAddr,
 }
+
+/// How long a leader hint stays adopted without being heard fresh (#2406).
+///
+/// The leader stamps its own hint on every datagram with an age of zero, and
+/// every relay passes the best hint on with how long ago it was last heard
+/// fresh, so a node on the far side of a large cluster still hears the real
+/// leader's hint a few seconds old. A hint nobody re-advertises, such as a
+/// forged one with term `u64::MAX`, ages on every relay and is dropped once
+/// it's older than this, everywhere. A minute is ten times what a hint takes
+/// to cross a 10,000-node cluster, and a leaderless council past it really
+/// has no leader to route to.
+pub const LEADER_HINT_EXPIRY: Duration = Duration::from_secs(60);
 
 /// The gossip-learned control-plane directory: per-node endpoints plus the
 /// best (highest-term) leader hint observed so far.
@@ -53,6 +66,10 @@ pub struct NodeDirectory {
     pub jobs: HashMap<NodeId, JobCapabilities>,
     /// Best known leader: newest recovery epoch first, then highest term.
     pub leader: Option<LeaderHint>,
+    /// When [`leader`](Self::leader) was last heard fresh: the moment its
+    /// leader stamped it, as far as the relays' ages tell. `None` for a hint
+    /// set directly rather than observed, which never expires.
+    pub leader_heard: Option<Instant>,
     /// The newest recovery epoch this node knows of, from its own recovery
     /// fence (#1997). A recovery starts a fresh term line, so a hint from an
     /// older epoch names a council that recovery replaced, however high its
@@ -68,6 +85,11 @@ impl NodeDirectory {
     /// Fold one received extension in. Returns `true` if the directory
     /// changed (callers republish the watch only on change).
     pub fn observe(&mut self, extension: &DirectoryExtension) -> bool {
+        self.observe_at(extension, Instant::now())
+    }
+
+    /// [`observe`](Self::observe) at `now`.
+    pub fn observe_at(&mut self, extension: &DirectoryExtension, now: Instant) -> bool {
         let endpoints = NodeEndpoints {
             api_address: extension.api_address,
             reporting_address: extension.reporting_address,
@@ -115,32 +137,69 @@ impl NodeDirectory {
             .insert(extension.node_id.clone(), claim)
             != Some(claim);
         if let Some(hint) = &extension.leader {
-            changed |= self.observe_hint(hint);
+            let age = Duration::from_millis(u64::from(extension.leader_age_ms));
+            changed |= self.observe_hint_at(hint, age, now);
         }
         changed
     }
 
-    /// Adopt `hint` if it is newer than the current one (a newer recovery
-    /// epoch, or a higher term in the same epoch), or the same epoch and term
-    /// with different content (a leader re-advertising moved endpoints).
-    /// Returns `true` if adopted.
+    /// Adopt `hint`, heard fresh just now, if it is newer than the current
+    /// one (a newer recovery epoch, or a higher term in the same epoch), or
+    /// the same epoch and term with different content (a leader
+    /// re-advertising moved endpoints). Returns `true` if adopted.
     /// A hint from before [`recovery_floor`](Self::recovery_floor) is never
     /// adopted.
     pub fn observe_hint(&mut self, hint: &LeaderHint) -> bool {
-        if hint.recovery_epoch < self.recovery_floor {
-            return false;
+        self.observe_hint_at(hint, Duration::ZERO, Instant::now())
+    }
+
+    /// [`observe_hint`](Self::observe_hint) for a hint last heard fresh
+    /// `age` before `now`, as the relay that sent it says. The same hint
+    /// heard fresher keeps the current one alive; one older than
+    /// [`LEADER_HINT_EXPIRY`] is refused, and a current hint that old is
+    /// dropped first, so a newer-looking hint nobody re-advertises can't
+    /// outrank the real leader for ever (#2406). Returns `true` if the
+    /// directory changed.
+    pub fn observe_hint_at(&mut self, hint: &LeaderHint, age: Duration, now: Instant) -> bool {
+        let expired = self.expire_leader(now);
+        if hint.recovery_epoch < self.recovery_floor || age >= LEADER_HINT_EXPIRY {
+            return expired;
         }
-        let newer = match &self.leader {
-            Some(current) => {
-                let order = |h: &LeaderHint| (h.recovery_epoch, h.term);
-                order(hint) > order(current) || (order(hint) == order(current) && hint != current)
+        let heard = now.checked_sub(age).unwrap_or(now);
+        let order = |h: &LeaderHint| (h.recovery_epoch, h.term);
+        match &self.leader {
+            Some(current) if order(hint) < order(current) => expired,
+            Some(current) if hint == current => {
+                // The same hint, heard again: only its freshness moves.
+                self.leader_heard = Some(self.leader_heard.map_or(heard, |at| at.max(heard)));
+                expired
             }
-            None => true,
-        };
-        if newer {
-            self.leader = Some(hint.clone());
+            _ => {
+                self.leader = Some(hint.clone());
+                self.leader_heard = Some(heard);
+                true
+            }
         }
-        newer
+    }
+
+    /// Drop the leader hint if it hasn't been heard fresh for
+    /// [`LEADER_HINT_EXPIRY`]. Returns `true` if it was dropped.
+    pub fn expire_leader(&mut self, now: Instant) -> bool {
+        let stale = self
+            .leader_heard
+            .is_some_and(|heard| now.saturating_duration_since(heard) >= LEADER_HINT_EXPIRY);
+        if stale {
+            self.leader = None;
+            self.leader_heard = None;
+        }
+        stale
+    }
+
+    /// How long ago the leader hint was last heard fresh, for a relay to
+    /// stamp on the hint it passes on. Zero for a hint set directly.
+    pub fn leader_age(&self, now: Instant) -> Duration {
+        self.leader_heard
+            .map_or(Duration::ZERO, |heard| now.saturating_duration_since(heard))
     }
 
     /// Raise [`recovery_floor`](Self::recovery_floor) to `floor`, the newest
@@ -158,6 +217,7 @@ impl NodeDirectory {
             .is_some_and(|hint| hint.recovery_epoch < floor)
         {
             self.leader = None;
+            self.leader_heard = None;
         }
         true
     }
@@ -229,6 +289,7 @@ mod tests {
             api_address: addr(api),
             reporting_address: addr(api + 1),
             leader,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
@@ -244,6 +305,7 @@ mod tests {
             api_address: addr(api),
             reporting_address: addr(api + 1),
             leader: None,
+            leader_age_ms: 0,
             labels: labels
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -262,6 +324,7 @@ mod tests {
             api_address: addr(api),
             reporting_address: addr(api + 1),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: pressured,
             recovery_epoch: None,
@@ -293,6 +356,43 @@ mod tests {
         assert!(!dir.observe(&extension("n1", 9117, None)));
         // Moved endpoint: change.
         assert!(dir.observe(&extension("n1", 9200, None)));
+    }
+
+    /// #2406: a forged hint with term `u64::MAX` outranked every real one
+    /// for good. Unless its leader re-advertises it, it expires.
+    #[test]
+    fn an_unconfirmed_hint_expires_and_a_lower_one_takes_over() {
+        let mut dir = NodeDirectory::default();
+        let t0 = Instant::now();
+        assert!(dir.observe_hint_at(&hint("attacker", u64::MAX), Duration::ZERO, t0));
+        let real = hint("leader", 12);
+        let soon = t0 + Duration::from_secs(1);
+        assert!(!dir.observe_hint_at(&real, Duration::ZERO, soon));
+        let later = t0 + LEADER_HINT_EXPIRY;
+        assert!(dir.observe_hint_at(&real, Duration::ZERO, later));
+        assert_eq!(dir.leader, Some(real));
+    }
+
+    /// The real leader's hint, heard fresh again and again through relays,
+    /// never expires; a relayed copy older than the expiry is refused.
+    #[test]
+    fn a_hint_heard_fresh_again_stays_and_a_stale_copy_is_refused() {
+        let mut dir = NodeDirectory::default();
+        let t0 = Instant::now();
+        let real = hint("leader", 3);
+        dir.observe_hint_at(&real, Duration::from_secs(5), t0);
+        for minute in 1..5 {
+            let now = t0 + Duration::from_secs(50 * minute);
+            dir.observe_hint_at(&real, Duration::from_secs(5), now);
+            assert!(!dir.expire_leader(now));
+        }
+        let end = t0 + Duration::from_secs(400);
+        assert!(dir.expire_leader(end));
+        assert_eq!(dir.leader, None);
+        assert!(!dir.observe_hint_at(&real, LEADER_HINT_EXPIRY, end));
+        assert_eq!(dir.leader, None);
+        assert!(dir.observe_hint_at(&real, Duration::from_secs(2), end));
+        assert_eq!(dir.leader_age(end), Duration::from_secs(2));
     }
 
     #[test]

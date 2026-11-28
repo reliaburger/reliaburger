@@ -1126,6 +1126,25 @@ The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_u
 
 The first version timed the outage instead: 25 seconds from when the proxy started. That flaked twice over (#908). On a loaded host, pushing the binary and starting the run took up to 45 seconds, so the outage was over before the first directive and the test failed with "proved nothing". And with the outage hit, three swaps of 45 to 55 seconds each brought the walk within seconds of the harness's 180 s watch, so CI once timed out with the leader, which goes last, still on v0.1.0. Ending the outage on an event, not a clock, fixes the first. For the second, `watch_upgrade` now fails after 180 s *without progress*: any change to the run's phase, a node's phase or a node's retry count restarts the clock. A walk that stops moving still fails, but a slow one no longer does.
 
+## A binary nobody tracks
+
+The registry blob from the last two sections has another enemy besides a late registry: the registry's own garbage collector (#2419). `relish upgrade start` pushes the binary once, as a bare blob in the `reliaburger-bun` repository, with no manifest and no tag. Chapter 5's GC treats any blob no manifest tracks as an orphan, and deletes it once the file is an hour old. A blob is a perfectly good orphan for that hour: it covers a push whose manifest hasn't arrived yet. An upgrade lasts longer. Workers go one at a time, a node may spend five minutes on its step, and a paused run waits for the operator with no limit at all. Pause at 10:20, resume at 11:40, and somewhere in between node A's hourly sweep nominated the binary, the arbiter approved it ("not tracked, nothing to lose"), and every node still to go got a 404.
+
+The fix reads state the cluster already has. While `active_upgrade` is set, paused included, its binaries are in use, so the Raft arbiter strips their digests out of every GC report before it approves anything:
+
+```rust
+let kept = self
+    .state
+    .active_upgrade
+    .as_ref()
+    .map(crate::upgrade::types::ClusterUpgradeState::binary_digests)
+    .unwrap_or_default();
+```
+
+`Option::map` takes a function, and a method path like `ClusterUpgradeState::binary_digests` is one: it takes `&ClusterUpgradeState`, which is exactly what `as_ref()` leaves inside the `Option`, so no closure is needed. `unwrap_or_default()` turns "no upgrade" into an empty set. The arbiter decides for every node, so that alone is enough. Each node's GC loop also reads the same set from its replica into `GcConfig::pinned_digests` and doesn't nominate those blobs, which saves a round trip on a council member. Nothing has to release the pin: when the upgrade completes or is aborted, `active_upgrade` is cleared, the binary is an ordinary orphan again, and the next sweep after the grace period collects it.
+
+`gc_arbitration_refuses_the_binary_of_an_active_upgrade` puts a paused upgrade in the state machine, sends a GC report naming its binary and another orphan, and checks that only the other orphan is approved. It then clears the upgrade and checks that the binary is approved too, so the pin can't leak storage. `gc_keeps_the_binary_of_an_upgrade_that_is_still_running` does the same for nomination.
+
 ## Asking the wrong node
 
 The next soak killed the leader, waited for a new one, and ran the same

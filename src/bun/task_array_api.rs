@@ -192,6 +192,7 @@ pub async fn submit_handler(
         }),
         replay_unknown: true,
         hook: false,
+        declared_image: None,
     };
     let policy_warnings = match super::job_api::admit_definition(
         &state,
@@ -320,6 +321,7 @@ pub async fn manifest_handler(
             cron: None,
             replay_unknown: true,
             hook: false,
+            declared_image: None,
         };
         match super::job_api::admit_definition(
             &state,

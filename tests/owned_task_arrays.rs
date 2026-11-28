@@ -3425,7 +3425,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
     let capacity = Resources::new(220, 80 << 20, 0);
     let budget = ExecutionBudget::new(capacity);
     let template: reliaburger::config::job::JobSpec = toml::from_str(
-        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-slots'\ncpu='100m'\nmemory='32Mi'",
+        "runtime='process'\nexec='/bin/sh'\ncommand=['-c','sleep 2']\nnamespace='rbtest-slots'\ncpu='100m'\nmemory='32Mi'",
     )
     .unwrap();
     let mut config = TaskArrayNodeConfig::for_data_dir(
@@ -3781,7 +3781,8 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     .unwrap();
     let budget = ExecutionBudget::new(Resources::new(1000, 256 << 20, 0));
     let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
-        "image='{image}'\nnamespace='rbtest-usage'\nruntime='shared-runc'\ncpu='200m'\nmemory='32Mi'"
+        "image='{image}'\nnamespace='rbtest-usage'\nruntime='shared-runc'\ncpu='200m'\nmemory='32Mi'\n\
+         command=['/bin/sh','-c','end=$(($(date +%s)+8)); while [ $(date +%s) -lt $end ]; do :; done']"
     ))
     .unwrap();
     let node = TaskArrayNode::new(

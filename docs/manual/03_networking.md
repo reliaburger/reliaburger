@@ -82,6 +82,20 @@ An app with an instance on every node (enough replicas, spread out) rides out
 a council outage untouched. `relish wtf` reports the outage as `no-leader` or
 `quorum-loss` ([Diagnostics](07_diagnostics.md)).
 
+## Container addresses
+
+On a rootful runc node, each container gets an address from a `/23` of
+`10.0.0.0/8` that belongs to that node. Bun picks the `/23` the first time
+it starts containers, from a hash of the hostname, passing over any that
+overlaps a network the host is on, and keeps it in
+`<data_dir>/instances/runc/bundles/.network-leases.json`. Renaming the host later doesn't
+move it, so running containers stay under Bun's control. Container
+addresses never leave their node: traffic out of it is masqueraded to the
+node's own address.
+
+To move a node to another `/23`, stop its workloads first, then delete
+`.network-leases.json`; Bun picks again on its next start.
+
 ## Who may connect
 
 Apps in the same namespace can reach each other; other namespaces can't. That

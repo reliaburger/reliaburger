@@ -220,7 +220,7 @@ ignored by default and run by their own targets and CI jobs
 | Feature demos | [`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) (roll forward, roll back, a bad version rolled back and marked `RolloutFailed`) and [`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) (a `file://` repository synced, an app deleted from it, a hand-applied app left alone) run to completion on a one-node cluster each starts through [`lib.sh`](../scripts/demo/lib.sh); a step that doesn't do what it says fails the demo, and each must print the resource readout and summary [`resources.py`](../scripts/demo/resources.py) samples ([`test_demo_resources.py`](../scripts/ci/test_demo_resources.py) covers its parsing and arithmetic). [`test_demo_scripts.py`](../scripts/ci/test_demo_scripts.py) checks on every run that they stop on the first error and swallow nothing | [`tests/demos.rs`](../tests/demos.rs) | `make test-cluster`; by hand `make rollout-demo`, `make gitops-demo` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
-| S3 object storage | Logs export to an S3 bucket, and a council backup goes up, lists, prunes and restores, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
+| S3 object storage | Logs export to an S3 bucket, a council backup goes up, lists, prunes and restores, and an interrupted volume-snapshot upload restarts cleanly, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs), [`src/bun/snapshot_worker.rs`](../src/bun/snapshot_worker.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, policy evaluation per app for 10 to 1,000 policies, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
@@ -374,7 +374,17 @@ merge train without the `full-ci` label runs neither: there both wait for the me
 gate nothing: they're uploaded and no job compares them. Gossip's are a
 simulated network and vary with the runner; the scheduler and policy
 benchmarks are pure CPU work on in-memory data, the kind `bench_baseline.py`
-could compare, but whether to is a maintainer decision. The task-array job compares each benchmark's mean with the
+could compare, but whether to is a maintainer decision. Because nothing
+compares them, a pull request or a merge group builds `make bench` with 16
+codegen units for the workspace crate (`cargo --config
+profile.bench.package.reliaburger.codegen-units=16`, through the job's
+`BENCH_CARGO`). The release profile's single unit made that crate a 20-minute
+compile on one core, and the job was the merge queue's last in 18 of 29 groups
+from 25 to 27 November 2026
+([#1723](https://github.com/reliaburger/reliaburger/issues/1723)). The
+dependencies keep their settings, so the cache the task-array job shares still
+matches, and the nightly and pushes build the release profile, so the numbers
+kept from them compare with earlier ones. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
 differ by tens of per cent from run to run, and on 12 October 2026 one was
@@ -435,8 +445,10 @@ in the `Makefile` isn't run by any workflow.
 
 ### S3 in CI
 
-`make test-s3` exports logs to an S3 bucket and round-trips a council backup
-through it: put, list, prune and restore by key. Until 0.2.6 it needed AWS
+`make test-s3` exports logs to an S3 bucket, round-trips a council backup
+through it (put, list, prune and restore by key), and cuts a volume
+snapshot's multipart upload off by its deadline to check that the next sweep
+ships the archive whole. Until 0.2.6 it needed AWS
 credentials and a real bucket, which the qualification Mac didn't have, so
 0.2.5 shipped without it (#1534). Now
 [`scripts/test-s3.sh`](../scripts/test-s3.sh) finds a bucket one of three ways:
@@ -586,6 +598,14 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 `linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
+
+Both jobs run cargo as root (`scripts/ci/as-root`), so what that writes under
+`$CARGO_HOME` and `target/` is root's, while `Swatinem/rust-cache` saves as the
+runner after the last step. The 26.04 job's save failed with "Permission
+denied" on every nightly (run 45997532768), so it never found a cache and built
+every dependency cold, about four minutes of each run (#1723). Each job's last
+step, whatever happened, hands both directories back to the runner
+(`RootBuildCacheTests` in `test_ci_workflow.py`).
 
 Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
 `cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
@@ -1019,7 +1039,10 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
-| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `task_manifest` | `TaskManifestRequest` from JSON and `validate_submission` (`bun::task_array_api`) | `POST /v1/batch/manifest` |
+| `task_manifest_file` | `TaskManifestRequest` from TOML, the JSON relish sends, and the trial registration `--dry-run` runs | a manifest file for `relish batch submit` |
+| `task_array_submit` | `TaskArraySubmitRequest` and `validate_submission` (`bun::task_array_api`) | `relish run --batch`, as `POST /v1/batch/array` |
+| `batch_submit` | `BatchSubmitRequest` and `resolve_job_namespaces` (`bun::batch`) | `relish batch`, as `POST /v1/batch` |
 | `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
 | `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 | `api_bearer` | `sesame::auth::extract_bearer`, `authenticate` and `sesame::oidc::verify_jwt_with_keys` | any client that can reach the API, before it has authenticated |
@@ -1042,7 +1065,9 @@ request matches its route on a segment boundary and that the HTTPS redirect
 names the routed host; the TFTP target that an honest client gets the whole
 file in order whatever options it asked for; the DHCP target that no reply
 hands out an address; and the netboot targets that a client's text reaches the
-operator's terminal escaped.
+operator's terminal escaped. The manifest-file target checks that the API reads
+the same manifest relish parsed from TOML, and that a manifest registered once
+registers again as the same batch when its retry is decoded afresh.
 
 Seeds must be the same bytes every time `make fuzz-corpus-seed` runs, so a
 seed never uses a random key or nonce: the JWT and join CSR seeds are signed
@@ -1069,7 +1094,7 @@ decoder gets the next target
 | 3 | A backend's WebSocket handshake response (`wrapper::websocket::parse_handshake`) | any workload behind an ingress route | none yet |
 | 4 | Join CSRs (`sesame::ca::sign_node_csr`) | a node holding a join token | `join_csr` |
 | 4 | Pushed manifests (`pickle::api`) | a client with a registry token | `oci_manifest_push` |
-| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest` (the rest are serde derives) |
+| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest`, `task_array_submit`, `batch_submit` (the rest are serde derives) |
 | 4 | GitOps webhook body (`lettuce::webhook`) | a sender holding the webhook secret; the HMAC is checked first | none yet |
 | 5 | Raft RPC frames (`council::network`) | a council peer, over mTLS | `raft_rpc_frame` |
 | 5 | Reporting frames (`reporting::transport`) | a node, over mTLS | none yet |
@@ -1077,7 +1102,7 @@ decoder gets the next target
 | 6 | Layer tarballs and whiteouts (`grill::image::unpack_layers`) | the registry an app names, pinned by the manifest's digests | none yet: it writes a filesystem |
 | 6 | Release and OS channel metadata (`upgrade::metadata`, `os::channel`) | the release server, signed | none yet |
 | 7 | Backup files and the state inside (`council::backup`) | an operator | `council_backup`, `council_backup_state` |
-| 7 | App, node, chaos scenario TOML (`config`, `smoker`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario` |
+| 7 | App, node, chaos scenario and task-manifest TOML (`config`, `smoker`, `bun::task_array_api`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario`, `task_manifest_file` |
 | 7 | Join tokens, Kubernetes YAML for `relish import`, the source bundle | an operator, on their own machine | none: nothing remote sends them |
 
 The next targets, in order: the Prometheus text parser, the WebSocket

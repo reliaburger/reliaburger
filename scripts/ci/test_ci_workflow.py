@@ -861,6 +861,26 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("target/criterion", upload)
         self.assertIn("name: criterion-task-arrays", upload)
 
+    def test_pull_requests_and_merge_groups_build_the_benchmarks_with_sixteen_codegen_units(self):
+        # The release profile's one codegen unit made the workspace crate a
+        # 20-minute single-threaded build, and `benchmarks` was the merge
+        # queue's last job in 18 of 29 groups (25-27 Nov 2026, #1723). Its
+        # output is uploaded, never gated, so a group only needs it to run.
+        # Only the workspace crate changes: the dependencies keep the cache
+        # task-array benchmarks shares, and the nightly and pushes measure
+        # the release profile's code as before.
+        job = self.jobs["benchmarks"]
+        header = job.split("\n    steps:", 1)[0]
+        self.assertIn(
+            "BENCH_CARGO: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group')"
+            " && 'cargo --config profile.bench.package.reliaburger.codegen-units=16' || 'cargo' }}",
+            header)
+        for target in ("bench", "bench-large"):
+            with self.subTest(target=target):
+                self.assertRegex(job, rf'(?m)^      - run: make {target} CARGO="\$BENCH_CARGO"$')
+        self.assertNotIn("CARGO_PROFILE_", job)
+        self.assertNotIn("BENCH_CARGO", self.jobs["task-array-benchmarks"])
+
     def test_every_benchmark_target_is_run_by_a_workflow(self):
         makefile = (REPO / "Makefile").read_text()
         targets = re.findall(r"(?m)^(bench[a-z-]*):", makefile)
@@ -868,7 +888,55 @@ class BenchmarkTests(unittest.TestCase):
         workflows = "\n".join(path.read_text() for path in WORKFLOWS.glob("*.yml"))
         for target in targets:
             with self.subTest(target=target):
-                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}(?: [A-Z_]+=\S+)*$")
+
+
+def hands_the_build_back(job):
+    """Whether a job that runs cargo as root returns its build to the runner
+    after the last root step, whatever happened, so rust-cache can save it."""
+    blocks = steps(job)
+    root = [index for index, block in enumerate(blocks)
+            if "scripts/ci/as-root" in block.split("run:", 1)[-1] and "run:" in block]
+    if not root:
+        return True
+    back = [index for index, block in enumerate(blocks)
+            if 'sudo chown -R "$(id -u):$(id -g)" -- "$CARGO_HOME" target' in block
+            and "if: always()" in block]
+    return bool(back) and back[-1] > root[-1]
+
+
+class RootBuildCacheTests(unittest.TestCase):
+    """A job that runs cargo as root hands the build back before its cache
+    saves (#1723).
+
+    linux-next runs `make test-linux` as root, so the crates it unpacks under
+    $CARGO_HOME and what it writes under target/ were root's, and rust-cache's
+    post step, which runs as the runner, failed to save on main ("Permission
+    denied", run 45997532768). The job never found a cache and built every
+    dependency cold, about four of its 31 minutes, in every merge group."""
+
+    def setUp(self):
+        self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def test_every_job_that_builds_as_root_hands_the_build_back_to_its_cache(self):
+        root_jobs = [name for name, job in self.jobs.items()
+                     if "scripts/ci/as-root" in job and "Swatinem/rust-cache@" in job]
+        self.assertEqual(sorted(root_jobs), ["linux", "linux-next"])
+        for name in root_jobs:
+            with self.subTest(job=name):
+                self.assertTrue(hands_the_build_back(self.jobs[name]))
+
+    def test_a_missing_early_or_conditional_hand_back_is_detected(self):
+        job = self.jobs["linux-next"]
+        blocks = steps(job)
+        back = next(block for block in blocks if '-- "$CARGO_HOME" target' in block)
+        missing = job.replace(back, "")
+        self.assertFalse(hands_the_build_back(missing))
+        conditional = job.replace(back, back.replace("if: always()", "if: success()"))
+        self.assertFalse(hands_the_build_back(conditional))
+        tests = next(block for block in blocks if "make test-linux" in block)
+        early = job.replace(back, "").replace(tests, back + "\n" + tests)
+        self.assertFalse(hands_the_build_back(early))
 
 
 class S3Tests(unittest.TestCase):

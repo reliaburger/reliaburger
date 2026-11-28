@@ -133,6 +133,16 @@ impl ClusterUpgradeState {
         select_binary(&self.binaries, platform)
     }
 
+    /// The registry digest (`sha256:<hex>`) of every binary this upgrade
+    /// distributes. Each is a bare blob in Pickle that no manifest tracks, so
+    /// registry GC keeps them while the upgrade is active (#2419).
+    pub fn binary_digests(&self) -> std::collections::HashSet<String> {
+        self.binaries
+            .iter()
+            .map(|binary| format!("sha256:{}", binary.sha256))
+            .collect()
+    }
+
     /// Should the scheduler avoid placing new work on this node right now?
     pub fn is_node_cordoned(&self, node_id: &str) -> bool {
         self.nodes.iter().any(|record| {

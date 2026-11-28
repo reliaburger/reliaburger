@@ -8,13 +8,67 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::rollup::{
-    MetricsQuery, MetricsQueryResult, MetricsQueryRow, OwnedRollupRow, QueryWarning,
+    MetricsQuery, MetricsQueryResult, MetricsQueryRow, OwnedRollupRow, QueryWarning, RollupReporter,
 };
 
 /// The response header a council member's `/v1/metrics/rollup/owned` sets
 /// when its answer continues in another page: the `start` to ask for next
 /// (#2451).
 pub const NEXT_START_HEADER: &str = "x-reliaburger-next-start";
+
+/// How long a node may go without a rollup reaching the council before a
+/// cluster query names it [`QueryWarning::NodeSilent`] (#2536). A minute's
+/// rollup leaves about a minute after the minute ends, and a worker whose
+/// parent changed re-sends this span, so a shorter gap is ordinary.
+pub const SILENT_AFTER_SECS: u64 = super::rollup_generator::BACKFILL_SPAN_SECS;
+
+/// A node that should report rollups: a live gossip member, and when this
+/// node first heard of it (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedReporter {
+    /// The member's node id, as its rollups name it.
+    pub node_id: String,
+    /// When it joined, as far as this node knows.
+    pub joined: u64,
+}
+
+/// The [`QueryWarning::NodeSilent`] warnings for a query over
+/// `start..=end` answered at `now` (#2536).
+///
+/// `heard` is every council member's [`RollupReporter`] list. A member of
+/// `expected` is silent when its newest rollup is more than
+/// [`SILENT_AFTER_SECS`] older than the window's end (or `now`, if that's
+/// earlier). A member that joined within that span owes nothing yet.
+pub fn silent_reporters(
+    expected: &[ExpectedReporter],
+    heard: &[RollupReporter],
+    start: u64,
+    end: u64,
+    now: u64,
+) -> Vec<QueryWarning> {
+    let end = end.min(now);
+    if end < start {
+        return Vec::new();
+    }
+    let due_by = end.saturating_sub(SILENT_AFTER_SECS);
+    let mut newest: BTreeMap<&str, u64> = BTreeMap::new();
+    for reporter in heard {
+        let last = newest.entry(&reporter.node_id).or_default();
+        *last = (*last).max(reporter.last_window);
+    }
+    expected
+        .iter()
+        .filter(|member| member.joined <= due_by)
+        .filter_map(|member| {
+            let last_seen = newest.get(member.node_id.as_str()).copied();
+            let silent = last_seen.is_none_or(|last| last < due_by);
+            silent.then(|| QueryWarning::NodeSilent {
+                node_id: member.node_id.clone(),
+                last_seen,
+            })
+        })
+        .collect()
+}
 
 /// Merge metrics results from multiple sources, sorted by timestamp.
 ///
@@ -100,30 +154,59 @@ pub fn merge_owned_rollups(sources: Vec<Vec<OwnedRollupRow>>) -> MetricsQueryRes
     }
 }
 
+/// Where a council member lists the newest rollup it holds from each node
+/// (#2536).
+pub const REPORTERS_PATH: &str = "/v1/metrics/rollup/reporters";
+
 /// Fan out a cluster-wide metrics query to all council aggregators.
 ///
 /// Each `council_url` should be a base URL like `http://10.0.1.5:9117`.
 /// The query is sent to `GET /v1/metrics/rollup/owned` on each council member.
 /// Results are merged by timestamp. Unresponsive nodes produce warnings.
+///
+/// Each member is also asked whom it hears from ([`REPORTERS_PATH`]), and a
+/// member of `expected` that none has heard from lately is named
+/// [`QueryWarning::NodeSilent`] (#2536). When a member doesn't answer that,
+/// silence is unknown and nobody is named.
 pub async fn fan_out_cluster_query(
     query: &MetricsQuery,
     council_urls: &[String],
     client: &reqwest::Client,
     timeout: Duration,
     service_token: Option<&str>,
+    expected: &[ExpectedReporter],
+    now: u64,
 ) -> MetricsQueryResult {
-    let (data_sources, warnings) = fan_out_to_urls(
+    let owned = fan_out_to_urls::<OwnedRollupRow>(
         query,
         council_urls,
         "/v1/metrics/rollup/owned",
         client,
         timeout,
         service_token,
-    )
-    .await;
+    );
+    let reporters = fan_out_to_urls::<RollupReporter>(
+        query,
+        council_urls,
+        REPORTERS_PATH,
+        client,
+        timeout,
+        service_token,
+    );
+    let ((data_sources, warnings), (heard, unheard)) = tokio::join!(owned, reporters);
 
     let mut result = merge_owned_rollups(data_sources.into_iter().map(|(_, rows)| rows).collect());
     result.warnings.extend(warnings);
+    if unheard.is_empty() {
+        let heard: Vec<RollupReporter> = heard.into_iter().flat_map(|(_, rows)| rows).collect();
+        result.warnings.extend(silent_reporters(
+            expected,
+            &heard,
+            query.start,
+            query.end,
+            now,
+        ));
+    }
     result
 }
 
@@ -496,6 +579,8 @@ mod tests {
             &reqwest::Client::new(),
             Duration::from_secs(2),
             None,
+            &[],
+            0,
         )
         .await;
         for server in servers {
@@ -566,6 +651,8 @@ mod tests {
                 &reqwest::Client::new(),
                 Duration::from_secs(1),
                 None,
+                &[],
+                0,
             )
             .await;
             server.abort();
@@ -617,6 +704,8 @@ mod tests {
             &reqwest::Client::new(),
             Duration::from_secs(2),
             None,
+            &[],
+            0,
         )
         .await;
         server.abort();
@@ -656,12 +745,197 @@ mod tests {
             &reqwest::Client::new(),
             Duration::from_secs(2),
             None,
+            &[],
+            0,
         )
         .await;
         server.abort();
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         let stamps: Vec<u64> = result.data.iter().map(|row| row.timestamp).collect();
         assert_eq!(stamps, [60, 120, 180]);
+    }
+
+    fn expected(node_id: &str, joined: u64) -> ExpectedReporter {
+        ExpectedReporter {
+            node_id: node_id.into(),
+            joined,
+        }
+    }
+
+    fn heard(node_id: &str, last_window: u64) -> RollupReporter {
+        RollupReporter {
+            node_id: node_id.into(),
+            last_window,
+        }
+    }
+
+    /// #2536: of three long-standing members, the one whose rollups stopped
+    /// is named, with its last rollup; a member that joined a minute ago
+    /// owes none yet.
+    #[test]
+    fn a_member_whose_rollups_stopped_is_named_silent_but_a_new_joiner_is_not() {
+        let now = 100_000;
+        let members = [
+            expected("w1", 1_000),
+            expected("w2", 1_000),
+            expected("w3", 1_000),
+            expected("w4", now - 60),
+        ];
+        let reporters = [
+            heard("w1", now - 120),
+            // w2 reports to two aggregators; the newer answer counts.
+            heard("w2", now - 3_000),
+            heard("w2", now - 180),
+            heard("w3", now - 1_200),
+        ];
+        let warnings = silent_reporters(&members, &reporters, now - 3_600, u64::MAX, now);
+        assert_eq!(
+            warnings,
+            [QueryWarning::NodeSilent {
+                node_id: "w3".into(),
+                last_seen: Some(now - 1_200),
+            }]
+        );
+    }
+
+    /// A member no council member has a rollup from is silent with no
+    /// `last_seen`.
+    #[test]
+    fn a_member_never_heard_from_is_silent_with_no_last_rollup() {
+        let now = 100_000;
+        let warnings = silent_reporters(&[expected("w1", 1_000)], &[], now - 3_600, now, now);
+        assert_eq!(
+            warnings,
+            [QueryWarning::NodeSilent {
+                node_id: "w1".into(),
+                last_seen: None,
+            }]
+        );
+    }
+
+    /// A window that ended in the past only needs rollups up to its end: a
+    /// member that went quiet after it isn't missing from that answer.
+    #[test]
+    fn a_past_window_only_needs_rollups_up_to_its_end() {
+        let now = 100_000;
+        let end = now - 7_200;
+        let warnings = silent_reporters(
+            &[expected("w1", 1_000), expected("w2", 1_000)],
+            &[heard("w1", end - 60), heard("w2", end - 1_000)],
+            end - 3_600,
+            end,
+            now,
+        );
+        assert_eq!(
+            warnings,
+            [QueryWarning::NodeSilent {
+                node_id: "w2".into(),
+                last_seen: Some(end - 1_000),
+            }]
+        );
+    }
+
+    /// Serve owned rollups and the reporter lists from one local server.
+    async fn serve_member(
+        owned: axum::routing::MethodRouter,
+        reporters: axum::routing::MethodRouter,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/v1/metrics/rollup/owned", owned)
+            .route(REPORTERS_PATH, reporters);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    /// #2536 through the fan-out: two council members, three expected
+    /// reporters. The one neither member has heard from lately is named.
+    #[tokio::test]
+    async fn the_cluster_query_names_a_member_no_aggregator_hears_from() {
+        let now = 100_000;
+        let empty = || axum::routing::get(|| async { axum::Json(Vec::<OwnedRollupRow>::new()) });
+        let (first, first_server) = serve_member(
+            empty(),
+            axum::routing::get(move || async move {
+                axum::Json(vec![heard("w1", now - 60), heard("w3", now - 900)])
+            }),
+        )
+        .await;
+        let (second, second_server) = serve_member(
+            empty(),
+            axum::routing::get(move || async move { axum::Json(vec![heard("w2", now - 120)]) }),
+        )
+        .await;
+        let query = MetricsQuery {
+            start: now - 3_600,
+            end: now,
+            ..cpu_query()
+        };
+        let members = [
+            expected("w1", 1_000),
+            expected("w2", 1_000),
+            expected("w3", 1_000),
+            expected("w4", now - 30),
+        ];
+        let result = fan_out_cluster_query(
+            &query,
+            &[first, second],
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+            &members,
+            now,
+        )
+        .await;
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(
+            result.warnings,
+            [QueryWarning::NodeSilent {
+                node_id: "w3".into(),
+                last_seen: Some(now - 900),
+            }]
+        );
+    }
+
+    /// A member that can't say whom it hears from leaves silence unknown:
+    /// its workers would all look silent. Its failure is already a warning.
+    #[tokio::test]
+    async fn no_member_is_called_silent_when_an_aggregator_does_not_say() {
+        use axum::http::StatusCode;
+        let now = 100_000;
+        let (url, server) = serve_member(
+            axum::routing::get(|| async { axum::Json(Vec::<OwnedRollupRow>::new()) }),
+            axum::routing::get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .await;
+        let query = MetricsQuery {
+            start: now - 3_600,
+            end: now,
+            ..cpu_query()
+        };
+        let result = fan_out_cluster_query(
+            &query,
+            &[url],
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+            &[expected("w1", 1_000)],
+            now,
+        )
+        .await;
+        server.abort();
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, QueryWarning::NodeSilent { .. })),
+            "{:?}",
+            result.warnings
+        );
     }
 
     // --- merge_cluster_results tests ---

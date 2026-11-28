@@ -307,6 +307,20 @@ pub struct ExportHoldObservation {
     pub failing_since: u64,
 }
 
+/// A node whose image collection pass failed or was refused, so its
+/// unpacked images aren't being removed (#2524).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageCollectionObservation {
+    /// Node identifier.
+    pub node_id: String,
+    /// What went wrong with the last pass.
+    pub problem: crate::grill::image::CollectionProblem,
+    /// Unix seconds of the first pass with this problem since one worked.
+    pub since: u64,
+    /// Bytes the node's unpacked images take.
+    pub unpacked_bytes: u64,
+}
+
 /// Observed cgroup CPU throttling for one application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CpuThrottleObservation {
@@ -397,6 +411,8 @@ pub struct ClusterEvidence {
     pub disks: Evidence<Vec<DiskObservation>>,
     /// Stores whose export is failing, so their retention is on hold.
     pub export_holds: Evidence<Vec<ExportHoldObservation>>,
+    /// Nodes whose image collection keeps failing or being refused.
+    pub image_collection: Evidence<Vec<ImageCollectionObservation>>,
     /// Safe public certificate metadata.
     pub certificates: Evidence<Vec<CertificateObservation>>,
     /// Per-node Pickle readiness and redundancy evidence.

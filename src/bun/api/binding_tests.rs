@@ -33,7 +33,7 @@ fn binder(answer: Option<u64>) -> ImageBinder {
 /// and `history` when given and the binder layered on when given.
 fn router_with(
     council: Option<Arc<crate::council::CouncilNode>>,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     binder: Option<ImageBinder>,
 ) -> (Router, CancellationToken) {
     router_with_service(council, history, binder, None)
@@ -41,7 +41,7 @@ fn router_with(
 
 fn router_with_service(
     council: Option<Arc<crate::council::CouncilNode>>,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     binder: Option<ImageBinder>,
     service: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
 ) -> (Router, CancellationToken) {
@@ -145,6 +145,25 @@ async fn a_cluster_apply_fails_and_writes_nothing_when_the_registry_is_down() {
 
     assert!(body.contains("\"Error\""), "{body}");
     assert!(body.contains("nginx:1.27"), "{body}");
+    assert_eq!(desired_image(&council, "web").await, None);
+    shutdown.cancel();
+    council.raft().shutdown().await.unwrap();
+}
+
+/// #2528: an image with a layer no node can unpack is refused at apply,
+/// naming the layer's media type, and nothing reaches Raft. Before, the
+/// apply said yes and every node's pull failed.
+#[tokio::test]
+async fn a_cluster_apply_refuses_an_image_whose_layers_no_node_can_unpack() {
+    let council = seeded_council("bind-unpackable-layer").await;
+    let lz4 = "application/vnd.oci.image.layer.v1.tar+lz4";
+    let binder = ImageBinder::with_upstream(Arc::new(crate::pickle::binding::LayeredUpstream(lz4)));
+    let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder));
+
+    let (_, body) = post(app, "/v1/apply", "[app.web]\nimage = \"nginx:1.27\"\n").await;
+
+    assert!(body.contains("\"Error\""), "{body}");
+    assert!(body.contains(lz4), "{body}");
     assert_eq!(desired_image(&council, "web").await, None);
     shutdown.cancel();
     council.raft().shutdown().await.unwrap();
@@ -348,10 +367,11 @@ async fn a_rollback_restores_the_bound_digest_without_asking_the_registry() {
         })
         .await
         .unwrap();
-    let history = Arc::new(RwLock::new(vec![
-        completed(1, 10, &old),
-        completed(2, 20, &new),
-    ]));
+    let history = Arc::new(RwLock::new(
+        vec![completed(1, 10, &old), completed(2, 20, &new)]
+            .into_iter()
+            .collect::<crate::bun::agent::DeployHistory>(),
+    ));
     let (app, shutdown) = router_with(Some(council.clone()), Some(history), Some(binder(None)));
 
     let (status, body) = post(app, "/v1/rollback/web/default", "").await;
@@ -493,4 +513,109 @@ async fn delegated_submissions_refuse_a_required_cosign_check_without_a_signatur
         shutdown.cancel();
         council.raft().shutdown().await.unwrap();
     }
+}
+
+/// Every route that keeps a job definition, with a body that submits one
+/// `report:latest` job named `nightly` in `default` (#1322).
+const DEFINITION_ROUTES: &[(&str, &str)] = &[
+    (
+        "/v1/jobs/runs",
+        r#"{"name":"nightly","namespace":"default","definition":{"template":{"image":"report:latest","command":["true"]},"cron":{"expression":"0 3 * * *"}}}"#,
+    ),
+    (
+        "/v1/batch",
+        r#"{"jobs":[{"name":"nightly","namespace":"default","spec":{"image":"report:latest","command":["true"]}}]}"#,
+    ),
+    (
+        "/v1/batch/array",
+        r#"{"name":"nightly","namespace":"default","template":{"image":"report:latest","command":["true"]},"spec":{"count":1}}"#,
+    ),
+];
+
+/// #1322: a job bound at admission keeps the tag it declared beside the
+/// digest it runs, on every route that keeps a definition, and the policy
+/// audit judges the tag: binding `report:latest` doesn't hide it from a
+/// rule against `:latest`.
+#[tokio::test]
+async fn a_bound_job_keeps_its_declared_image_for_the_audit_on_every_route() {
+    let bound = format!("report:latest@{}", digest(7).as_str());
+    let policies = Config::parse(
+        "[policy.pinned-jobs]\napplies_to = 'jobs'\ndeny = \"job.image.endsWith(':latest')\"\nmessage = 'pin a version'\n",
+    )
+    .unwrap()
+    .policy;
+    for (route, request) in DEFINITION_ROUTES {
+        let council = seeded_council("bind-declared-job").await;
+        let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder(Some(7))));
+        let (status, body) = post(app, route, request).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{route}: {body}");
+
+        let mut desired = council.desired_state().await;
+        let record = desired
+            .task_arrays
+            .jobs()
+            .definition("default", "nightly")
+            .unwrap_or_else(|| panic!("{route}: no definition"));
+        assert_eq!(
+            record.definition.template.image.as_deref(),
+            Some(bound.as_str()),
+            "{route}"
+        );
+        assert_eq!(
+            record.definition.declared_image.as_deref(),
+            Some("report:latest"),
+            "{route}"
+        );
+        desired.policies = policies.clone();
+        let audit = crate::policy::audit::audit(&desired);
+        assert_eq!(
+            audit
+                .verdict
+                .denials
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["policy pinned-jobs denies job default/nightly: pin a version".to_string()],
+            "{route}"
+        );
+        shutdown.cancel();
+        council.raft().shutdown().await.unwrap();
+    }
+}
+
+/// #1322: a job manifest's deployment keeps each job's declared image, so
+/// the definitions it commits later carry it.
+#[tokio::test]
+async fn a_job_manifest_keeps_the_images_its_jobs_declared() {
+    let council = seeded_council("bind-declared-manifest").await;
+    let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder(Some(7))));
+    let digest = digest(7);
+    let (status, body) = post(
+        app,
+        "/v1/apply",
+        &format!(
+            "[job.nightly]\nimage = 'report:latest'\ncommand = ['true']\nschedule = '0 3 * * *'\n\
+             [job.pinned]\nimage = 'report:v1@{}'\ncommand = ['true']\nschedule = '0 4 * * *'\n",
+            digest.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let desired = council.desired_state().await;
+    let (_, deployment) = desired
+        .task_arrays
+        .deployments()
+        .next()
+        .expect("the manifest's deployment");
+    assert_eq!(
+        deployment.config.job["nightly"].image.as_deref(),
+        Some(format!("report:latest@{}", digest.as_str()).as_str())
+    );
+    assert_eq!(
+        deployment.declared_images,
+        std::collections::BTreeMap::from([("nightly".to_string(), "report:latest".to_string())])
+    );
+    shutdown.cancel();
+    council.raft().shutdown().await.unwrap();
 }

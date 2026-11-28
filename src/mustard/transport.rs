@@ -524,6 +524,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            leader_age_ms: 0,
             labels: std::collections::BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,

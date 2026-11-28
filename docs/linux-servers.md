@@ -72,7 +72,13 @@ Ensure the following ports are open:
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
 cluster members can reach the container host ports, and only they and the
-`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports.
+It closes the whole `10000`-`32767` range, not just the ports Bun hands out, so
+move `[network] port_range` if another service on the node listens inside it;
+Bun warns about each one it finds at start-up. A graceful stop that stops
+every workload removes the perimeter again; otherwise
+`sudo nft delete table ip reliaburger_fw` and
+`sudo nft delete table ip6 reliaburger_fw` remove it by hand. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
@@ -92,6 +98,12 @@ chain's policy to `DROP`. Bun enables IPv4 forwarding but doesn't override
 another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
+
+Containers on a node get addresses from a `/23` inside `10.0.0.0/8`. Bun
+picks it the first time it starts containers, passing over any `/23` that
+overlaps a network the host is on, and keeps it from then on, so renaming a
+host doesn't strand its containers. Container addresses never leave their
+node.
 
 Bun's own check for published container ports is a forward-hook chain at
 priority -10 in its `reliaburger_fw` table. nftables runs every table's chain

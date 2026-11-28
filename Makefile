@@ -134,8 +134,8 @@ test-gym-user: ## Test `relish gym run` on a throwaway local cluster (#1683): th
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
-test-s3: ## Export logs and round-trip a council backup through a throwaway local S3 server, or a real bucket with RELIABURGER_TEST_S3_URL=s3://bucket/prefix and AWS credentials
-	scripts/test-s3.sh $(NEXTEST) --lib --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3)'
+test-s3: ## Export logs, round-trip a council backup and interrupt a volume-snapshot upload through a throwaway local S3 server, or a real bucket with RELIABURGER_TEST_S3_URL=s3://bucket/prefix and AWS credentials
+	scripts/test-s3.sh $(NEXTEST) --lib --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3) | test(=bun::snapshot_worker::tests::an_interrupted_s3_upload_restarts_cleanly)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check

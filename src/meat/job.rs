@@ -50,6 +50,13 @@ pub struct JobDefinition {
     /// next apply that names it runs it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hook: bool,
+    /// The image the job declared, kept when admission bound its tag to a
+    /// digest or pinned a signed image, so the stored image differs. With
+    /// it the policy audit judges the job as declared (#1322), as it judges
+    /// an app by its declared spec (#1118). `None` when the stored image is
+    /// the declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_image: Option<String>,
 }
 
 impl JobDefinition {
@@ -84,6 +91,7 @@ impl JobDefinition {
             cron,
             replay_unknown,
             hook,
+            declared_image: None,
         }
     }
 
@@ -104,6 +112,26 @@ impl JobDefinition {
         spec
     }
 
+    /// The job as declared: [`Self::to_spec`] with the image the job
+    /// declared, before admission bound or pinned it. Binding and pinning
+    /// are the only changes admission makes to a job (policy defaults fill
+    /// in apps, not jobs), so this is the spec its manifest or request
+    /// carried. The policy audit judges this (#1322).
+    pub fn declared_spec(&self) -> JobSpec {
+        let mut spec = self.to_spec();
+        if let Some(declared) = &self.declared_image {
+            spec.image = Some(declared.clone());
+        }
+        spec
+    }
+
+    /// Record `declared`, the image the job carried before admission bound
+    /// or pinned it, when it differs from the image now in the template.
+    pub fn settle_declared_image(&mut self, declared: Option<String>) {
+        self.declared_image =
+            declared.filter(|declared| self.template.image.as_deref() != Some(declared.as_str()));
+    }
+
     /// Whether the definition outlives its runs. Anything else is a one-off
     /// and expires when its last run is pruned.
     pub fn is_lasting(&self) -> bool {
@@ -117,6 +145,15 @@ impl JobDefinition {
         }
         self.tasks.validate().map_err(|e| e.to_string())?;
         validate_template(&self.template).map_err(|e| e.to_string())?;
+        if let Some(declared) = &self.declared_image
+            && self
+                .template
+                .image
+                .as_deref()
+                .is_none_or(|image| image == declared)
+        {
+            return Err("a declared image is kept only beside a different stored image".into());
+        }
         if let Some(cron) = &self.cron {
             super::cron::CronSchedule::parse(&cron.expression).map_err(|e| e.to_string())?;
         }
@@ -736,6 +773,92 @@ mod tests {
         assert!(back.replay_unknown);
         assert_eq!(back.image, spec.image);
     }
+
+    /// #1322: the declared spec is the stored one with the image the job
+    /// declared, so the audit judges `report:latest` as declared even
+    /// though the cluster runs the digest admission bound it to.
+    #[test]
+    fn the_declared_spec_carries_the_image_the_job_declared() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let spec: JobSpec =
+            toml::from_str("image = 'report:latest'\nschedule = '0 3 * * *'\n").unwrap();
+        let mut definition = JobDefinition::from_spec(spec);
+        assert_eq!(definition.declared_spec(), definition.to_spec());
+
+        definition.template.image = Some(format!("report:latest@{digest}"));
+        definition.declared_image = Some("report:latest".into());
+        let declared = definition.declared_spec();
+        assert_eq!(declared.image.as_deref(), Some("report:latest"));
+        assert_eq!(declared.schedule.as_deref(), Some("0 3 * * *"));
+        assert_eq!(
+            definition.to_spec().image,
+            Some(format!("report:latest@{digest}"))
+        );
+    }
+
+    /// #1322: a declared image is kept only beside an image it differs
+    /// from, so one definition has one stored form.
+    #[test]
+    fn a_declared_image_must_differ_from_the_stored_one() {
+        let mut definition = JobDefinition::from_spec(
+            toml::from_str::<JobSpec>("image = 'report:v1'\ncommand = ['true']\n").unwrap(),
+        );
+        definition.declared_image = Some("report:v1".into());
+        assert!(definition.validate().is_err());
+        definition.declared_image = Some("report:v0".into());
+        assert!(definition.validate().is_ok());
+        let mut host = JobDefinition::from_spec(
+            toml::from_str::<JobSpec>("runtime = 'process'\nexec = '/bin/true'\n").unwrap(),
+        );
+        assert!(host.validate().is_ok());
+        host.declared_image = Some("report:v0".into());
+        assert!(host.validate().is_err());
+    }
+
+    /// #1322: admission settles the declared image afresh each time, and
+    /// keeps it only when binding or pinning changed the image.
+    #[test]
+    fn settling_the_declared_image_keeps_it_only_when_admission_changed_the_image() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let mut definition = JobDefinition::from_spec(
+            toml::from_str::<JobSpec>("image = 'report:v1'\ncommand = ['true']\n").unwrap(),
+        );
+        definition.settle_declared_image(Some("report:v1".into()));
+        assert_eq!(definition.declared_image, None);
+        definition.template.image = Some(format!("report:v1@{digest}"));
+        definition.settle_declared_image(Some("report:v1".into()));
+        assert_eq!(definition.declared_image.as_deref(), Some("report:v1"));
+        definition.settle_declared_image(Some(format!("report:v1@{digest}")));
+        assert_eq!(definition.declared_image, None);
+    }
+
+    /// #1322: a definition that differs only in what it declared is a new
+    /// revision, as any other change to it is, and the store keeps the
+    /// declared image with it.
+    #[test]
+    fn the_store_keeps_the_declared_image_with_the_definition() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        let mut first = definition(1, Some("0 3 * * *"));
+        first.template = toml::from_str("image = 'report:v1'\ncommand = ['true']\n").unwrap();
+        apply(&mut store, put(first.clone(), None), &mut next);
+        let record = store.jobs().definition("default", "cleanup").unwrap();
+        assert_eq!(
+            (record.revision, record.definition.declared_image.clone()),
+            (1, None)
+        );
+
+        let mut bound = first;
+        bound.template.image = Some(format!("report:v1@sha256:{}", "c".repeat(64)));
+        bound.declared_image = Some("report:v1".into());
+        apply(&mut store, put(bound, None), &mut next);
+        let record = store.jobs().definition("default", "cleanup").unwrap();
+        assert_eq!(record.revision, 2);
+        assert_eq!(
+            record.definition.declared_spec().image.as_deref(),
+            Some("report:v1")
+        );
+    }
     use crate::config::job::JobSpec;
     use crate::meat::task_array_store::{TaskArrayApplied, TaskArrayWrite, TaskArrays};
 
@@ -750,6 +873,7 @@ mod tests {
             }),
             replay_unknown: false,
             hook: false,
+            declared_image: None,
         }
     }
 

@@ -765,6 +765,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 state: ContainerState::Running,
                 health_counters: crate::bun::health::HealthCounters::new(),
                 restart_count: 0,
+                backoff_step: 0,
                 last_restart: None,
                 host_port: record.host_port,
                 container_ip: None,

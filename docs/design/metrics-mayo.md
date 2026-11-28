@@ -2,7 +2,9 @@
 
 **Component:** Mayo (Metrics store + Built-In Alerts)
 **Binary:** Embedded in Bun (the single-node agent)
-**Status:** Design (this document reconciled against the shipped code)
+**Status:** Partly shipped. Collection, Parquet storage, rollups and the four built-in node alerts ship; the sections marked planned don't.
+**Reconciled against:** not reconciled at a named release; an earlier pass reconciled it with the shipped code, and §10.3 was checked against 0.3.4 (#2515)
+**Sketches:** tiered retention in §3.2, §3.4, §4.4, §5.3, §5.8, the planned tests in §10.3
 **Whitepaper Reference:** Section 15
 
 ---
@@ -110,7 +112,7 @@ Every read a caller drives has a row cap, a deadline and, where it lists names, 
 | `/v1/metrics/rollup` (no name) | 10,000 rows |
 | every query above, plus `query_sql`, the rollup and autoscaler aggregates | `QUERY_DEADLINE` (8 s), under the fan-out's 10 s wait |
 
-Every read runs on a snapshot (#2449). `MayoStore::snapshot()` and `RollupStore::snapshot()` list the files and copy the unflushed buffer under the store's read guard, and the query methods live on the returned `MetricsSnapshot` and `RollupSnapshot`. Callers take the snapshot in one statement, so the guard is dropped before the query runs: tokio's `RwLock` is fair, and a guard held through a slow query stalls the collector's (or the aggregator's) write and every read queued behind it. The API handlers, the rollup worker and the alert check all query this way. On the council side the rollup store's write lock is taken only briefly: the report aggregator queues each `NodeRollup` for a separate ingest task (a bounded queue of 1,024; a full queue drops and counts), so its report loop never waits on the lock, and the flush task uses `rollup_store::flush_off_lock`, which freezes the buffer into a pending batch under the lock, writes the Parquet file without it, and drops the batch under the lock once written. Queries read a pending batch from memory, never its file, until then (#2443). The autoscaler (`src/cluster/orchestrate.rs`) still holds the read guard through its aggregate query; that's one read guard among readers, and no longer blocks report handling.
+Every read runs on a snapshot (#2449). `MayoStore::snapshot()` and `RollupStore::snapshot()` list the files and copy the unflushed buffer under the store's read guard, and the query methods live on the returned `MetricsSnapshot` and `RollupSnapshot`. Callers take the snapshot in one statement, so the guard is dropped before the query runs: tokio's `RwLock` is fair, and a guard held through a slow query stalls the collector's (or the aggregator's) write and every read queued behind it. The API handlers, the rollup worker and the alert check all query this way. On the council side the rollup store's write lock is taken only briefly: the report aggregator queues each `NodeRollup` for a separate ingest task (a bounded queue of 1,024; a full queue drops and counts), so its report loop never waits on the lock, and the flush task uses `rollup_store::flush_off_lock`, which freezes the buffer into a pending batch under the lock, writes the Parquet file without it, and drops the batch under the lock once written. Queries read a pending batch from memory, never its file, until then (#2443). The autoscaler (`src/cluster/orchestrate.rs`) takes one rollup snapshot per tick and runs one aggregate query per metric series its apps use, over the longest evaluation window, each app reading only the minutes inside its own (#2530); `relish top`'s local rows query a metrics snapshot too.
 
 A query past its deadline is `MayoError::QueryRejected`, which the handlers answer with a 400 and the reason: the caller's range is the problem, and narrowing it helps where retrying doesn't. `hydrate_seen_windows` at startup has no deadline; it isn't a caller's query.
 
@@ -349,7 +351,7 @@ The council member stores received rollups in a rollup store and serves them at 
 
 Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each member's whole answer (`src/bun/api/metrics.rs`).
 
-`/v1/metrics/cluster` bounds (#2451): without `start` it reads the last hour (`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`). Each member answers `/v1/metrics/rollup/owned` in pages of at most `OWNED_ROWS_PAGE` (10,000) contributions ending on a whole minute, with an `x-reliaburger-next-start` header while more remain; the entry node follows the pages up to `MAX_OWNED_ROWS` (200,000) per member. A member that refuses (past that total, or one minute larger than a page) is reported as `QueryWarning::QueryRefused { node_id, reason }`, the reason read from its error body; only a member that doesn't answer is `NodeUnresponsive`. The single-node fallback refuses the same ranges with a 400. Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
+`/v1/metrics/cluster` bounds (#2451): without `start` it reads the last hour (`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`). Each member answers `/v1/metrics/rollup/owned` in pages of at most `OWNED_ROWS_PAGE` (10,000) contributions ending on a whole minute, with an `x-reliaburger-next-start` header while more remain; the entry node follows the pages up to `MAX_OWNED_ROWS` (200,000) per member. A member that refuses (past that total, or one minute larger than a page) is reported as `QueryWarning::QueryRefused { node_id, reason }`, the reason read from its error body; only a member that doesn't answer is `NodeUnresponsive`. The single-node fallback refuses the same ranges with a 400. A live member silent for the window's last `SILENT_AFTER_SECS` (five minutes, the backfill span) is `QueryWarning::NodeSilent { node_id, last_seen }` (#2536): the entry node takes the expected reporters from its remembered gossip members (`KnownMembers::live_since`, skipping any that joined within that span) and asks each council member's `/v1/metrics/rollup/reporters` for the newest window it holds from each node (`RollupStore::reporters`, kept on every ingest and seeded from the flushed files at startup). If any member doesn't answer that, nobody is named. The single-node fallback applies the same check to its own store. Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 
@@ -637,15 +639,12 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 
 - Verify that an alert with `for = "5m"` transitions from `Inactive` -> `Pending` -> `Firing` after exactly 5 minutes of continuous threshold breach.
 - Verify that a momentary dip below threshold during the `for` period resets the alert to `Inactive`.
-- Verify that per-app suppression (`cpu.idle = false`) prevents the alert from firing for the suppressed app but not for other apps.
-- Verify that per-app threshold tuning (`memory.low = { threshold = 95 }`) uses the overridden value.
 
 **Integration tests:**
 
-- Deploy a test app that consumes 90% of its memory limit. Verify that the `memory.low` alert fires within the expected timeframe (default: 5 minutes).
-- Deploy a test app that triggers an OOM kill. Verify that the `oom.kill` alert fires immediately (no `for` duration on OOM).
 - Configure a webhook notification destination. Trigger an alert. Verify that the webhook receives the expected JSON payload with correct labels, severity, and timestamps.
-- Configure a per-app suppression. Verify that the suppressed alert does not fire for the suppressed app, does not produce a webhook notification, and is not visible in `relish alerts`.
+
+**Planned, with custom alert rules (#1773).** The shipped rules are four fixed node rules (`default_rules` in `src/mayo/alert.rs`) with no per-app overrides, so these tests wait for that work: per-app suppression and threshold tuning, a per-app memory alert, an OOM-kill alert with no `for` duration, and a command that lists active alerts.
 
 ### 10.4 Prometheus Compatibility Tests
 

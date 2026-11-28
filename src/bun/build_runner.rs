@@ -37,6 +37,18 @@ pub const TERMINAL_BUILD_RETENTION_SECS: u64 = 3600;
 /// cap-at-50 precedent).
 pub const MAX_TERMINAL_BUILDS: usize = 50;
 
+/// How long a build may say `Running` before it's taken as lost (#2376): a
+/// runner node that never came back, or a final state that never reached
+/// Raft. A day is far beyond any build's Buildah stages at the default
+/// `[images] build_timeout_secs` (15 minutes each). It's a constant, not
+/// derived from that per-node setting, so every Raft replica fails the
+/// same records.
+pub const RUNNING_BUILD_DEADLINE_SECS: u64 = 24 * 3600;
+
+/// How long `update_build_state` keeps trying to write a build's final
+/// state to Raft: long enough to ride out a leader election.
+const FINAL_STATE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// How this node runs image builds.
 #[derive(Debug, Clone)]
 pub struct BuildSettings {
@@ -137,6 +149,26 @@ pub struct BuildRecord {
     pub repository: Option<String>,
 }
 
+impl BuildRecord {
+    /// The record's state as of `now_epoch_secs`: a `Running` build past
+    /// [`RUNNING_BUILD_DEADLINE_SECS`] is `Failed`, since its runner never
+    /// reported a result.
+    pub fn state_at(&self, now_epoch_secs: u64) -> BuildState {
+        let age = now_epoch_secs.saturating_sub(self.created_at_epoch_secs);
+        if self.state == BuildState::Running && age > RUNNING_BUILD_DEADLINE_SECS {
+            BuildState::Failed {
+                reason: format!(
+                    "the builder never reported a result within {} hours; \
+                     a result arriving later is refused",
+                    RUNNING_BUILD_DEADLINE_SECS / 3600
+                ),
+            }
+        } else {
+            self.state.clone()
+        }
+    }
+}
+
 /// Why a build state update was rejected.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum BuildUpdateError {
@@ -170,18 +202,21 @@ impl Default for BuildDurableState {
 }
 
 impl BuildDurableState {
-    /// Register a build: allocate the next id, prune stale terminal
-    /// records (using the new record's clock — deterministic across
-    /// Raft replicas), and store the record.
+    /// Register a build: allocate the next id, fail builds past their
+    /// deadline, prune stale terminal records (using the new record's clock,
+    /// so every Raft replica does the same), and store the record.
     pub fn register(&mut self, record: BuildRecord) -> u64 {
         let id = self.next_build_id.max(1);
         self.next_build_id = id + 1;
-        self.prune_terminal(record.created_at_epoch_secs);
+        self.expire_and_prune(record.created_at_epoch_secs);
         self.builds.push((id, record));
         id
     }
 
-    fn prune_terminal(&mut self, now_epoch_secs: u64) {
+    fn expire_and_prune(&mut self, now_epoch_secs: u64) {
+        for (_, record) in &mut self.builds {
+            record.state = record.state_at(now_epoch_secs);
+        }
         self.builds.retain(|(_, record)| {
             !(record.state.is_terminal()
                 && now_epoch_secs.saturating_sub(record.created_at_epoch_secs)
@@ -593,10 +628,28 @@ pub(crate) async fn register_build_record(
 }
 
 /// Record a build state transition durably, mirroring it locally.
-/// Never fails the caller: the mirror always updates, and a Raft write
-/// failure is logged (the honest-failure path on status reads catches
-/// records that stayed `Running`).
+/// Never fails the caller: the mirror always updates, and a Raft write is
+/// tried three times, then logged (a status read fails a record its
+/// runner left `Running`, and so does its deadline).
 pub(crate) async fn update_build_state(state: &ApiState, build_id: u64, new_state: BuildState) {
+    write_build_state(state, build_id, new_state, std::time::Duration::ZERO).await;
+}
+
+/// Record the state a build finished in. Like [`update_build_state`], but
+/// the Raft write is retried for [`FINAL_STATE_PATIENCE`]: the outcome is
+/// known and the write idempotent, and three tries in under a second used
+/// to lose it to a leader election, leaving the replicated record `Running`
+/// on every node but the runner (#2376).
+async fn finish_build_state(state: &ApiState, build_id: u64, new_state: BuildState) {
+    write_build_state(state, build_id, new_state, FINAL_STATE_PATIENCE).await;
+}
+
+async fn write_build_state(
+    state: &ApiState,
+    build_id: u64,
+    new_state: BuildState,
+    patience: std::time::Duration,
+) {
     state
         .build_registry
         .lock()
@@ -609,17 +662,19 @@ pub(crate) async fn update_build_state(state: &ApiState, build_id: u64, new_stat
         build_id,
         state: new_state,
     };
-    for attempt in 0..3u32 {
-        match propose_track(state, &request).await {
+    let started = tokio::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(200);
+    for attempt in 1u32.. {
+        let error = match propose_track(state, &request).await {
             Ok(_) => return,
-            Err(e) if attempt == 2 => {
-                eprintln!("bun: build {build_id}: state update not written to raft: {e}");
-            }
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1)))
-                    .await;
-            }
+            Err(error) => error,
+        };
+        if attempt >= 3 && started.elapsed() + pause > patience {
+            eprintln!("bun: build {build_id}: state update not written to raft: {error}");
+            return;
         }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_secs(10));
     }
 }
 
@@ -1147,12 +1202,6 @@ pub struct BuildRunnerContext {
     pub api: ApiState,
 }
 
-impl BuildRunnerContext {
-    async fn set_state(&self, build_id: u64, state: BuildState) {
-        update_build_state(&self.api, build_id, state).await;
-    }
-}
-
 /// The lifted build body: fetch the context blob from the local
 /// registry, extract, run `buildah bud` and export the image (bounded by
 /// `[images] build_timeout_secs`), prune Buildah's storage, upload the image
@@ -1165,12 +1214,11 @@ pub async fn run_build(request: BuildSubmitRequest, build_id: u64, ctx: BuildRun
     let outcome = run_build_inner(&request, build_id, &ctx).await;
     match outcome {
         Ok(image) => {
-            ctx.set_state(build_id, BuildState::Completed { image })
-                .await;
+            finish_build_state(&ctx.api, build_id, BuildState::Completed { image }).await;
         }
         Err(reason) => {
             eprintln!("bun: build {build_id} ({}) failed: {reason}", request.name);
-            ctx.set_state(build_id, BuildState::Failed { reason }).await;
+            finish_build_state(&ctx.api, build_id, BuildState::Failed { reason }).await;
         }
     }
     ctx.api.active_builds.lock().await.remove(&build_id);
@@ -1997,7 +2045,9 @@ pub async fn build_status_handler(
             update_build_state(&state, build_id, failed.clone()).await;
             Json(serde_json::json!(failed)).into_response()
         }
-        build_state => Json(serde_json::json!(build_state)).into_response(),
+        // A read anywhere reports a build past its deadline as failed, so
+        // a client polling through any node sees it end (#2376).
+        _ => Json(serde_json::json!(record.state_at(epoch_now_secs()))).into_response(),
     }
 }
 
@@ -2579,6 +2629,39 @@ mod tests {
         assert!(state.get(running_id).is_some(), "in-flight build kept");
         assert!(state.get(fresh_id).is_some());
         assert_eq!(state.next_build_id, fresh_id + 1);
+    }
+
+    /// A build whose runner never reports (a lost node, a final write that
+    /// missed Raft) stays `Running` only until its deadline (#2376). The
+    /// next registration fails it, so it ages out like any terminal build.
+    #[test]
+    fn a_build_running_past_its_deadline_is_failed_and_pruned() {
+        let mut state = BuildDurableState::default();
+        let mut lost = running_record("lost");
+        lost.created_at_epoch_secs = 0;
+        let lost_id = state.register(lost);
+
+        let week = 7 * 24 * 3600;
+        let mut within = running_record("within");
+        within.created_at_epoch_secs = week - 3600;
+        let within_id = state.register(within);
+
+        let mut later = running_record("later");
+        later.created_at_epoch_secs = week;
+        state.register(later);
+
+        assert!(
+            state
+                .get(lost_id)
+                .is_none_or(|record| matches!(record.state, BuildState::Failed { .. })),
+            "a build a week past its start still says {:?}",
+            state.get(lost_id).map(|record| &record.state)
+        );
+        assert_eq!(
+            state.get(within_id).map(|record| &record.state),
+            Some(&BuildState::Running),
+            "a build an hour old keeps running"
+        );
     }
 
     fn report(node: &crate::meat::NodeId, has_buildah: bool) -> StateReport {

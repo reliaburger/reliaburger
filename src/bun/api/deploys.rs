@@ -312,8 +312,7 @@ pub(super) async fn cluster_deploy_history(
         Some(history) => history
             .read()
             .await
-            .iter()
-            .filter(|entry| entry.app_id.name == app && entry.app_id.namespace == namespace)
+            .of_app(&crate::meat::AppId::new(app, namespace))
             .cloned()
             .collect(),
         None => Vec::new(),
@@ -743,6 +742,7 @@ mod tests {
                 &TaskArrayWrite::DeployBegin {
                     operation_id: operation_id.clone(),
                     config: Box::new(config),
+                    declared_images: Default::default(),
                     now_epoch_secs: 2,
                 },
                 &mut ids,

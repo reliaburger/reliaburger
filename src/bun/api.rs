@@ -121,7 +121,8 @@ use logs::{
 use metrics::{
     alerts_handler, app_metric_rows, metrics_app_chart_handler, metrics_app_handler,
     metrics_cluster_handler, metrics_keys_handler, metrics_owned_rollup_handler,
-    metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
+    metrics_query_handler, metrics_rollup_handler, metrics_rollup_reporters_handler,
+    metrics_summary_handler,
 };
 use node_info::{
     DesiredAppsSource, app_spec_handler, capabilities_handler, cluster_capabilities_handler,
@@ -275,6 +276,9 @@ pub struct RosterMember {
 struct KnownMember {
     member: RosterMember,
     last_heard: std::time::Instant,
+    /// When this node first heard of it, or heard of it again after it was
+    /// down: when it joined, as far as this node knows (#2536).
+    joined: std::time::Instant,
 }
 
 impl KnownMembers {
@@ -300,25 +304,30 @@ impl KnownMembers {
         use crate::mustard::state::NodeState;
         let mut table = self.0.write().await;
         let previous: Vec<KnownMember> = table.drain(..).collect();
-        let heard_before = |node_id: &crate::meat::NodeId| {
+        let before = |node_id: &crate::meat::NodeId| {
             previous
                 .iter()
                 .find(|known| &known.member.info.node_id == node_id)
-                .map(|known| known.last_heard)
         };
         let mut next = Vec::new();
         for member in &roster {
             if retired.contains(&member.info.node_id.0) {
                 continue;
             }
+            let before = before(&member.info.node_id);
             let last_heard = if member.state.is_down() {
-                heard_before(&member.info.node_id).unwrap_or(now)
+                before.map_or(now, |known| known.last_heard)
             } else {
                 now
             };
+            // A member that was down rejoins now.
+            let joined = before
+                .filter(|known| !known.member.state.is_down())
+                .map_or(now, |known| known.joined);
             next.push(KnownMember {
                 member: member.clone(),
                 last_heard,
+                joined,
             });
         }
         for known in &previous {
@@ -351,6 +360,19 @@ impl KnownMembers {
             .iter()
             .find(|known| &known.member.info.node_id == node_id)
             .map(|known| known.member.info.address)
+    }
+
+    /// Members that aren't down, each with when it joined as far as this
+    /// node knows: the nodes a cluster metric query expects rollups from
+    /// (#2536).
+    pub async fn live_since(&self) -> Vec<(crate::meat::NodeId, std::time::Instant)> {
+        self.0
+            .read()
+            .await
+            .iter()
+            .filter(|known| !known.member.state.is_down())
+            .map(|known| (known.member.info.node_id.clone(), known.joined))
+            .collect()
     }
 
     /// Remembered members that are down: dead to gossip, or reaped by it.
@@ -394,7 +416,7 @@ pub struct ApiState {
     /// Alert evaluator.
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     /// Deploy history (shared with agent).
-    pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    pub deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     /// Bounded cluster event history and live feed.
     pub events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     /// Pickle image catalog (shared with registry).
@@ -497,7 +519,7 @@ pub fn router(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
-    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     council: Option<Arc<crate::council::CouncilNode>>,
@@ -550,7 +572,7 @@ pub fn router_with_upgrade(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
-    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     council: Option<Arc<crate::council::CouncilNode>>,
@@ -845,6 +867,10 @@ pub fn router_with_upgrade(
             "/v1/metrics/rollup/owned",
             get(metrics_owned_rollup_handler),
         )
+        .route(
+            "/v1/metrics/rollup/reporters",
+            get(metrics_rollup_reporters_handler),
+        )
         .route("/v1/metrics/cluster", get(metrics_cluster_handler))
         .route(
             "/v1/metrics/app/{app}/{namespace}",
@@ -1138,13 +1164,15 @@ async fn enforce_cluster_permission(
     crate::sesame::auth::authorize_cluster_permission(auth, action, &permissions)
 }
 
-/// The replicated `[permission]` map, keyed by token name. Empty without a
-/// council (single-node mode, where permissions can't be configured).
+/// The replicated `[permission]` map, keyed by token name: this node's
+/// replica, or the leader's view on a node with no Raft seat (#2538). Empty
+/// without a council (single-node mode, where permissions can't be
+/// configured).
 pub(crate) async fn permission_map(
     state: &ApiState,
 ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
     match &state.council {
-        Some(council) => council.desired_state().await.permissions,
+        Some(council) => council.permissions().await,
         None => std::collections::BTreeMap::new(),
     }
 }

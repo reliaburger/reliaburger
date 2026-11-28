@@ -254,7 +254,12 @@ Neither needs a network.
 | Grafana (for the basics) | TUI and web dashboard |
 
 Config is TOML. The [whitepaper](whitepaper.md) explains the architecture
-and its trade-offs; the [design docs](design/) cover each subsystem.
+and its trade-offs; the [design docs](design/) cover each subsystem. Each
+design doc opens with three lines: `Status` (shipped, partly shipped or
+design only), `Reconciled against` (the release someone last checked the
+whole doc at, or "not reconciled") and `Sketches` (the sections that describe
+design nobody has built yet). A test keeps the header on every doc, and a
+Rust listing whose types aren't in the tree carries a sketch label.
 
 ## Scope and limits
 

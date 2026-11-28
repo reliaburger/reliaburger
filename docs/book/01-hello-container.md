@@ -1716,6 +1716,23 @@ pub fn compute_backoff(&self, restart_count: u32) -> Duration {
 
 `powi` is "power, integer exponent." It's faster than `powf` (which takes a float exponent) because integer exponentiation can use repeated squaring. The `i` suffix is Rust's naming convention for integer-argument variants.
 
+### Forgiving old restarts
+
+The first version passed the instance's `restart_count` straight in, and the count only ever went up. An instance that had restarted nine times over three months needed a five-minute gap before any later restart, however long it had run in between: the day its database failed over, it sat down for five minutes when a fresh instance would have waited two seconds (#2373). The count can't just be reset, because `relish apps` shows it as RESTARTS and the state sweep compares it to tell one run from the next, so it must never go backwards. The instance carries a second counter instead, `backoff_step`, which climbs with `restart_count` but drops to 0 when a run has lasted `RESTART_FORGIVEN_AFTER`, ten minutes, the window sidecars already used:
+
+```rust
+if instance.last_restart.is_some_and(|last| {
+    now.saturating_duration_since(last) >= crate::bun::restart::RESTART_FORGIVEN_AFTER
+}) {
+    instance.backoff_step = 0;
+}
+let required_backoff = instance
+    .restart_policy
+    .compute_backoff(instance.backoff_step);
+```
+
+`saturating_duration_since` returns zero rather than panicking if `last` is somehow later than `now`. A job's restart budget still counts `restart_count`: forgiving a job's failures would let it retry for ever.
+
 ### The struct update syntax
 
 The `for_job` constructor uses `..Self::default()` to fill in fields it doesn't explicitly set:
@@ -3350,6 +3367,36 @@ The methods that write to the journal take the claim by value and hand it back: 
 **Let something else own the process.** Every command Runc runs, from the long-lived `runc run` launcher to a two-second `ip link add`, starts under an independent *process owner*: a small Bun helper process that outlives Bun. The owner records the child's identity on disk before opening an execution gate that lets the command actually start. It holds its own lock file for its whole life, makes itself the subreaper so orphaned grandchildren come back to it, and is the only thing that ever reaps or signals the child. Bun talks to it over a private Unix socket. If Bun can take an owner's lock, the owner is gone, and an owner that vanished without recording a result is an error, never "probably finished". A timed-out wait means "still running", and the command stays on the books until its owner confirms it has retired.
 
 That socket conversation once panicked a Bun that had already shut down cleanly. Bun's owner bookkeeping takes file locks, so it runs in `tokio::task::spawn_blocking`, which hands a closure to a separate pool of threads where blocking is allowed. Inside it, `request` borrowed the runtime back with `Handle::current().block_on(...)` so it could put a Tokio `timeout` around the connect, write and read. Tokio's shutdown order is what broke it: when the runtime is dropped, async tasks are dropped first, then the timer stops, and only then does Tokio wait for blocking threads to finish. A status request still running at that moment registered a timer on a stopped driver, and Tokio panics with "A Tokio 1.x context was found, but it is being shutdown". It happened once in a jobs soak, during a graceful stop. The request now uses a plain `std` Unix socket instead. A nonblocking `connect` still fails at once on a full backlog, and socket read and write timeouts, plus one overall deadline, replace the Tokio timer. The code that runs on a blocking thread no longer needs the runtime at all, and a test calls it from a thread that has no runtime.
+
+`relish exec` and exec health checks use the same machinery. Each exec gets a helper owner of its own, in an `exec-*` directory inside its workload owner's, and the command's output used to go straight into two files there. The 1 MiB limit was checked only when the files were read back, after the command had finished. A command that printed a lot wrote gigabytes to the node's disk first, for up to five minutes, and then the caller got an error and none of the output ([#2392](https://github.com/reliaburger/reliaburger/issues/2392)). `exec_output_file_never_grows_past_its_limit` in `tests/process_recovery.rs` runs `yes` for two seconds and watches the file: on the old code it reached 4 GB.
+
+A workload's own output can't move off files: [Chapter 14](14-changing-the-tyres.md) explains how a pipe whose reader dies kills its writer with SIGPIPE. An exec is different. Its command is short-lived and its helper retires it anyway, so the helper hands the command pipes and drains them itself:
+
+```rust
+let (source, sink) = std::io::pipe()?;
+fcntl(&source, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+```
+
+`std::io::pipe` returns the two ends as owned values, `PipeReader` and `PipeWriter`, each closed when it's dropped and marked close-on-exec, so no other child inherits them. The writer becomes the command's stdout through `Stdio::from(sink)`. The reader is non-blocking, because the helper is a single-threaded loop that mustn't stall on a quiet command. Each turn, `OutputDrain::drain` copies what the pipe holds into the file, up to 1 MiB plus one byte, and throws away the rest. It keeps reading past the cap, or the command would block on a full pipe and never finish. The extra byte is the evidence that there was more. When Bun reads the files back, it returns the first mebibyte with `[output cut at 1 MiB]` as the last line, rather than an error. The in-process path that tests use reads its pipes with the same cap, and `runc exec`, which runs under the same helper, behaves the same way.
+
+There's one owner per workload, so whatever an owner costs, a busy node pays 500 times. Its loop used to look at everything (new clients, the child, adopted orphans, exec helpers) and then sleep for 10 ms, for as long as the workload ran. An idle owner woke 187 times in two seconds in `an_idle_owner_does_not_wake_on_a_timer`, which counts its voluntary context switches in `/proc/<pid>/status`. At 500 apps that's 50,000 wake-ups a second spent finding nothing to do, and it keeps a small CPU like a Wyse 3040's out of its deeper idle states ([#2447](https://github.com/reliaburger/reliaburger/issues/2447)).
+
+The owner can't just block on one thing, because the things it waits for arrive in different ways. A client arrives on the listening socket and output arrives on a pipe, and those are file descriptors that `poll(2)` can wait on together. A child's exit and a cancellation arrive as signals, SIGCHLD and SIGTERM, which no file descriptor reports. The classic answer is the *self-pipe trick*: the owner opens a socket pair, and the signal handler writes one byte to it. Now a signal is a readable descriptor too:
+
+```rust
+pub(super) extern "C" fn wake(_: nix::libc::c_int) {
+    let saved = nix::errno::Errno::last_raw();
+    let sender = WAKE_SENDER.load(std::sync::atomic::Ordering::Relaxed);
+    if sender >= 0 {
+        unsafe { nix::libc::write(sender, b"!".as_ptr().cast(), 1) };
+    }
+    nix::errno::Errno::set_raw(saved);
+}
+```
+
+A signal handler can interrupt the program anywhere, even halfway through a `malloc`, so it may only make *async-signal-safe* calls. Loading an atomic integer and calling `write(2)` are safe. Allocating, locking or printing aren't. `extern "C"` gives the function the C calling convention the kernel uses to call it, and the descriptor lives in a `static AtomicI32` because a handler can't capture anything: it's a plain function, not a closure. It saves and restores `errno` because the code it interrupted may be about to read its own. The sending end is non-blocking. If the channel is full a wake-up is already pending, so a failed write loses nothing.
+
+The loop drains the channel *before* it looks at anything, then looks, then calls `poll` on the listener, the channel and any output pipes. A signal that lands while it's looking leaves a byte behind, so the next `poll` returns at once. Drain after looking instead, and that byte would be swallowed with the work it announced still undone. While an exec is in flight or the workload is retiring, the loop keeps its 10 ms tick, since those paths are written as polling state machines. Otherwise it waits up to five seconds, as a safety net: a missed wake-up delays work, but can't lose it. Linux has a neater tool for the child alone, `pidfd_open`, a descriptor that turns readable when one process exits. But orphans the owner adopts as subreaper raise SIGCHLD too, and macOS has no pidfd, so one handler covers both. The same test now sees the idle owner wake no times at all in two seconds (three runs in the Lima VM, against 187 before), and `an_owner_sees_its_workload_exit_promptly` checks that a workload's exit still reaches Bun at once.
 
 With those three pieces, restart becomes a matter of reading and checking. For each instance, Bun finds its *adoption record* (its own note of what it was running: spec, PID, process start time, log location). `owned_adopt` claims the generation and cross-checks everything:
 

@@ -270,6 +270,14 @@ pub(super) async fn node_relay_handler(
         )
             .into_response();
     };
+    if asks_to_follow_events(&peer_path, uri.query()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the node relay does not forward a followed event stream: ask the node \
+             directly, or use /v1/events?follow=true, which already follows every node",
+        )
+            .into_response();
+    }
     let mut url = match known_node_api_url(&state, known.as_deref(), &node, &peer_path).await {
         Ok(url) => url,
         Err(response) => return response,
@@ -288,22 +296,48 @@ pub(super) async fn node_relay_handler(
             .body(body);
     }
     let request = copy_forwarded_auth(request, &headers);
-    let response = match tokio::time::timeout(RELAY_TIMEOUT, request.send()).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
+    relay_exchange(request, &node, RELAY_TIMEOUT).await
+}
+
+/// Whether a relayed request asks for a followed event stream, which never
+/// ends: `follow=true` on `v1/events`.
+fn asks_to_follow_events(peer_path: &str, query: Option<&str>) -> bool {
+    peer_path == "/v1/events"
+        && query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(key, value)| key == "follow" && value != "false")
+        })
+}
+
+/// Send `request` to `node` and pass back its whole answer, or a 504 if the
+/// answer, body included, isn't in within `timeout`. A peer that sends its
+/// headers and then stalls used to hold the relay for as long as the caller
+/// waited (#2393).
+async fn relay_exchange(
+    request: reqwest::RequestBuilder,
+    node: &str,
+    timeout: std::time::Duration,
+) -> Response {
+    match tokio::time::timeout(timeout, read_relayed_answer(request, node)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "node {node} did not answer within {}s",
+                timeout.as_secs_f64()
+            ),
+        )
+            .into_response(),
+    }
+}
+
+async fn read_relayed_answer(request: reqwest::RequestBuilder, node: &str) -> Response {
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("node {node} did not answer: {error}"),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                format!(
-                    "node {node} did not answer within {}s",
-                    RELAY_TIMEOUT.as_secs()
-                ),
             )
                 .into_response();
         }
@@ -432,5 +466,51 @@ mod tests {
         ] {
             assert_eq!(relay_peer_path(&get, path), None, "relayed GET /{path}");
         }
+    }
+
+    /// A peer that answers its headers and then sends nothing more used to
+    /// hold the relay for as long as the caller waited: only `send()` had a
+    /// deadline (#2393). The whole exchange has one now.
+    #[tokio::test]
+    async fn the_relay_gives_up_on_a_peer_that_stalls_mid_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                )
+                .await
+                .unwrap();
+            // Then nothing, for longer than any test waits.
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            drop(socket);
+        });
+
+        let request = reqwest::Client::new().get(format!("http://{address}/v1/events"));
+        let started = std::time::Instant::now();
+        let response =
+            relay_exchange(request, "node-2", std::time::Duration::from_millis(300)).await;
+        peer.abort();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn only_a_followed_event_stream_is_refused() {
+        assert!(asks_to_follow_events("/v1/events", Some("follow=true")));
+        assert!(asks_to_follow_events(
+            "/v1/events",
+            Some("limit=5&follow=true")
+        ));
+        assert!(!asks_to_follow_events("/v1/events", Some("follow=false")));
+        assert!(!asks_to_follow_events("/v1/events", None));
+        assert!(!asks_to_follow_events("/v1/status", Some("follow=true")));
     }
 }

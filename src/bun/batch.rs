@@ -237,6 +237,7 @@ pub async fn batch_submit_handler(
         None
     };
     let mut policy_warnings = Vec::new();
+    let mut declared_images = std::collections::BTreeMap::new();
     for job in &mut jobs {
         let namespace = job.namespace().to_owned();
         let mut definition = crate::meat::job::JobDefinition::from_spec(job.spec.clone());
@@ -257,6 +258,10 @@ pub async fn batch_submit_handler(
         }
         // Admission binds the image and settles the namespace. Copy only
         // those back: the run policy stays on the spec for `RegisterJobs`.
+        // The image the job declared goes beside it (#1322).
+        if let Some(image) = definition.declared_image {
+            declared_images.insert(job.name.clone(), image);
+        }
         job.spec.image = definition.template.image;
         job.spec.namespace = definition.template.namespace;
     }
@@ -270,6 +275,7 @@ pub async fn batch_submit_handler(
     let write = crate::meat::task_array_store::TaskArrayWrite::RegisterJobs {
         request_id,
         jobs: jobs.into_iter().map(|job| (job.name, job.spec)).collect(),
+        declared_images,
         submitted_at_epoch_secs: epoch_now_secs(),
     };
     match super::task_array_leader::write_task_array(&state, write).await {

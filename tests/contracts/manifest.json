@@ -4206,6 +4206,31 @@
           ]
         },
         {
+          "id": "issue-2392-runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/process_owner.rs",
+            "src/grill/process_owner/exec.rs"
+          ]
+        },
+        {
+          "id": "issue-2420-runc_a_hostname_change_leaves_live_containers_under_control",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_a_hostname_change_leaves_live_containers_under_control",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/network_leases.rs"
+          ]
+        },
+        {
           "id": "issue-2412-runc_a_local_user_cannot_reach_a_containers_set_id_files",
           "binary": "reliaburger",
           "test": "grill::runc::tests::runc_a_local_user_cannot_reach_a_containers_set_id_files",

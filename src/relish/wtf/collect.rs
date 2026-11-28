@@ -19,8 +19,8 @@ use super::{
     AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
     CertificateObservation, ClusterEvidence, CouncilObservation, CpuThrottleObservation,
     DeployObservation, DiskObservation, Evidence, ExportHoldObservation, FaultObservation,
-    GitOpsObservation, IsolationObservation, LaunchFailureObservation, LogObservation,
-    NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    GitOpsObservation, ImageCollectionObservation, IsolationObservation, LaunchFailureObservation,
+    LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
     RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
     TokenObservation, WtfInputs,
 };
@@ -51,6 +51,7 @@ struct NodeCollection {
 struct LocalEvidenceSet {
     disks: Evidence<Vec<DiskObservation>>,
     export_holds: Evidence<Vec<ExportHoldObservation>>,
+    image_collection: Evidence<Vec<ImageCollectionObservation>>,
     cpu_throttling: Evidence<Vec<CpuThrottleObservation>>,
     certificates: Evidence<Vec<CertificateObservation>>,
 }
@@ -272,6 +273,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             faults,
             disks: local.disks,
             export_holds: local.export_holds,
+            image_collection: local.image_collection,
             certificates: local.certificates,
             registry,
             tokens,
@@ -831,6 +833,7 @@ fn collect_alerts(
 fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> LocalEvidenceSet {
     let mut disks = EvidenceBuilder::default();
     let mut export_holds = EvidenceBuilder::default();
+    let mut image_collection = EvidenceBuilder::default();
     let mut cpu = EvidenceBuilder::default();
     let mut certificates = EvidenceBuilder::default();
     for node in collected {
@@ -840,6 +843,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
                 let reason = format!("node {}: {error}", node.node_id);
                 disks.unavailable(reason.clone());
                 export_holds.unavailable(reason.clone());
+                image_collection.unavailable(reason.clone());
                 cpu.unavailable(reason.clone());
                 certificates.unavailable(reason);
                 continue;
@@ -865,6 +869,19 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
                         node_id: node.node_id.clone(),
                         storage_domain: hold.storage_domain.clone(),
                         failing_since: hold.failing_since,
+                    }),
+            );
+        image_collection
+            .values
+            .extend(
+                snapshot
+                    .image_collection
+                    .iter()
+                    .map(|image| ImageCollectionObservation {
+                        node_id: node.node_id.clone(),
+                        problem: image.problem,
+                        since: image.since,
+                        unpacked_bytes: image.unpacked_bytes,
                     }),
             );
         append_diagnostic_source(&snapshot.cpu_throttling, &node.node_id, &mut cpu, |item| {
@@ -894,6 +911,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
     LocalEvidenceSet {
         disks: disks.finish(observed_at),
         export_holds: export_holds.finish(observed_at),
+        image_collection: image_collection.finish(observed_at),
         cpu_throttling: cpu.finish(observed_at),
         certificates: certificates.finish(observed_at),
     }
@@ -1438,6 +1456,11 @@ mod tests {
                 storage_domain: "logs".to_string(),
                 failing_since: 7,
             }],
+            image_collection: Some(crate::bun::diagnostics::ImageCollectionEvidence {
+                problem: crate::grill::image::CollectionProblem::Refused,
+                since: 5,
+                unpacked_bytes: 1 << 30,
+            }),
         };
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1460,6 +1483,16 @@ mod tests {
                 node_id: "node-1".to_string(),
                 storage_domain: "logs".to_string(),
                 failing_since: 7,
+            }]
+        );
+        // #2524: a node's failing image collection reaches wtf.
+        assert_eq!(
+            evidence.image_collection.value().unwrap(),
+            &[ImageCollectionObservation {
+                node_id: "node-1".to_string(),
+                problem: crate::grill::image::CollectionProblem::Refused,
+                since: 5,
+                unpacked_bytes: 1 << 30,
             }]
         );
         assert!(matches!(evidence.disks, Evidence::Degraded { .. }));

@@ -1,5 +1,9 @@
 # Relish: CLI & TUI Design Document
 
+**Status:** Partly shipped. Every `relish` command here exists unless it's marked *(planned)*, and a test checks that.
+**Reconciled against:** not reconciled (§4 and §10 checked against 0.3.4, #2513)
+**Sketches:** the §4 listings marked as sketches, the planned plan and diff types in §5, the commands marked *(planned)*, §13
+
 ## 1. Overview
 
 Relish is the CLI and interactive terminal UI for Reliaburger. It's a single Rust binary that replaces five separate tools from the Kubernetes ecosystem: `kubectl` (cluster management), `k9s` (interactive TUI), `stern` (multi-instance log streaming), `kubectl-debug` (debug containers), and `terraform plan` (change previewing). Every debugging, diagnostic, configuration, and operational capability is compiled into the binary. There's nothing to install, no plugins to manage, no separate monitoring stack to query, and no shell scripts to maintain.
@@ -219,6 +223,9 @@ Connection settings come from these flags, each with an environment fallback:
 
 ### TUI State
 
+Original sketch; these types are not in the tree. The TUI's state is `TuiApp`, with the `View` enum and the fetched `ClusterData`, in `src/relish/tui/state.rs`.
+
+<!-- sketch -->
 ```rust
 /// Top-level TUI application state.
 #[derive(Debug, Clone)]
@@ -268,6 +275,9 @@ pub enum ViewKind {
 
 ### App View
 
+Original sketch; these types are not in the tree. `relish apps` builds `AppRow` and `Instances` in `src/relish/apps_cmd.rs`, and the TUI reads apps from `ClusterData` in `src/relish/tui/state.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppView {
@@ -317,6 +327,9 @@ pub struct InstanceView {
 
 ### Node View
 
+Original sketch; these types are not in the tree. `relish nodes` builds `NodeRow` in `src/relish/nodes_cmd.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {
@@ -357,6 +370,9 @@ pub enum NodeRole {
 
 ### Event Stream
 
+Original sketch; these types are not in the tree. `relish events` filters with `EventsFilter` in `src/relish/events_cmd.rs`.
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -416,92 +432,11 @@ pub enum ActorSource {
 }
 ```
 
-### Plan and Diff Results
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanResult {
-    pub changes: Vec<PlanChange>,
-    pub summary: PlanSummary,
-    pub validation_errors: Vec<ValidationError>,
-    pub scheduling_preview: Vec<SchedulingDecision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanChange {
-    pub resource: String,           // e.g., "app.web", "job.cleanup"
-    pub action: PlanAction,
-    pub fields: Vec<FieldChange>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PlanAction {
-    Create,
-    Update,
-    Destroy,
-    NoChange,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldChange {
-    pub path: String,               // e.g., "image", "replicas", "env.FEATURE_FLAG"
-    pub old_value: Option<String>,
-    pub new_value: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanSummary {
-    pub to_create: u32,
-    pub to_update: u32,
-    /// Running on the cluster but absent from this config. Informational:
-    /// apply is additive and never removes; `relish stop` does.
-    pub not_in_config: u32,
-    pub unchanged: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulingDecision {
-    pub instance: String,           // e.g., "web-4"
-    pub target_node: String,        // e.g., "node-02"
-    pub constraints_satisfied: Vec<ConstraintCheck>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConstraintCheck {
-    pub constraint: String,         // e.g., "storage=ssd"
-    pub satisfied: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffResult {
-    pub drifted: Vec<DriftEntry>,
-    pub in_sync: Vec<String>,
-    pub summary: DiffSummary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftEntry {
-    pub resource: String,
-    pub fields: Vec<DriftField>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftField {
-    pub path: String,
-    pub config_value: String,
-    pub cluster_value: String,
-    pub cause: Option<String>,      // e.g., "autoscaler adjusted", "manual override"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffSummary {
-    pub drifted_count: u32,
-    pub in_sync_count: u32,
-}
-```
-
 ### Inspect Output
 
+Original sketch; these types are not in the tree. `relish inspect` takes an app name and returns an `Inspection` of its instances, one `NodeReport` per node (`src/relish/inspect.rs`).
+
+<!-- sketch -->
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InspectOutput {
@@ -1080,6 +1015,91 @@ There is no `plan` subcommand. Use `relish apply <path> --dry-run` (or
 scheduling-preview and capacity-validation described in earlier drafts are not
 built — the plan diffs desired config against known state by resource and image
 only.
+
+**The original plan and diff types.** Original sketch; these types are not in the tree. `relish apply --dry-run` prints an `ApplyPlan` of `PlanEntry` rows (`src/relish/plan.rs`), and `relish diff` builds a `ConfigDiff` (`src/relish/diff.rs`).
+
+<!-- sketch -->
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub changes: Vec<PlanChange>,
+    pub summary: PlanSummary,
+    pub validation_errors: Vec<ValidationError>,
+    pub scheduling_preview: Vec<SchedulingDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanChange {
+    pub resource: String,           // e.g., "app.web", "job.cleanup"
+    pub action: PlanAction,
+    pub fields: Vec<FieldChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlanAction {
+    Create,
+    Update,
+    Destroy,
+    NoChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldChange {
+    pub path: String,               // e.g., "image", "replicas", "env.FEATURE_FLAG"
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub to_create: u32,
+    pub to_update: u32,
+    /// Running on the cluster but absent from this config. Informational:
+    /// apply is additive and never removes; `relish stop` does.
+    pub not_in_config: u32,
+    pub unchanged: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingDecision {
+    pub instance: String,           // e.g., "web-4"
+    pub target_node: String,        // e.g., "node-02"
+    pub constraints_satisfied: Vec<ConstraintCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintCheck {
+    pub constraint: String,         // e.g., "storage=ssd"
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResult {
+    pub drifted: Vec<DriftEntry>,
+    pub in_sync: Vec<String>,
+    pub summary: DiffSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftEntry {
+    pub resource: String,
+    pub fields: Vec<DriftField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftField {
+    pub path: String,
+    pub config_value: String,
+    pub cluster_value: String,
+    pub cause: Option<String>,      // e.g., "autoscaler adjusted", "manual override"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffSummary {
+    pub drifted_count: u32,
+    pub in_sync_count: u32,
+}
+```
 
 **`relish diff <path-a> [<path-b>]`**
 
@@ -1887,38 +1907,11 @@ All API requests use HTTP/2 with connection reuse. The mTLS handshake occurs onc
 
 ### CLI Integration Tests
 
-This is the original per-command layout. Today the CLI's integration tests live in `tests/suite/relish_cli.rs` (plus the doc snippet tests in `tests/suite/doc_snippets.rs`), and the planned files below remain a target:
+There is no `tests/cli/` directory. The CLI's tests live in three places (see `docs/testing.md`):
 
-```
-tests/
-  cli/
-    test_status.rs          # relish status output and exit codes
-    test_apply.rs           # relish apply with various configs
-    test_plan.rs            # relish plan output format, scheduling preview
-    test_diff.rs            # relish diff drift detection
-    test_compile.rs         # relish compile merge logic
-    test_lint.rs            # relish lint error detection
-    test_fmt.rs             # relish fmt idempotency
-    test_logs.rs            # relish logs streaming, filtering
-    test_events.rs          # relish events filtering, time ranges
-    test_path.rs            # relish path step-by-step output
-    test_inspect.rs         # relish inspect resource types
-    test_wtf.rs             # relish wtf correlation logic
-    test_exec.rs            # relish exec, debug containers
-    test_top.rs             # relish top output format
-    test_history.rs         # relish history audit trail
-    test_firewall.rs        # relish firewall rule display, test
-    test_resolve.rs         # relish resolve service map query
-    test_route.rs           # relish route ingress display
-    test_secret.rs          # relish secret encrypt/rotate
-    test_token.rs           # relish token create/list/rotate/revoke
-    test_snapshot.rs        # relish snapshot create/list/restore/delete
-    test_upgrade.rs         # relish upgrade check/plan/start/status
-    test_fault.rs           # relish fault injection commands
-    test_test.rs            # relish test (meta-test)
-    test_bench.rs           # relish bench output format
-    test_global_flags.rs    # --output, --namespace, --cluster, --no-colour
-```
+- **Unit tests** beside each command in `src/relish/` (for example `src/relish/apps_cmd.rs`, `src/relish/plan.rs`, `src/relish/inspect.rs`), in a `#[cfg(test)] mod tests` at the bottom of the file.
+- **Snapshot tests** with `insta` for rendered output, such as tables and TUI frames; the snapshots sit in `src/relish/snapshots/` and `src/relish/tui/snapshots/`.
+- **Integration tests** in the portable `tests/suite/` binary: `tests/suite/relish_cli.rs` runs the real `relish`, and `tests/suite/doc_snippets.rs` checks that every `relish` command in the manual and this document parses.
 
 **Local-only command tests** (`compile`, `lint`, `fmt`) run without a cluster. They use fixture TOML files in `tests/fixtures/` and verify output against expected snapshots.
 

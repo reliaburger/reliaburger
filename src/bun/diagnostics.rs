@@ -90,6 +90,9 @@ pub struct DiagnosticStaticEvidence {
     /// The stores whose export is failing, as Bun's disk-pressure task
     /// last found them.
     pub export_holds: ExportHolds,
+    /// The node's image store: unpacked sizes and how its last collection
+    /// pass went (#2524). Unset on a node whose runtime pulls no images.
+    pub image_store: crate::grill::image::ImageStoreStatus,
 }
 
 /// A store whose export is failing (#2062). With an export destination set,
@@ -153,6 +156,21 @@ impl ExportHolds {
             })
             .collect()
     }
+}
+
+/// A node's image collection that keeps failing or being refused, so its
+/// unpacked images aren't being removed (#2524). No error text: it could
+/// name a host path, and this payload never carries one. Bun's log has the
+/// reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageCollectionEvidence {
+    /// What went wrong with the last pass.
+    pub problem: crate::grill::image::CollectionProblem,
+    /// Unix seconds of the first pass with this problem since one worked.
+    pub since: u64,
+    /// Bytes the node's unpacked images take, as their markers record.
+    pub unpacked_bytes: u64,
 }
 
 /// Capacity evidence for one configured storage domain.
@@ -239,6 +257,10 @@ pub struct LocalDiagnosticSnapshot {
     /// Stores whose export is failing, so their retention is on hold.
     #[serde(default)]
     pub export_holds: Vec<ExportHoldEvidence>,
+    /// The node's image collection, when its last pass failed or was
+    /// refused (#2524).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_collection: Option<ImageCollectionEvidence>,
 }
 
 /// Desired service state used to distinguish an intentionally empty service
@@ -787,6 +809,7 @@ mod tests {
                 value: crate::council::backup::BackupStatus::NotConfigured,
             },
             export_holds: Vec::new(),
+            image_collection: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

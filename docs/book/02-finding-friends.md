@@ -112,6 +112,10 @@ Labels are stored in a `BTreeMap` rather than a `HashMap` because we need determ
 
 Labels travel in each node's gossip extension, not in membership updates, and every node copies what it hears onto the sender's membership record. The snapshot the scheduler and `relish nodes` read, though, is only republished when a digest of the membership changes, and that digest held each member's id, state, incarnation and roles. The V02 soak restarted a node with a new label. It came back quickly enough that nobody suspected it, so its state and incarnation didn't move, the digest didn't move, and the new label never left the internal record: the app pinned to it could never be scheduled. The digest now includes labels and addresses. A snapshot is cheap; a change the scheduler can't see isn't.
 
+"A snapshot is cheap" turned out to be true once, not on every datagram. `run` publishes after every probe tick *and* every received datagram, and each publish cloned every member (id, labels, resources) into a snapshot, cloned them again into a digest, sorted it, compared it, and then did all of that once more for the roster. An audit in 0.3.4 measured it (#2439): with five labels per member, a datagram that changed nothing cost 813 µs of the gossip task's time at 1,000 members and 12.8 ms at 10,000, on the one task that also has to answer probes within 200 ms. A node gets several datagrams a second.
+
+The fix is a version counter on `MembershipTable`. Every method that changes something a snapshot shows bumps it: `apply_update` and `add_node` when they change a member, `suspect`, `declare_dead`, the reaps, `set_roles` when a flag actually flips, and two new narrow methods, `set_labels` and `acknowledge`, which replaced the places that reached into a record with `get_mut` on every datagram. `get_mut` itself still exists, and it bumps the version whatever the caller does with the reference: it can't know, so it has to assume a change. A spurious publish costs a snapshot; a missed one hides a change from the scheduler. `publish_membership` returns straight away when the version and the council roles (`watch::Receiver::has_changed`) are both where they were at the last publish. The digest comparison stays behind it, so a bump that changed nothing visible still publishes nothing. The same benchmark, `gossip_publish_after_datagram`, now reads about 210 ns per datagram at both sizes. `a_datagram_that_changes_nothing_takes_no_snapshot` took 100 snapshots for 50 datagrams before; `every_visible_change_still_publishes` checks an ACK that clears a suspicion, a relabel and new council roles still go out.
+
 ## The SWIM gossip protocol
 
 Now for the interesting part. How do 10,000 nodes discover each other, detect failures, and propagate information — without a central registry?
@@ -244,13 +248,13 @@ impl NodeState {
 
 Dead and suspect updates jump the queue. If the queue is full and we have to choose between telling people about a new join and telling them about a failure, the failure wins. Failure detection is time-sensitive; join announcements can wait.
 
-There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_refutation` marks the update, and the ordering puts the refutation flag before everything else:
+There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_urgent` marks the update, and the ordering puts the urgent flag before everything else:
 
 ```rust
 impl Ord for QueuedUpdate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.refutation
-            .cmp(&other.refutation)
+        self.urgent
+            .cmp(&other.urgent)
             .then_with(|| /* state priority */)
             .then_with(|| /* remaining broadcasts */)
     }
@@ -258,6 +262,10 @@ impl Ord for QueuedUpdate {
 ```
 
 `bool` implements `Ord` with `false < true`, and `BinaryHeap` pops the *largest* element, so `true` comes out first. `then_with` only runs its closure when the comparison so far is `Equal`, which is how you chain tie-breakers without nested `if`s.
+
+That lane was first called `enqueue_refutation`, and only the refuting node used it. An audit in 0.3.4 asked what happens one hop later (#2441). A peer that hears the refutation re-queues "h Alive at 2" with plain `enqueue`, at priority 1, behind its own backlog. After 100 of 1,000 nodes die together, that backlog is 100 `Dead` rumours with 30 broadcasts each: 3,000 sends at eight per datagram, over a minute. So the refutation travelled only as fast as h itself could ping, about five peers a second, while every other node's five-second suspicion timer ran. A seeded simulation in `tests/gossip_10k.rs`, `a_refutation_outruns_a_correlated_failures_backlog`, shows it: 300 nodes, 30 dead, and after 20 rounds (ten seconds) only 29 survivors had heard the refutation.
+
+The fix ranks an `Alive` that overturns a failure the same at every hop. `handle_message` checks the member's state before applying the update, and when it goes from `Suspect`, `Dead` or `Left` to `Alive`, it re-queues with `enqueue_urgent`, hence the rename. The simulation then turned up a second, quieter hole. The peers that hear the refutation *from h itself* never re-queued it at all: `add_node` registers the sender first and already raises its incarnation and state, so by the time the same `Alive` is read from the piggyback list there's nothing left to change, and a change is what triggers a re-queue. Those peers now notice that the sender was down or suspect to them at a lower incarnation and queue its `Alive` as urgent too. A plain join, an unknown node turning up `Alive`, stays at normal priority, or a mass join would starve failure news. The same simulation now finishes inside the ten-round budget for three seeds. One more small change: a node probing a target it already holds `Suspect` now says so in the PING, as its ACKs already did, so the target hears the claim from its suspecter and refutes straight away.
 
 The other half is superseding. The queue used to happily send `n1 Suspect@5` after it already held `n1 Alive@6`: both went out, the stale one first because Suspect outranks Alive, and every receiver discarded it after spending datagram space on it. Now the queue keeps the best-ranked update it holds for each node (incarnation first, then state, the same order `resolve_conflict` uses) in a `HashMap`. An update that ranks below what's held is never queued, and an older entry that's still in the heap is thrown away when it's popped rather than sent. Why not remove it from the heap straight away? Because a binary heap can't find an element without scanning all of it, and on a 10,000-member cluster's first dissemination that's 10,000 scans of 10,000 entries. Marking stale and skipping later costs one hash lookup.
 
@@ -483,7 +491,21 @@ fn refute(&mut self) {
 }
 ```
 
-Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
+Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_urgent`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
+
+The refutation jumps past the claim, `max(own, offending) + 1`, so a node that restarted at 1 while its peers hold it `Dead` at 50 wins in one step. The claim's incarnation comes straight off the wire, though, and an audit in 0.3.4 asked what a claim at `u64::MAX` does to that `+ 1` (#2395). In C an unsigned overflow silently wraps. Rust is stricter, and also less uniform than you might expect: a debug or test build checks every `+` and panics on overflow ("attempt to add with overflow"), while a release build, by default, skips the check and wraps. So the same claim killed the gossip task in our tests and, in production, wrapped the node's incarnation to 0, a refutation that loses to the claim everywhere. Neither is acceptable from one datagram.
+
+The fix has two halves. Nothing real comes near half of `u64`'s range, so `handle_message` drops any incarnation above `MAX_INCARNATION` (`u64::MAX / 2`) before it's applied: the datagram's own, each update's, a `Stale` answer's and a floor's. And the arithmetic says what it means:
+
+```rust
+self.incarnation = self
+    .incarnation
+    .max(offending_incarnation)
+    .saturating_add(1)
+    .min(MAX_INCARNATION);
+```
+
+`saturating_add` clamps at the type's maximum instead of overflowing, in debug and release alike; `checked_add` is its sibling that returns `None` on overflow when you want to refuse instead. The `.min` keeps our own incarnation inside the range our peers accept. `a_claim_at_the_highest_incarnation_does_not_wrap_ours` panicked before the fix; `a_claim_at_the_ceiling_saturates_instead_of_wrapping` and `a_datagram_a_stale_answer_and_a_floor_above_the_ceiling_are_dropped` cover the rest.
 
 A node only refutes a claim at or above its own incarnation. A `Suspect` at a lower one has already lost to the node's own record, since the higher incarnation wins, so refuting it would raise the incarnation and spread an `Alive` for nothing; a delayed or repeated rumour used to do exactly that. `a_claim_below_our_incarnation_is_not_refuted` checks `Suspect`, `Dead` and `Left` below the incarnation, and a `Suspect` at it.
 
@@ -586,6 +608,8 @@ One wrinkle forced a wire change. A relay used to forward the target's ACK with 
 
 Rather than box the recursion, we removed the wait. A relay records "forward b's ACK to a" with a deadline in a small bounded list and returns at once; b's ACK arrives through `handle_message` like any message, and the `Ack` arm forwards it. There's no waiting state left to be deaf in. `handle_message` now also returns whether it accepted the message, and `wait_for_ack` only counts an ACK that was accepted, so a replayed old ACK can't pass for a fresh one.
 
+So who may move a member's address? After this fix, only two things: a fresh datagram from the member itself (its UDP source), and, since 0.3.4, a rumour that the member is `Alive` at a strictly higher incarnation (#2475). The second closed a gap the first left. A node that came back under the same name on a new IP fixed its address only on the peers it happened to contact; everyone else heard "Alive at incarnation 2" by rumour, raised the incarnation and kept probing the old IP, so the node flapped between `Alive` and `Suspect` for minutes. Only a node raises its own incarnation, and the address sits inside the HMAC with it, so a strictly higher `Alive` is the node's own newer word about itself. An equal incarnation could be a replay, and a `Suspect` or `Dead` carries the address its *accuser* holds, which may be the old one, so neither moves anything: `a_higher_incarnation_update_replaces_the_address`, `an_update_at_the_same_incarnation_keeps_the_address` and `a_higher_incarnation_failure_keeps_the_address` pin all three.
+
 The tests read as the scenarios they prevent: `replayed_ping_from_another_address_does_not_move_the_member`, `replayed_extension_cannot_roll_a_recovery_epoch_back`, `ping_during_a_relay_wait_is_acknowledged`, `own_refutation_goes_out_before_suspect_and_dead`, and in `message.rs`, `worst_case_ping_with_full_extension_fits_the_udp_budget`, which signs a datagram with every field at its maximum and checks the bytes. The gated `nodes_with_maximal_labels_stay_alive_during_churn` runs it for real: nodes with 63-byte names and full label sets over UDP, one leaving and one joining, and nobody else is ever declared dead.
 
 ### Dead node cleanup
@@ -594,7 +618,26 @@ Nodes transition through Alive → Suspect → Dead, but what happens to Dead en
 
 The SWIM paper doesn't say much about this: it's an implementation detail. Our approach: track when each node last changed state via a `state_changed` timestamp on `NodeMembership`, then periodically remove Dead and Left nodes whose `state_changed` is older than `cleanup_timeout` (60 seconds by default).
 
-Why 60 seconds? At 500ms gossip intervals, a 10,000-node cluster needs about `3 × ceil(log2(10000))` = 42 rounds (21 seconds) for an update to reach every node. 60 seconds gives nearly three times that margin. We don't want to reap a Dead node before all other nodes have learned about its death, because a late-arriving node might add it back as Alive from stale gossip.
+Why 60 seconds? Each update is piggybacked `3 × ceil(log2(10000))` = 42 times, and at 500ms gossip intervals that's about 21 seconds for one update to reach every node of a 10,000-node cluster, if the queue isn't backed up. (That's one rumour's spread. A node *joining* a cluster that size needs the join pages described under anti-entropy below, and a fleet booting at once has thousands of rumours queued, so this figure is a lower bound, not a promise.) 60 seconds gives nearly three times that margin. We don't want to reap a Dead node before all other nodes have learned about its death, because a late-arriving node might add it back as Alive from stale gossip.
+
+For a long time the delay was the *only* protection, and an audit in 0.3.4 showed how thin it was (#2474). Picture a 300-node cluster where node C is cut off for 90 seconds. While it's away, X dies, and everyone but C declares it dead and, a minute later, reaps it. C comes back still believing "X Alive at incarnation 4", and its first push-pull says so. Every receiver has no entry for X, so `apply_update` adds it as `Alive` and re-broadcasts it. Within seconds X is alive everywhere, and every node has to probe it, suspect it and declare it dead all over again. With tables over 64 entries you don't even need the partition: a node that missed the `Dead` rumour can easily miss X's entry in the rotating sync window too.
+
+So a reap now leaves a tombstone: the incarnation X was reaped at, kept in the same `RetainedFloor` as its sequence floor, so it inherits the floor's 24-hour expiry and its 1,024-entry bound for free. Before an update is applied, one check:
+
+```rust
+fn tombstoned(&self, update: &MembershipUpdate, now: Instant) -> bool {
+    update.state == NodeState::Alive
+        && self.membership.get(&update.node_id).is_none()
+        && self
+            .sequence_floors
+            .get(&update.node_id)
+            .filter(|floor| floor.expires > now)
+            .and_then(|floor| floor.reaped_incarnation)
+            .is_some_and(|tombstone| update.incarnation <= tombstone)
+}
+```
+
+The chain reads left to right: `get` gives an `Option<&RetainedFloor>`, `filter` turns an expired floor into `None`, `and_then` swaps the floor for its own `Option<u64>` tombstone, and `is_some_and` answers `false` for any `None` along the way. A higher incarnation is a real return and passes, and so does X's own datagram, which clears the floor. `a_stale_alive_about_a_reaped_member_does_not_bring_it_back` failed before the fix; `a_tombstone_expires_with_its_floor` and `a_restarted_member_refutes_past_its_tombstone` cover the edges. We could also have shared tombstones in the floor exchange, which would cover a node that joined after the reap, but that's a wire change for a corner of a corner, and a node that takes one stale `Alive` just probes X and finds it dead.
 
 The reap runs every probe cycle (500ms). Iterating the membership table and comparing timestamps is trivial: even at 10,000 nodes it takes microseconds.
 
@@ -854,6 +897,10 @@ fn membership_window(&mut self) -> Vec<MembershipUpdate> {
 ```
 
 That iterator chain reads left to right. `cycle()` turns the slice into an endless iterator that starts over when it reaches the end, which is how a window near the end of the table wraps round to the beginning. `skip(start)` throws away the first `start` items, `take(64)` stops after 64, and `cloned()` copies each borrowed entry into an owned one so `collect()` can build a new `Vec`. Nothing runs until `collect()` pulls on the chain; Rust iterators are lazy, like Python generators, so the "endless" iterator never allocates anything endless. `sort_unstable_by` sorts in place with a comparison closure. "Unstable" means equal elements may swap places, which can't matter here because node ids are unique, and it's a little faster.
+
+A rotating window is fine for a member that already knows almost everyone. For a node that has just joined, it's a disaster that grows with the cluster, and an audit in 0.3.4 did the sums (#2442). The joiner's first exchange brings back 64 of the seed's 1,000 entries. The next one is ten seconds later, with a random peer whose cursor is wherever it happens to be, so windows overlap. Even with no overlap at all that's 80 seconds at 1,000 members and 13 minutes at 10,000, and the hollow-node runs in #1413 never saw a 1,000-node fleet agree on its membership within six minutes.
+
+So a `Sync` now says how many members its sender knows, `known_members: u32`, a new field on the wire. A request from a peer that knows more than a window fewer than we do is a joiner's, and gets a *page* instead of a window: up to 512 entries in up to 64 datagrams, about 90 KB, small enough for a default UDP receive buffer to take in one burst. We keep a cursor per joiner, so its next page starts where this one stopped, and hand any one joiner at most one page per half protocol period. On the joiner's side, an exchange that taught it at least a window's worth of new members means it's still catching up, and it syncs again on the very next cycle, with the same peer. `a_joiner_learns_a_cluster_larger_than_one_sync_window_promptly` gives a seed 500 members and checks the joiner knows them all after one exchange (it knew 65 before), and `a_joiner_sees_a_10k_member_cluster_in_twenty_exchanges` in `tests/gossip_10k.rs` does 10,000 in twenty. Why not send the whole table in one go? At 10,000 members that's 1,250 datagrams, and a burst that size overruns the receiver's socket buffer, so most of it would be lost; memberlist does a full-state transfer over TCP instead, and our gossip transport is UDP only.
 
 Sending is a loop over `chunks`:
 
@@ -1932,6 +1979,21 @@ let hint_plausible = |hint: &LeaderHint| {
 
 `Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real, but only for hints from its own recovery epoch (more on epochs in a moment). A voter that a recovery has fenced still holds the old council's term, and comparing that with the new council's fresh term line would make it refuse the new leader for no reason. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
 
+"Not really" turned out to need one more piece. Every node derives the gossip key from the same master key, so any compromised worker can sign a hint naming itself at term `u64::MAX`. No later hint outranks that, so a seatless node followed it until it restarted (#2406). The security half of that issue closed elsewhere: a seatless node now fetches its security state only from a voter of the council it knows. The rest, a reporting stall that lasted for ever, closes here: hints now expire. Each extension carries `leader_age_ms`, how long ago its stamping node last heard the hint fresh. The leader stamps its own hint at 0, and a relay passes on the age it holds, so the real leader's hint arrives a few seconds old even across a large cluster, refreshed all the time. A forged hint nobody re-advertises ages on every hop, and once it's older than `LEADER_HINT_EXPIRY` (a minute) the directory drops it and refuses any copy that old:
+
+```rust
+pub fn observe_hint_at(&mut self, hint: &LeaderHint, age: Duration, now: Instant) -> bool {
+    let expired = self.expire_leader(now);
+    if hint.recovery_epoch < self.recovery_floor || age >= LEADER_HINT_EXPIRY {
+        return expired;
+    }
+    let heard = now.checked_sub(age).unwrap_or(now);
+    // ... adopt a newer hint, or refresh `leader_heard` for the same one
+}
+```
+
+Why an age and not a timestamp? Hosts' clocks disagree, and an age needs no agreement: each node measures it on its own monotonic `Instant` and only ever adds to it. `Instant::checked_sub` returns `None` instead of panicking when the subtraction would go before the clock's start, which is the `Instant` version of the `checked_add` we met with incarnations. A compromised node can still re-sign its forged hint every few seconds; then the stall lasts as long as the attack, and the node doing it is the one to find and remove. `a_node_outside_raft_does_not_follow_an_unbounded_hint_for_ever` failed before the fix.
+
 The same review found a second way for a hint to lie about its term. `relish council recover` builds a new council at a new *recovery epoch*, and its terms start again from the bottom. For a while, surviving workers still relay the old council's last hint: epoch 0, term 9, say, against the recovered leader's epoch 1, term 3. The directory ordered hints by `(recovery_epoch, term)`, but `resolve_leader_view` compared terms alone, so 9 beat 3 and the recovered leader's reporting epoch jumped to 9. The maintainer only ever let that epoch grow, and the scheduler skips every pass while the epoch differs from the leader's own term. Nothing would ever bring it back down ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 
 Two changes close it. The gossip directory now holds a *recovery floor*, the newest epoch the node's own recovery fence knows. `observe_hint` refuses a hint from below the floor, and `raise_recovery_floor` drops one already held when the floor rises, so a node never resolves the old council at all. And the reporting epoch is keyed on the pair, not the term:
@@ -2216,7 +2278,7 @@ An app with neither `exec` nor `script` runs an image (or, with only a `command`
 | Image locality | 15 | Prefer nodes with cached images (Phase 5) |
 | Stability | 5 | Prefer longer-running nodes |
 
-These are points, not percentages. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
+These are points, not percentages. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere (#1214). Stability isn't a reported uptime either: the leader counts from when its own gossip table first saw the node, so a leader restart or failover makes every node look new again.
 
 Spread used to be a weight too, and it took two bugs to get it out of the table. At 10 points against bin-packing's 50, the bin-packer put every replica of an app on one node, which defeats the point of having replicas. At 60 points, scored as "runs this app or doesn't", it beat bin-packing for a node with no replica at all, but once every candidate ran one, bin-packing chose again. Lose one node of three running four replicas and both survivors run the app, so the busier one took both replacements: three replicas on one node, one on the other. No weight fixes that for good, because the next dimension someone adds can outvote it. So the replica count is the first sort key and the weighted score only breaks ties:
 

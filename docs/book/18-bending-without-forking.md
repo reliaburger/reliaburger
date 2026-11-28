@@ -1485,16 +1485,80 @@ in desired state needs the task-array machinery, so #1119 covered it by
 review (#1322). The tests now go through the real router instead, which
 already has that machinery: they submit a job to `/v1/jobs/runs`, commit a
 jobs policy, and read the audit. One checks a scheduled job is judged with
-its schedule put back, by a rule that names `job.schedule`. Two pin
-decisions the review left open. A one-off job is judged while a run refers
+its schedule put back, by a rule that names `job.schedule`. Another pins a
+decision the review left open: a one-off job is judged while a run refers
 to it; once its last run is pruned its definition expires, and so does its
 place in the audit, because a job that will never run again has nothing
-left to refuse. And a job pinned as `report:latest@sha256:…` is judged as
-`report:latest`. Apps escape that because #1118 keeps the declared spec next
-to the stored one; jobs have no declared spec, so `unbound` can't tell a
-digest the caller wrote from one the leader bound. Keeping one means new
-fields in Raft state and job definitions, a protocol and state bump, so it
-waits for a release that bumps them anyway.
+left to refuse.
+
+The third decision didn't stay a decision for long. Take a job pinned as
+`report:latest@sha256:…`. It runs exactly that digest, so a rule against
+`:latest` has nothing to say about it. But the audit judged it as
+`report:latest`, because it read every job image back through `unbound`.
+It had to: `report:latest` bound by the leader is stored as
+`report:latest@sha256:…` too, and nothing in the definition said which of
+the two the caller wrote. Apps escaped that because #1118 keeps the declared
+spec beside the stored one. Since 0.3.4 jobs do the same.
+
+What does a job's declared spec hold? We looked at what admission changes.
+Policy defaults fill in apps, not jobs. Binding swaps a tag for a digest,
+and a signature check pins a signed image the same way. That's the whole
+list, and both touch only the image. So `JobDefinition` grew one field
+rather than a second copy of itself:
+
+```rust
+/// The image the job declared, kept when admission bound its tag to a
+/// digest or pinned a signed image, so the stored image differs.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub declared_image: Option<String>,
+```
+
+`declared_spec()` is `to_spec()` with that image put back, and the audit
+judges it. A whole `JobSpec` would have doubled every definition, and they
+all count against a 20 KiB cap. If jobs ever take policy defaults, the
+field grows into a spec then.
+
+Admission settles the field in one place, `admit_definition`, which every
+route that keeps a definition calls:
+
+```rust
+let declared = definition.template.image.clone();
+super::task_array_api::admit_template_image(state, binder, &mut definition.template).await?;
+definition.settle_declared_image(declared);
+```
+
+and `settle_declared_image` is one line:
+
+```rust
+self.declared_image = declared.filter(|declared| {
+    self.template.image.as_deref() != Some(declared.as_str())
+});
+```
+
+`Option::filter` keeps the value only when the closure says yes, so the
+field is `None` whenever the image came through unchanged. One stored form
+for one definition matters here: the definition's digest decides whether a
+retried submission is the same run, and `validate` refuses a declared image
+equal to the stored one, or one beside no image at all. `/v1/jobs/runs`
+takes a whole `JobDefinition` as JSON, so a caller could name a
+`declared_image` of their own. `admit_definition` clears it before anything
+reads it: the declared image is what admission saw, never what the request
+claims.
+
+The awkward part was the two writes that don't carry definitions. A batch
+(`RegisterJobs`) and a job manifest (`DeployBegin`) carry `JobSpec`s, and
+the store turns them into definitions itself, later in a deployment's case,
+once its apps commit. A `JobSpec` is the manifest's own type, so a field
+there would be one any manifest could set. Instead each write carries a map
+beside its specs, `declared_images: BTreeMap<String, String>`, job name to
+image, and a deployment keeps it in its record until its jobs commit. The
+store refuses a name the write doesn't carry, and a replayed deployment
+must match its declared images as well as its config.
+
+`JobDefinition` and `DeploymentRecord` refuse unknown fields, and they live
+in Raft state, so an older node can't read what a newer one writes. That's
+a protocol and state bump, which is why this waited for a release that
+bumped the format anyway: 0.3.4.
 
 ### The exec secret provider
 

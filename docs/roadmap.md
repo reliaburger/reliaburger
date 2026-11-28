@@ -773,7 +773,10 @@ what's shipped and what's scheduled.
   [#2227](https://github.com/reliaburger/reliaburger/pull/2227)), and the
   `v02-loops` bounds, first
   [recorded](qualification/2026-11-12-v02-loops-bounds.md) on 12 November,
-  are being recorded again this week. V04, the cold installs on Linux x86_64
+  passed the quiet macOS upgrade-node rerun 115 of 115 on 26 November
+  ([record](qualification/2026-11-26-v02-upgrade-node-macos.md)); the
+  macOS upgrade-cluster and registry-new-leader lanes wait for a quiet
+  Studio. V04, the cold installs on Linux x86_64
   and arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
   the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s

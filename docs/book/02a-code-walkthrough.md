@@ -455,7 +455,7 @@ These are conscious choices, not bugs. Each one maps to a specific future phase.
 - **No autoscaler.** The `autoscale` config field is parsed but not acted on. Phase 7.
 - **No full council loss recovery.** If all council members die simultaneously, there's no pre-seeded recovery mechanism. Phase 4/8.
 - **In-memory Raft storage.** Log and state machine live in memory. Restart = data loss. Persistent storage comes later.
-- **Image locality scoring is a placeholder.** Returns 0 because there's no Pickle registry to check against until Phase 5.
-- **Node stability scoring is a placeholder.** Returns 50 because there's no real uptime tracking yet.
+- **Image locality scoring is inert.** The scorer checks `cached_images`, but nodes don't report their cached images, so the leader passes an empty set and every node scores 0 (#1214).
+- **Node stability is the leader's view.** Nodes don't report their uptime, so the leader uses how long its gossip table has known each node. A leader restart or failover resets every node's age to zero.
 
 Now go read `src/meat/types.rs`. Everything else will make more sense after that.

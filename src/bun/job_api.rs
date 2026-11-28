@@ -100,6 +100,8 @@ pub(crate) async fn admit_definition(
     )
     .map_err(|e| error(StatusCode::CONFLICT, e.to_string()))?;
     definition.template.namespace = Some(namespace.into());
+    // Admission settles the declared image below; a request doesn't name it.
+    definition.declared_image = None;
     definition
         .validate()
         .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
@@ -130,7 +132,11 @@ pub(crate) async fn admit_definition(
             ));
         }
     }
+    // The declared image is the one the job carried before binding or
+    // pinning, kept so the policy audit judges what was declared (#1322).
+    let declared = definition.template.image.clone();
     super::task_array_api::admit_template_image(state, binder, &mut definition.template).await?;
+    definition.settle_declared_image(declared);
     let refusal = match sole_node_refusal(state, name, namespace, definition) {
         Some(reason) => Some(reason),
         None => cluster_refusal(state, name, namespace, definition).await,

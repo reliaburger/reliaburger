@@ -926,7 +926,9 @@ fn accepted_fields<T: serde::de::DeserializeOwned>() -> Vec<String> {
         Ok(_) => panic!("the table accepted an unknown field"),
         Err(error) => error.to_string(),
     };
-    let Some((_, list)) = error.split_once("expected one of") else {
+    // serde says ``expected one of `a`, `b`, `c` `` for three or more fields,
+    // ``expected `a` or `b` `` for two and ``expected `a` `` for one.
+    let Some((_, list)) = error.split_once(", expected ") else {
         panic!("serde's unknown-field error changed shape: {error}");
     };
     list.split('`')
@@ -976,12 +978,188 @@ fn manual_reference_lists_every_app_and_job_field() {
     );
 }
 
-// --- The CLI design doc ------------------------------------------------------
+/// Every value `bun --help` offers for `--runtime` is in the manual's
+/// `--runtime` row, so the reference never hides one the binary shows.
+#[test]
+fn manual_bun_runtime_row_names_every_value_bun_offers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bun"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    // clap's long help lists each value as `- name: what it does`.
+    let after_flag = &help[help.find("--runtime <").expect("bun has no --runtime")..];
+    let values: Vec<&str> = after_flag
+        .lines()
+        .skip_while(|line| !line.contains("Possible values:"))
+        .skip(1)
+        .map_while(|line| line.trim().strip_prefix("- "))
+        .filter_map(|item| item.split(':').next())
+        .collect();
+    assert!(values.len() > 3, "found only {values:?} in:\n{after_flag}");
+
+    let reference = read("docs/manual/13_reference.md");
+    let row = manual_section(&reference, "## bun flags")
+        .lines()
+        .find(|line| line.starts_with("| `--runtime"))
+        .expect("no --runtime row under ## bun flags")
+        .to_string();
+    let missing: Vec<&&str> = values
+        .iter()
+        .filter(|value| !row.contains(&format!("`{value}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the --runtime row omits {missing:?}: {row}"
+    );
+}
+
+#[test]
+fn accepted_fields_reads_one_and_two_field_tables() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct One {
+        alpha: u8,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Two {
+        alpha: u8,
+        beta: u8,
+    }
+    assert_eq!(accepted_fields::<One>(), ["alpha"]);
+    assert_eq!(accepted_fields::<Two>(), ["alpha", "beta"]);
+}
+
+/// Every `node.toml` section is in the reference's "Node config sections"
+/// table, and every key in it is named somewhere in the manual: as
+/// `` `[section] key` ``, `` `section.key` ``, `` `key` `` or `` `key = …` ``,
+/// as a `[section.key]` table, or on a line starting `key = `. An unknown key is an error, so a key the manual
+/// doesn't name can only be found by reading `src/config/node.rs`.
+#[test]
+fn manual_names_every_node_config_key() {
+    use reliaburger::config::node::*;
+    use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
+    use reliaburger::council::backup::BackupConfig;
+    use reliaburger::lettuce::types::GitOpsConfig;
+    use reliaburger::testkit::safety::ClusterTestPolicy;
+
+    let reference = read("docs/manual/13_reference.md");
+    let table = manual_section(&reference, "## Node config sections");
+    let mut missing = Vec::new();
+    for section in accepted_fields::<NodeConfig>() {
+        let named =
+            table.contains(&format!("`[{section}]`")) || table.contains(&format!("`[{section}."));
+        if !named {
+            missing.push(format!("no `[{section}]` row in Node config sections"));
+        }
+    }
+
+    let manual: String = manual_files().iter().map(|file| read(file)).collect();
+    let sections = [
+        ("node", accepted_fields::<NodeSection>()),
+        ("cluster", accepted_fields::<ClusterSection>()),
+        ("cluster.backup", accepted_fields::<BackupConfig>()),
+        ("storage", accepted_fields::<StorageSection>()),
+        ("storage.snapshots", accepted_fields::<SnapshotsSection>()),
+        ("resources", accepted_fields::<ResourcesSection>()),
+        ("network", accepted_fields::<NetworkSection>()),
+        ("reporting_tree", accepted_fields::<ReportingTreeSection>()),
+        ("reconstruction", accepted_fields::<ReconstructionSection>()),
+        ("images", accepted_fields::<ImagesSection>()),
+        ("metrics", accepted_fields::<MetricsSection>()),
+        ("logs", accepted_fields::<LogsSection>()),
+        ("alerts", accepted_fields::<AlertsSection>()),
+        ("security", accepted_fields::<SecuritySection>()),
+        ("security.tokens", accepted_fields::<TokensSection>()),
+        ("ingress", accepted_fields::<IngressSection>()),
+        ("dns", accepted_fields::<DnsSection>()),
+        ("ebpf", accepted_fields::<EbpfSection>()),
+        ("upgrades", accepted_fields::<UpgradeSection>()),
+        ("smoker", accepted_fields::<SmokerSection>()),
+        ("runtime", accepted_fields::<RuntimeSection>()),
+        (
+            "process_workloads",
+            accepted_fields::<ProcessWorkloadsConfig>(),
+        ),
+        ("gitops", accepted_fields::<GitOpsConfig>()),
+        ("testing", accepted_fields::<ClusterTestPolicy>()),
+    ];
+    for (section, keys) in sections {
+        for key in keys {
+            let named = manual.contains(&format!("`[{section}] {key}`"))
+                || manual.contains(&format!("`{section}.{key}`"))
+                || manual.contains(&format!("`{key}`"))
+                || manual.contains(&format!("`{key} = "))
+                || manual.contains(&format!("[{section}.{key}]"))
+                || manual.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&format!("{key} = "))
+                        || line.starts_with(&format!("# {key} = "))
+                });
+            if !named {
+                missing.push(format!("[{section}] {key}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the manual doesn't name these node.toml keys:\n{}",
+        missing.join("\n")
+    );
+}
+
+// --- Commands in design docs ------------------------------------------------
+
+/// Design docs besides `cli-relish.md` whose inline `relish …` spans must
+/// name real commands, or carry `*(planned)*`.
+const DESIGN_DOCS_WITH_REAL_COMMANDS: &[&str] =
+    &["docs/design/deployments.md", "docs/design/metrics-mayo.md"];
+
+/// Check each inline `relish …` span in `file` outside `skipped_lines`: a
+/// real one has no `*(planned)*`, and a planned one must still fail, so the
+/// label lapses when it lands. Returns how many spans it checked.
+fn check_design_doc_commands(
+    file: &str,
+    skipped_lines: &std::ops::RangeInclusive<usize>,
+    cache: &mut BTreeMap<Vec<String>, Result<String, String>>,
+    failures: &mut Vec<String>,
+) -> usize {
+    let mut checked = 0;
+    for span in inline_spans(file, &read(file)) {
+        let line: usize = span
+            .location
+            .rsplit(':')
+            .next()
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_default();
+        if skipped_lines.contains(&line) {
+            continue;
+        }
+        checked += 1;
+        let result = check_inline_span(&span.text, cache);
+        match (result, span.labelled_planned) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Err(error), false) => {
+                failures.push(format!("{}: `{}`: {error}", span.location, span.text))
+            }
+            (Ok(()), true) => failures.push(format!(
+                "{}: `{}` works now; remove its *(planned)*",
+                span.location, span.text
+            )),
+        }
+    }
+    checked
+}
 
 /// `docs/design/cli-relish.md` describes what `relish` does. Every inline
 /// `relish …` span outside its "Planned commands" section must name a real
 /// subcommand with real flags; a planned one there or elsewhere is labelled
 /// `*(planned)*`, and must still fail, so the label lapses when it lands.
+/// The design docs in [`DESIGN_DOCS_WITH_REAL_COMMANDS`] follow the same
+/// rule, with no exempt section.
 #[test]
 fn cli_design_doc_names_no_missing_commands() {
     let file = "docs/design/cli-relish.md";
@@ -997,31 +1175,165 @@ fn cli_design_doc_names_no_missing_commands() {
 
     let mut cache = BTreeMap::new();
     let mut failures = Vec::new();
-    let mut checked = 0;
-    for span in inline_spans(file, &text) {
-        let line: usize = span
-            .location
-            .rsplit(':')
-            .next()
-            .and_then(|number| number.parse().ok())
-            .unwrap_or_default();
-        if planned_lines.contains(&line) {
-            continue;
-        }
-        checked += 1;
-        let result = check_inline_span(&span.text, &mut cache);
-        match (result, span.labelled_planned) {
-            (Ok(()), false) | (Err(_), true) => {}
-            (Err(error), false) => {
-                failures.push(format!("{}: `{}`: {error}", span.location, span.text))
-            }
-            (Ok(()), true) => failures.push(format!(
-                "{}: `{}` works now; remove its *(planned)*",
-                span.location, span.text
+    let checked = check_design_doc_commands(file, &planned_lines, &mut cache, &mut failures);
+    assert!(checked > 50, "found only {checked} inline commands");
+    let mut others = 0;
+    for file in DESIGN_DOCS_WITH_REAL_COMMANDS {
+        // Line numbers start at 1, so nothing in these docs is exempt.
+        others += check_design_doc_commands(file, &(0..=0), &mut cache, &mut failures);
+    }
+    assert!(
+        others > 10,
+        "found only {others} inline commands in other design docs"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// --- Design-doc status headers ----------------------------------------------
+
+/// The words a design doc's `**Status:**` line starts with.
+const DESIGN_DOC_STATUSES: &[&str] = &["Shipped", "Partly shipped", "Design only"];
+
+/// Every design doc opens with the same three header lines, so a reader (or an
+/// agent reading it through `relish agent source`) can tell built from
+/// planned before trusting it: `**Status:**` (one of
+/// [`DESIGN_DOC_STATUSES`]), `**Reconciled against:**` (a release someone
+/// checked the whole doc at, or "not reconciled") and `**Sketches:**` (the
+/// sections that describe unbuilt design, or "none").
+#[test]
+fn every_design_doc_has_a_status_header() {
+    let directory = super::website::repository().join("docs/design");
+    let mut files: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".md"))
+        .map(|name| format!("docs/design/{name}"))
+        .collect();
+    files.sort();
+    assert!(files.len() > 10, "found only {files:?}");
+    let mut failures = Vec::new();
+    for file in files {
+        let text = read(&file);
+        let head: Vec<&str> = text.lines().take(12).collect();
+        let field = |name: &str| {
+            head.iter()
+                .find_map(|line| line.strip_prefix(&format!("**{name}:** ")))
+        };
+        match field("Status") {
+            Some(status)
+                if DESIGN_DOC_STATUSES
+                    .iter()
+                    .any(|word| status.starts_with(word)) => {}
+            Some(status) => failures.push(format!(
+                "{file}: status {status:?} starts with none of {DESIGN_DOC_STATUSES:?}"
             )),
+            None => failures.push(format!("{file}: no **Status:** line in its first 12 lines")),
+        }
+        for name in ["Reconciled against", "Sketches"] {
+            if field(name).is_none() {
+                failures.push(format!("{file}: no **{name}:** line in its first 12 lines"));
+            }
         }
     }
-    assert!(checked > 50, "found only {checked} inline commands");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// --- Types in design-doc listings --------------------------------------------
+
+/// Design docs whose Rust listings must declare real types, unless the
+/// listing is labelled a sketch.
+const DESIGN_DOCS_WITH_REAL_TYPES: &[&str] = &[
+    "docs/design/cli-relish.md",
+    "docs/design/gitops-lettuce.md",
+    "docs/design/scheduler-meat.md",
+];
+
+/// Put on the line before a ```` ```rust ```` fence whose types aren't in the
+/// tree, under a prose line that says so.
+const SKETCH_MARKER: &str = "<!-- sketch -->";
+
+/// Every name `src/` declares with `struct`, `enum` or `type`.
+fn declared_type_names() -> std::collections::BTreeSet<String> {
+    fn walk(directory: &std::path::Path, names: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, names);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let words: Vec<&str> = text
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|word| !word.is_empty())
+                    .collect();
+                for pair in words.windows(2) {
+                    if matches!(pair[0], "struct" | "enum" | "type") {
+                        names.insert(pair[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    walk(&super::website::repository().join("src"), &mut names);
+    names
+}
+
+/// `(location, name)` for each `pub struct`, `pub enum` or `pub type` in a
+/// Rust listing not labelled with [`SKETCH_MARKER`].
+fn unlabelled_listing_types(file: &str, text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut in_fence = false;
+    let mut checked_fence = false;
+    let mut previous = "";
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            checked_fence = !in_fence && trimmed == "```rust" && !previous.contains(SKETCH_MARKER);
+            in_fence = !in_fence;
+        } else if in_fence && checked_fence {
+            let words: Vec<&str> = trimmed
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty())
+                .collect();
+            for triple in words.windows(3) {
+                if triple[0] == "pub" && matches!(triple[1], "struct" | "enum" | "type") {
+                    found.push((format!("{file}:{}", index + 1), triple[2].to_string()));
+                }
+            }
+        }
+        if !trimmed.is_empty() {
+            previous = trimmed;
+        }
+    }
+    found
+}
+
+#[test]
+fn a_sketch_marker_exempts_only_the_listing_it_precedes() {
+    let text =
+        "<!-- sketch -->\n```rust\npub struct Gone;\n```\n\n```rust\npub enum Real {}\n```\n";
+    assert_eq!(
+        unlabelled_listing_types("doc.md", text),
+        vec![("doc.md:7".to_string(), "Real".to_string())]
+    );
+}
+
+/// A design doc's Rust listing either declares types that exist in `src/`,
+/// or says it is a sketch, so a reader can use it as a map of the code.
+#[test]
+fn design_doc_listings_declare_real_types_or_say_they_are_sketches() {
+    let declared = declared_type_names();
+    let mut failures = Vec::new();
+    for file in DESIGN_DOCS_WITH_REAL_TYPES {
+        for (location, name) in unlabelled_listing_types(file, &read(file)) {
+            if !declared.contains(&name) {
+                failures.push(format!(
+                    "{location}: `{name}` isn't declared in src/; fix the listing or \
+                     label it with {SKETCH_MARKER}"
+                ));
+            }
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

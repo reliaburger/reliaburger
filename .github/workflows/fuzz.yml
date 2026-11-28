@@ -56,7 +56,7 @@ jobs:
     # fuzz/fuzz_targets/). Cached, only reliaburger itself rebuilds (14
     # minutes): a path dependency's fingerprint is its files' mtimes, which
     # every checkout resets.
-    timeout-minutes: 185
+    timeout-minutes: 205
     steps:
       - uses: actions/checkout@v4
         with:
