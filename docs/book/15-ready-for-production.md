@@ -10707,7 +10707,17 @@ lost an acknowledged write. Every one was the checker or the environment:
   forwards never went in, and the agent wrote 9 GB of logs in five minutes.
   The harness now spots that line in the start log within seconds, forces
   the VM off and starts it again. It also records that forced stop as an
-  extra power cut, because the guest had booted, and caps both logs.
+  extra power cut, because the guest had booted, and caps both logs. At
+  first it kept timing I6 from the first power-on, so the spin, the forced
+  stop and the second boot all counted against Bun, and two runs stopped on
+  a 314 s "slow recovery". The clock now starts again with the start that
+  booted ([#2542](https://github.com/reliaburger/reliaburger/issues/2542)).
+- **A writer nobody could read.** Twice Bun never answered after a cut, so
+  the harness couldn't read `/data/seq` at all. I6 failed, rightly, but I1
+  failed too, as if acknowledged writes had gone. Nothing had been read, so
+  nothing was known. I1 now says "undecided" (`"pass": null`), the cut lists
+  it apart from its violations, and the summary leaves an undecided cut out
+  of the bound: it proved nothing either way.
 
 One more: `--resume` carried a run on past a violation, powering the kept VM
 on and overwriting what we'd have diagnosed. It refuses now. And because

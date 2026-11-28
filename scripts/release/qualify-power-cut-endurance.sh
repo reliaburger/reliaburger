@@ -406,8 +406,10 @@ forwarder_spin='vsock forwarder accept error'
 # other failure.
 start_vm() {
     local log=$1 pid status=0 from
-    # Only this start's output: a retry appends to the same log.
-    from=$(( $(wc -c < "$log" 2> /dev/null || echo 0) + 1 ))
+    # Only this start's output: a retry appends to the same log. The stderr
+    # redirect goes first: bash opens the input in order, and the first
+    # start's log doesn't exist yet (#2542).
+    from=$(( $(wc -c 2> /dev/null < "$log" || echo 0) + 1 ))
     spun() { tail -c "+$from" "$log" 2> /dev/null | grep -q "$forwarder_spin"; }
     with_timeout "$start_timeout" "$limactl" start --tty=false "${vm[1]}" >> "$log" 2>&1 &
     pid=$!
@@ -460,6 +462,8 @@ cap_power_logs() {
 #   - the spinning vsock forwarder, or a start that timed out (forwarder_retries).
 #     The guest had booted then, so that stop is a second power cut,
 #     recorded as an extra power-off; the invariants after it cover both.
+# I6 times the start that booted: the second start resets powered_on_at, so
+# the forced stop and the first start's wait don't count against Bun (#2542).
 # Any other failure is left to I6 and I4 to judge.
 power_back() {
     local log result=0
@@ -476,6 +480,7 @@ power_back() {
         with_timeout 120 "$limactl" stop --force "${vm[1]}" >> "$log" 2>&1 || true
         cap_power_logs "$log"
         result=0
+        powered_on_at=$(now)
         start_vm "$log" || result=$?
     fi
     cap_power_logs "$log"
